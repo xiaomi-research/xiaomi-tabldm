@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.26.1"]
+build-backend = "hatchling.build"
+
+[project]
+name = "Xiaomi-TabLDM"
+dynamic = ["version"]
+description = "Xiaomi TabLDM inference-only library: load a checkpoint and run default-mode tabular inference (classification & regression)."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["tabular data", "foundation model", "TabLDM", "in-context learning", "inference"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering",
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "torch>=2.2",            # Flash Attention v2 support
+    "scikit-learn>=1.3.0",
+    "numpy",
+    "scipy",
+    "einops>=0.7",           # used for rotary position embeddings
+    "psutil",                # memory estimation at inference
+    "tqdm>=4.64.0",
+    "huggingface-hub",       # checkpoint download / cache
+]
+
+[project.optional-dependencies]
+numba = ["numba"]           # optional JIT speed-up for quantile distribution
+test = ["pytest"]
+
+[tool.hatch.version]
+path = "tabldm/__about__.py"
+
+[tool.hatch.build.targets.sdist]
+only-include = ["tabldm", "LICENSE", "README.md"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["tabldm"]

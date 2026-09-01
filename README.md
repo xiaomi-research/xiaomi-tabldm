@@ -1,0 +1,378 @@
+# Xiaomi-TabLDM: A Tabular Foundation Model
+
+![1787623284744](image/README/1787623284744.jpg)
+
+![Hugging Face](https://huggingface.co/occams/Xiaomi-TabLDM)
+
+This repository is the official implementation of **Xiaomi-TabLDM**, featuring the tabular foundation model **TabLDM**.
+
+Tabular foundation models establish a general prediction paradigm based on in-context learning. Given labeled samples from a downstream dataset as context, a single pretrained model can make predictions directly without task-specific training. Building on this paradigm, we introduce TabLDM, a new tabular foundation model that enables more flexible context utilization and more efficient model-capacity scaling.
+
+**A New Performance Standard.** On the challenging TALENT benchmark, TabLDM outperforms all baselines on binary classification tasks and ranks second overall. On TabArena, TabLDM surpasses traditional machine-learning baselines, ranks third overall, and ranks second on regression tasks. Notably, TabLDM outperforms TabPFN-3 at a similar model scale and approaches TabFM while using substantially fewer total and activated parameters.
+
+**Large-Scale Synthetic Pretraining.** TabLDM expands the coverage and diversity of synthetic tabular data used for pretraining. We also improve the three-stage training strategy by progressively introducing dual-stream feature groups, lightweight Attention Residual, and sparse Mixture-of-Experts. These components enable TabLDM to learn richer feature interactions and develop expert specialization across diverse tabular tasks.
+
+**Test-Time Scaling.** TabLDM further improves tabular prediction through test-time compute scaling: allocating additional compute during inference consistently improves predictive performance over the base model.
+
+**Easy to Use:** TabLDM can be installed with `pip` and provides a scikit-learn-compatible interface.
+`fit` does not update model weights; it only preprocesses the context and loads the pretrained model.
+Predictions are produced through in-context learning in a single forward pass.
+
+**Fast:** With KV caching, repeated calls to `predict` on the same training data can reuse cached context projections, significantly accelerating repeated inference. A GPU is recommended for larger datasets, and CPU/disk offloading can be used to scale to larger data sizes.
+
+## Performance
+
+<div align="center">
+  <img
+    src="image/README/Xiaomi-TabLDM_TALENT_Fig1.png"
+    alt="Overall rank on TALENT"
+    width="800"
+  >
+  <br>
+  <em>Figure 1. Overall rank on TALENT.</em>
+</div>
+
+<div align="center">
+  <img
+    src="image/README/Xiaomi-TabLDM_TabArena_Fig1.png"
+    alt=" Regression Elo performance on TabArena"
+    width="800"
+  >
+  <br>
+  <em>Figure 2. Regression Elo performance on TabArena.</em>
+</div>
+
+<div align="center">
+  <img
+    src="image/README/Xiaomi-TabLDM_BCCO_Fig2.png"
+    alt="Performance on BCCO"
+    width="800"
+  >
+  <br>
+  <em>Figure 3. Average-rank comparison on BCCO. Circles denote the average ranks on BCCO-CLS and BCCO-REG, while diamonds denote the overall average rank across the two settings. </em>
+</div>
+
+<div align="center">
+  <img
+    src="image/README/Xiaomi-TabLDM__OpenML-CTR23_Fig8.png"
+    alt="Performance on OpenML-CTR23"
+    width="800"
+  >
+  <br>
+  <em>Figure 4. Average-rank comparison on OpenML-CTR23 over 33 regression datasets.</em>
+</div>
+
+<div align="center">
+  <img
+    src="image/README/Xiaomi-TabLDM_TrainingEfficiency_Fig10.png"
+    alt="Training efficiency"
+    width="800"
+  >
+  <br>
+  <em>Figure 5. Training efficiency and improvability trade-offs across different task types: (left)classification performance, (right)overall tasks.</em>
+</div>
+
+## Installation
+
+```bash
+cd Xiaomi-TabLDM
+pip install .
+```
+
+Install optional dependencies as needed:
+
+```bash
+pip install .[numba]   # Optional JIT acceleration for the quantile distribution layer
+pip install .[test]    # Test dependencies
+```
+
+Installing PyTorch with `pip` may fail on Intel Macs. If so, install PyTorch first:
+
+```bash
+conda install pytorch -c pytorch
+```
+
+Then install `tabldm` as described above.
+
+### Dependencies
+
+`torch>=2.2`, `scikit-learn>=1.3.0`, `numpy`, `scipy`, `einops>=0.7`,
+`psutil`, `tqdm>=4.64.0`, and `huggingface-hub`. `numba` is optional.
+
+## Basic Usage
+
+### Classification
+
+```python
+from tabldm import TabLDMClassifier
+
+clf = TabLDMClassifier(model_path="checkpoints/clf_moe1.ckpt")
+clf.fit(X_train, y_train)          # In-context learning: no weight updates
+pred = clf.predict(X_test)
+proba = clf.predict_proba(X_test)  # (n_test, n_classes)
+```
+
+### Regression
+
+```python
+from tabldm import TabLDMRegressor
+
+reg = TabLDMRegressor(model_path="checkpoints/reg_moe1.ckpt")
+reg.fit(X_train, y_train)
+pred = reg.predict(X_test)
+```
+
+> `fit` **does not train the model**. It only preprocesses the labeled context
+> (`X_train`, `y_train`) and loads the pretrained weights. Prediction is performed
+> entirely through in-context learning. On first use, the checkpoint is downloaded
+> automatically from the Hugging Face Hub. Specify `model_path` to use a local file
+> for offline inference.
+
+### KV Cache
+
+When calling `predict` multiple times with the same training data, such as during
+evaluation, enabling KV caching avoids repeatedly computing the context. The cache
+is built during `fit` and reused across subsequent `predict` calls. Note that this
+requires additional GPU/CPU memory, so choose the setting based on your use case:
+
+> KV caching is not supported for classification tasks with more than 10 classes.
+> Keep `kv_cache=False` (the default) for these datasets; otherwise `fit` raises an
+> error.
+
+```python
+clf = TabLDMClassifier(
+    kv_cache=True, model_path="checkpoints/clf_moe1.ckpt"
+)
+clf.fit(X_train, y_train)          # Build the cache once
+clf.predict(X_test_batch_1)        # Reuse the cached context
+clf.predict(X_test_batch_2)
+```
+
+### Save/Load
+
+```python
+clf.save(
+    "classifier.pkl",
+    save_model_weights=False,  # If False, reload weights from the checkpoint
+    save_training_data=True,   # If True, include training data; False improves privacy
+    save_kv_cache=True,        # Save the KV cache when available
+)
+
+from tabldm import TabLDMClassifier
+clf = TabLDMClassifier.load("classifier.pkl")
+```
+
+When `save_model_weights=False` (the default), the saved file is smaller, but the
+weights must be reloaded from `model_path` or the Hub when loading the estimator.
+
+## Advanced Configuration
+
+TabLDM provides a set of parameters for customizing inference behavior. The following
+example shows all available classifier parameters and their default values:
+
+```python
+from tabldm import TabLDMClassifier
+
+clf = TabLDMClassifier(
+    n_estimators=8,               # Ensemble members; more is more accurate but slower
+    norm_methods=None,            # Normalization methods to try
+    feat_shuffle_method="latin",  # Feature permutation strategy
+    class_shuffle_method="shift", # Class permutation strategy
+    outlier_threshold=4.0,        # Z-score threshold for outlier detection/clipping
+    softmax_temperature=0.9,      # Temperature controlling prediction confidence
+    average_logits=True,          # Average logits (True) or probabilities (False)
+    support_many_classes=True,    # Automatically handle more than 10 classes
+    batch_size=8,                 # Ensemble members processed together; lower saves memory
+    kv_cache=False,               # Cache training-data KV projections for repeated inference
+    model_path=None,              # Checkpoint path; None downloads from Hugging Face
+    allow_auto_download=True,     # Download automatically when not found locally
+    checkpoint_version="checkpoints/clf_stage3_moe1_step-10000.ckpt",  # Pretrained checkpoint version
+    device=None,                  # Inference device; None selects CUDA or CPU automatically
+    use_amp="auto",               # Automatic mixed precision for faster inference
+    use_fa3="auto",               # Flash Attention 3 on Hopper GPUs such as H100
+    offload_mode="auto",          # Decide automatically when to use CPU/disk offloading
+    disk_offload_dir=None,        # Directory for disk offloading
+    random_state=42,              # Random seed for reproducibility
+    n_jobs=None,                  # Number of PyTorch threads for CPU inference
+    verbose=False,                # Print detailed inference information
+    inference_config=None,        # Fine-grained inference control for advanced users
+)
+```
+
+`TabLDMRegressor` accepts the same parameters except for the classification-specific
+parameters `class_shuffle_method`, `softmax_temperature`, `average_logits`, and
+`support_many_classes`.
+
+For TALENT classification evaluation, the test script can additionally randomize the
+integer code mapping of categorical feature columns and class labels independently for
+each ensemble member:
+
+```bash
+python tests/infer_talent_cls.py --all --seed-num 3 --cat_randomEncode
+```
+
+`--cat_random` is also accepted as an alias for `--cat_randomEncode`.
+
+## Loading Checkpoints
+
+Checkpoints are resolved in the following order:
+
+1. **`model_path`** — If it points to an existing file, that file is used directly.
+2. If `model_path` is set but the file does not exist and `allow_auto_download=True`,
+   the checkpoint named by `checkpoint_version` is downloaded to `model_path`.
+3. If `model_path` is `None`, the checkpoint is retrieved from the Hugging Face Hub
+   cache using `checkpoint_version` as the key.
+
+The public MoE1 loader uses the Hugging Face repository
+`occams/Xiaomi-TabLDM`. Therefore, the default classifier checkpoint
+`checkpoints/clf_stage3_moe1_step-10000.ckpt` corresponds to:
+
+```text
+https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_stage3_moe1_step-10000.ckpt
+```
+
+The `checkpoint_version` value is the filename inside this repository, not a
+local filesystem path. The first lookup uses the local Hugging Face cache
+(typically `~/.cache/huggingface/hub`); if the file is not cached and
+`allow_auto_download=True`, it is downloaded automatically.
+
+For fully offline inference, point `model_path` to a local file:
+
+```python
+clf = TabLDMClassifier(
+    model_path="/path/to/step-40000.ckpt", allow_auto_download=False
+)
+```
+
+## Model Loading Comparison
+
+The following results compare the model loading cost of TabICLv2 and TabLDM:
+
+| Model | GPU Memory (GB) | Loading Time (s) | Parameters (M) |
+| ----- | --------------- | ---------------- | -------------- |
+| TabICLv2 (clf) | 0.106 | 1.184 | 27.552 |
+| TabLDM (clf) | 0.271 | 4.533 | 70.075 |
+| TabICLv2 (reg) | 0.109 | 1.587 | 28.545 |
+| TabLDM (reg) | 0.275 | 4.627 | 71.083 |
+
+## Available Models
+
+| Model | Architecture | Classifier | Regressor |
+| ----- | ------------ | ---------- | --------- |
+| **MoE1** | 2 routed experts (top-1) + 1 shared expert, with MoE layers in the final 8 layers | `TabLDMClassifier` | `TabLDMRegressor` |
+
+> The current inference package supports only MoE1 checkpoints to ensure that the
+> model architecture matches the `state_dict`.
+
+### MoE Checkpoint Example
+
+For a TabLDM-MoE checkpoint, such as a `clf_stage3_..._moe1_...` artifact produced
+by the training project, use the matching estimator:
+
+```python
+from tabldm import TabLDMClassifier   # 2 experts, top-1
+
+clf = TabLDMClassifier(
+    model_path="outputs/clf_stage3_..._moe1_.../step-40000.ckpt",
+    device="cuda",
+)
+clf.fit(X_train, y_train)
+clf.predict(X_test)
+```
+
+The corresponding regression estimator is `TabLDMRegressor`.
+
+## Testing
+
+```bash
+cd Xiaomi-TabLDM
+pytest tests/test_infer_package.py -v
+```
+
+By default, the tests look for a stage-3 MoE1 checkpoint in `../checkpoints`. Override
+this location with the `TABLDM_CKPT_DIR` environment variable. If no checkpoint is
+found, the tests are skipped automatically.
+
+## License
+
+This project is released under the [Apache License 2.0](LICENSE).
+
+Copyright (C) 2026 Xiaomi Corporation
+
+## FAQ
+
+**What is TabLDM?**
+TabLDM is a tabular foundation model similar to TabPFN and TabICL. It learns new data
+through in-context learning in a single forward pass of a pretrained Transformer:
+`y_pred = model(X_train, y_train, X_test)` (called internally by `predict()`).
+Its learning capability comes from pretraining on large-scale synthetic data.
+
+**How fast is TabLDM?**
+For a dataset with $n$ training rows and $m$ columns, the runtime complexity is
+$O(n^2 + nm^2)$. KV caching accelerates repeated inference on the same training data,
+while CPU/disk offloading enables larger datasets to be processed without running
+out of memory.
+
+**What dataset sizes are suitable?**
+The pretraining data covers hundreds to tens of thousands of training samples and
+datasets ranging from a few to more than one hundred feature columns. The model can
+extrapolate to larger scales, although accuracy may decline as the data moves beyond
+the training distribution. Specific recommended ranges will be added after empirical
+evaluation.
+
+## Preprocessing
+
+### Built-In Preprocessing
+
+For `X`, TabLDM accepts either a pandas DataFrame or a NumPy array and performs the
+following operations:
+
+- Detect and ordinal-encode categorical columns, including string, object, category,
+  and boolean columns. In NumPy arrays, all columns share the same data type, and
+  integer columns are treated as numerical.
+- Create a separate category for missing values in categorical features.
+- Mean-impute missing numerical values encoded as NaN.
+- Detect and clip outliers.
+- Scale and normalize features.
+- Permute features to increase ensemble diversity.
+
+## Package Layout
+
+```
+tabldm/
+├── __init__.py          # Public API: estimators + InferenceConfig
+├── __about__.py         # Version number
+├── _model/              # PyTorch model + inference engine
+│   ├── tabldm.py                 # Base TabLDM module
+│   ├── attnres_light_rmsnorm.py # AttnRes/RMSNorm architecture
+│   ├── attnres_light_rmsnorm_moe.py # MoE1 architecture
+│   ├── embedding*.py, interaction.py, learning.py, encoders.py, layers.py
+│   ├── attention.py, rope.py, ssmax.py, moe.py, quantile_dist.py
+│   ├── kv_cache.py, kv_cache_attnres.py
+│   ├── inference.py, inference_config.py
+└── _sklearn/            # scikit-learn interface
+    ├── base.py, classifier.py, regressor.py
+    ├── preprocessing.py, sklearn_utils.py
+    └── *_dualstream_moe.py   # MoE1 estimators
+```
+
+## To Do
+
+The following items are organized according to the structure of the
+[TabICL README](https://github.com/soda-inria/tabicl). They are currently missing and
+should be added in the future:
+
+- [ ] **Benchmark figures:** There is no `docs/figures` directory. Add performance
+  comparison figures and Pareto-frontier plots for benchmarks such as TabArena and
+  TALENT.
+- [ ] **Measured speed and scale results:** The complexity description in the FAQ is
+  inherited from TabICL. Add TabLDM-specific measurements of runtime and supported
+  sample/feature sizes on specific hardware such as H100, A100, and CPU.
+- [ ] **Paper citation:** No TabLDM paper link or BibTeX entry is currently available.
+- [ ] **Contributors:** Confirm the list of authors and maintainers.
+- [ ] **Tutorials:** There is no `tutorials/` directory. Add end-to-end examples for
+  classification, regression, KV caching, and MoE.
+- [ ] **Advanced preprocessing (skrub integration):** If support for a skrub
+  `TableVectorizer` pipeline is validated, add a dirty-data preprocessing example
+  similar to the one in TabICL.
+- [ ] **Star History:** Add a Star History chart after the repository becomes public.
