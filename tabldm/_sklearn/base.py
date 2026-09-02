@@ -142,6 +142,47 @@ class TabLDMBaseEstimator(BaseEstimator):
 
         return use_amp, use_fa3
 
+    def _resolve_batch_size(self) -> None:
+        """Resolve the ``"auto"`` option for ``batch_size``.
+
+        Called by ``_build_inference_config`` at ``fit()`` and ``__setstate__``.
+        An explicit int (or None) is stored as-is in ``batch_size_``. ``"auto"``
+        triggers a heuristic based on ``n_samples_in_ * n_features_in_``,
+        mirroring the scaling used by production benchmarking scripts to
+        reduce CUDA memory pressure on large datasets:
+
+        +--------------------------+-------------+
+        | n_samples_in_ * n_features_in_ | batch_size_ |
+        +==========================+=============+
+        | <= 2,000,000             |     8       |
+        +--------------------------+-------------+
+        | <= 5,000,000             |     4       |
+        +--------------------------+-------------+
+        | <= 10,000,000             |     2       |
+        +--------------------------+-------------+
+        | >  10,000,000             |     1       |
+        +--------------------------+-------------+
+
+        ``batch_size`` controls how many ensemble estimators are processed
+        per forward pass, not how the data rows are chunked, so this only
+        trades wall-clock time for memory and does not change numerical
+        results.
+        """
+        if self.batch_size == "auto":
+            n_samples = getattr(self, "n_samples_in_", 0)
+            n_features = getattr(self, "n_features_in_", 0)
+            n_cells = n_samples * n_features
+            if n_cells <= 2_000_000:
+                self.batch_size_ = 8
+            elif n_cells <= 5_000_000:
+                self.batch_size_ = 4
+            elif n_cells <= 10_000_000:
+                self.batch_size_ = 2
+            else:
+                self.batch_size_ = 1
+        else:
+            self.batch_size_ = self.batch_size
+
     def _build_inference_config(self) -> None:
         """Build the inference configuration from init parameters.
 
@@ -149,6 +190,7 @@ class TabLDMBaseEstimator(BaseEstimator):
         the inference config after loading from a persisted file.
         """
         use_amp, use_fa3 = self._resolve_amp_fa3()
+        self._resolve_batch_size()
 
         init_config = {
             "COL_CONFIG": {

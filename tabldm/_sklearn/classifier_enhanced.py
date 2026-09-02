@@ -136,8 +136,10 @@ class TabLDMEnhancedClassifier(ClassifierMixin, TabLDMBaseEstimator):
     support_many_classes : bool, default=True
         Enable many-class support (mixed-radix + hierarchical).
 
-    batch_size : Optional[int], default=8
-        Batch size for inference.
+    batch_size : int, "auto", or None, default=8
+        Batch size for inference. ``"auto"`` picks a value based on
+        ``n_samples_in_ * n_features_in_`` to reduce CUDA memory pressure on
+        large datasets (<=1M cells -> 8, <=2M -> 4, <=5M -> 2, else 1).
 
     kv_cache : bool or str, default=False
         KV cache mode. Not compatible with ``enhance_candidates=True``.
@@ -245,7 +247,7 @@ class TabLDMEnhancedClassifier(ClassifierMixin, TabLDMBaseEstimator):
         softmax_temperature: float = 0.9,
         average_logits: bool = True,
         support_many_classes: bool = True,
-        batch_size: Optional[int] = 8,
+        batch_size: Optional[int | str] = 4,
         kv_cache: bool | str = False,
         model_path: Optional[str | Path] = None,
         allow_auto_download: bool = True,
@@ -552,7 +554,7 @@ class TabLDMEnhancedClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.model_kv_cache_ = OrderedDict()
 
         for norm_method, (Xs, ys) in train_data.items():
-            batch_size = self.batch_size or Xs.shape[0]
+            batch_size = self.batch_size_ or Xs.shape[0]
             n_batches = int(np.ceil(Xs.shape[0] / batch_size))
             Xs_split = np.array_split(Xs, n_batches)
             ys_split = np.array_split(ys, n_batches)
@@ -899,7 +901,7 @@ class TabLDMEnhancedClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 f"{n_bad_xs}/{Xs.size} non-finite values (shape={Xs.shape})"
             )
 
-        batch_size = self.batch_size or Xs.shape[0]
+        batch_size = self.batch_size_ or Xs.shape[0]
         n_batches = int(np.ceil(Xs.shape[0] / batch_size))
         Xs_split = np.array_split(Xs, n_batches)
         ys_split = np.array_split(ys, n_batches)
@@ -940,7 +942,7 @@ class TabLDMEnhancedClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """Process model forward passes in batches."""
-        batch_size = self.batch_size or Xs.shape[0]
+        batch_size = self.batch_size_ or Xs.shape[0]
         n_batches = np.ceil(Xs.shape[0] / batch_size)
         Xs = np.array_split(Xs, n_batches)
         ys = np.array_split(ys, n_batches)
@@ -970,7 +972,7 @@ class TabLDMEnhancedClassifier(ClassifierMixin, TabLDMBaseEstimator):
     def _batch_forward_with_cache(self, Xs: np.ndarray, kv_cache: TabLDMCache) -> np.ndarray:
         """Process model forward passes using a pre-computed KV cache."""
         n_total = Xs.shape[0]
-        batch_size = self.batch_size or n_total
+        batch_size = self.batch_size_ or n_total
         n_batches = int(np.ceil(n_total / batch_size))
         Xs_split = np.array_split(Xs, n_batches)
 

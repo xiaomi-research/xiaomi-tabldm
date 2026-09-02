@@ -129,8 +129,10 @@ class TabLDMEnhancedRegressor(RegressorMixin, TabLDMBaseEstimator):
     outlier_threshold : float, default=4.0
         Z-score threshold for outlier detection.
 
-    batch_size : Optional[int], default=8
-        Batch size for inference.
+    batch_size : int, "auto", or None, default=8
+        Batch size for inference. ``"auto"`` picks a value based on
+        ``n_samples_in_ * n_features_in_`` to reduce CUDA memory pressure on
+        large datasets (<=1M cells -> 8, <=2M -> 4, <=5M -> 2, else 1).
 
     kv_cache : bool or str, default=False
         KV cache mode. Not compatible with ``enhance_candidates=True``.
@@ -213,7 +215,7 @@ class TabLDMEnhancedRegressor(RegressorMixin, TabLDMBaseEstimator):
         norm_methods: Optional[str | List[str]] = None,
         feat_shuffle_method: str = "latin",
         outlier_threshold: float = 4.0,
-        batch_size: Optional[int] = 8,
+        batch_size: Optional[int | str] = 4,
         kv_cache: bool | str = False,
         model_path: Optional[str | Path] = None,
         allow_auto_download: bool = True,
@@ -235,7 +237,7 @@ class TabLDMEnhancedRegressor(RegressorMixin, TabLDMBaseEstimator):
         k_fold: bool = True,
         n_splits: int = 5,
         foundation_rate: float = 0.25,
-        max_num_features: Optional[int] = 500,
+        max_num_features: Optional[int] = 300,
         enable_high_kurtosis_target_ensemble: bool = True,
         high_kurtosis_threshold: float = 10.0,
         high_kurtosis_n_estimators: int = 8,
@@ -794,7 +796,7 @@ class TabLDMEnhancedRegressor(RegressorMixin, TabLDMBaseEstimator):
                 [Xs[i][:, feat_indices[i]] for i in range(Xs.shape[0])], axis=0
             )
 
-        batch_size = self.batch_size or Xs.shape[0]
+        batch_size = self.batch_size_ or Xs.shape[0]
         n_batches = np.ceil(Xs.shape[0] / batch_size)
         Xs = np.array_split(Xs, n_batches)
         ys = np.array_split(ys, n_batches)
@@ -836,7 +838,7 @@ class TabLDMEnhancedRegressor(RegressorMixin, TabLDMBaseEstimator):
     ) -> np.ndarray | dict[str, np.ndarray]:
         """Process model forward passes using a pre-computed KV cache."""
         n_total = Xs.shape[0]
-        batch_size = self.batch_size or n_total
+        batch_size = self.batch_size_ or n_total
         n_batches = int(np.ceil(n_total / batch_size))
         Xs_split = np.array_split(Xs, n_batches)
 
@@ -1096,7 +1098,7 @@ class TabLDMEnhancedRegressor(RegressorMixin, TabLDMBaseEstimator):
             train_data = generator.transform(X=None, mode="train")
             kv_cache_dict = OrderedDict()
             for norm_method, (Xs, ys) in train_data.items():
-                batch_size = self.batch_size or Xs.shape[0]
+                batch_size = self.batch_size_ or Xs.shape[0]
                 n_batches = int(np.ceil(Xs.shape[0] / batch_size))
                 Xs_split = np.array_split(Xs, n_batches)
                 ys_split = np.array_split(ys, n_batches)
