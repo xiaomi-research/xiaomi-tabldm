@@ -36,7 +36,7 @@ regressor = TabLDMRegressor(
     n_estimators=2,
     device="cpu",
     model_path=os.environ.get("TABLDM_REG_CKPT"),
-    checkpoint_version="checkpoints/reg_stage3_moe1_step-10000.ckpt",
+    checkpoint_version="checkpoints/reg_default.ckpt",
 )
 regressor.fit(X_train, y_train)
 

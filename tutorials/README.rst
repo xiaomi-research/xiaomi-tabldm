@@ -32,8 +32,8 @@ By default, TabLDM downloads the configured checkpoint from Hugging Face Hub on
 the first ``fit()`` call. To run fully offline, pass an existing checkpoint file
 to ``model_path``. The default Hub checkpoint paths are::
 
-    checkpoints/clf_stage3_moe1_step-10000.ckpt
-    checkpoints/reg_stage3_moe1_step-10000.ckpt
+    checkpoints/clf_default.ckpt
+    checkpoints/reg_default.ckpt
 
 The examples also support local checkpoint overrides. When set, these
 environment variables take precedence over the default Hub checkpoints::

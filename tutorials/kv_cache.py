@@ -39,7 +39,7 @@ classifier = TabLDMClassifier(
     kv_cache=True,
     device="cpu",
     model_path=os.environ.get("TABLDM_CLF_CKPT"),
-    checkpoint_version="checkpoints/clf_stage3_moe1_step-10000.ckpt",
+    checkpoint_version="checkpoints/clf_default.ckpt",
 )
 classifier.fit(X_train, y_train)
 

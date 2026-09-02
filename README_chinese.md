@@ -183,7 +183,7 @@ clf = TabLDMClassifier(
     kv_cache=False,               # 缓存训练数据 KV 投影，加速重复推理
     model_path=None,              # checkpoint 路径，None 则从 Hugging Face 下载
     allow_auto_download=True,     # 本地不存在时自动下载
-    checkpoint_version="checkpoints/clf_stage3_moe1_step-10000.ckpt",  # 预训练 checkpoint 版本
+    checkpoint_version="checkpoints/clf_default.ckpt",  # 预训练 checkpoint 版本
     device=None,                  # 推理设备，None 自动选择 CUDA 或 CPU
     use_amp="auto",               # 自动混合精度，加速推理
     use_fa3="auto",               # Hopper GPU（如 H100）的 Flash Attention 3
@@ -221,10 +221,10 @@ checkpoint 按以下顺序解析：
 
 当前公开的 MoE1 加载器使用 Hugging Face 仓库
 `occams/Xiaomi-TabLDM`。因此，默认分类 checkpoint
-`checkpoints/clf_stage3_moe1_step-10000.ckpt` 对应的文件地址为：
+`checkpoints/clf_default.ckpt` 对应的文件地址为：
 
 ```text
-https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_stage3_moe1_step-10000.ckpt
+https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt
 ```
 
 `checkpoint_version` 表示该仓库中的文件名，而不是本地文件系统路径。

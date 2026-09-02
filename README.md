@@ -186,7 +186,7 @@ clf = TabLDMClassifier(
     kv_cache=False,               # Cache training-data KV projections for repeated inference
     model_path=None,              # Checkpoint path; None downloads from Hugging Face
     allow_auto_download=True,     # Download automatically when not found locally
-    checkpoint_version="checkpoints/clf_stage3_moe1_step-10000.ckpt",  # Pretrained checkpoint version
+    checkpoint_version="checkpoints/clf_default.ckpt",  # Pretrained checkpoint version
     device=None,                  # Inference device; None selects CUDA or CPU automatically
     use_amp="auto",               # Automatic mixed precision for faster inference
     use_fa3="auto",               # Flash Attention 3 on Hopper GPUs such as H100
@@ -225,10 +225,10 @@ Checkpoints are resolved in the following order:
 
 The public MoE1 loader uses the Hugging Face repository
 `occams/Xiaomi-TabLDM`. Therefore, the default classifier checkpoint
-`checkpoints/clf_stage3_moe1_step-10000.ckpt` corresponds to:
+`checkpoints/clf_default.ckpt` corresponds to:
 
 ```text
-https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_stage3_moe1_step-10000.ckpt
+https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt
 ```
 
 The `checkpoint_version` value is the filename inside this repository, not a

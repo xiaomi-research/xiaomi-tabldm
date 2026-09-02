@@ -251,7 +251,7 @@ class TabLDMEnhancedClassifier(ClassifierMixin, TabLDMBaseEstimator):
         kv_cache: bool | str = False,
         model_path: Optional[str | Path] = None,
         allow_auto_download: bool = True,
-        checkpoint_version: str = "checkpoints/clf_stage3_moe1_step-10000.ckpt",
+        checkpoint_version: str = "checkpoints/clf_default.ckpt",
         device: Optional[str | torch.device] = None,
         use_amp: bool | str = "auto",
         use_fa3: bool | str = "auto",

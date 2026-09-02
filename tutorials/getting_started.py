@@ -29,7 +29,7 @@ classifier = TabLDMClassifier(
     n_estimators=2,
     device="cpu",
     model_path=os.environ.get("TABLDM_CLF_CKPT"),
-    checkpoint_version="checkpoints/clf_stage3_moe1_step-10000.ckpt",
+    checkpoint_version="checkpoints/clf_default.ckpt",
 )
 classification_scores = cross_val_score(
     classifier,
@@ -55,7 +55,7 @@ regressor = TabLDMRegressor(
     n_estimators=2,
     device="cpu",
     model_path=os.environ.get("TABLDM_REG_CKPT"),
-    checkpoint_version="checkpoints/reg_stage3_moe1_step-10000.ckpt",
+    checkpoint_version="checkpoints/reg_default.ckpt",
 )
 regression_scores = cross_val_score(
     regressor,
