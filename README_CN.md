@@ -59,7 +59,7 @@
     width="800"
   >
   <br>
-  <em>图 1. TALENT 上的整体排名。</em>
+  <em>图 1. TALENT 上的整体排名（越低越好）。</em>
 </div>
 
 <div align="center">
@@ -69,7 +69,7 @@
     width="800"
   >
   <br>
-  <em>图 2. TabArena 上的回归 Elo 性能。</em>
+  <em>图 2. TabArena 上的回归 Elo 性能（越高越好）。</em>
 </div>
 
 <div align="center">

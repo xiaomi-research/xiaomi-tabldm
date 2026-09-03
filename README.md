@@ -57,7 +57,7 @@ Predictions are produced through in-context learning in a single forward pass.
     width="800"
   >
   <br>
-  <em>Figure 1. Overall rank on TALENT.</em>
+  <em>Figure 1. Overall rank on TALENT (lower is better).</em>
 </div>
 
 <div align="center">
@@ -67,7 +67,7 @@ Predictions are produced through in-context learning in a single forward pass.
     width="800"
   >
   <br>
-  <em>Figure 2. Regression Elo performance on TabArena.</em>
+  <em>Figure 2. Regression Elo performance on TabArena (higher is better).</em>
 </div>
 
 <div align="center">
