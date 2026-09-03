@@ -1,4 +1,19 @@
-# Xiaomi-TabLDM: A Tabular Foundation Model
+<p align="left">
+    <a href="README_CN.md">中文</a>&nbsp ｜ &nbspEnglish&nbsp</a>
+</p>
+<br><br>
+
+<h3 align="center">
+  <b>
+    <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+    <br/>
+    Xiaomi-TabLDM：A Tabular Large Data Foundation Model<br/>For Classification and Regression via In-context Learning
+    <br/>
+    <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+    <br/>
+  </b>
+</h3>
+
 
 <div align="center">
   <img
