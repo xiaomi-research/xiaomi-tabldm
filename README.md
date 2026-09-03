@@ -10,7 +10,6 @@
 </h3>
 
 <div align="center" style="line-height: 1;">
-  |
   <a href="https://huggingface.co/occams/Xiaomi-TabLDM" target="_blank">🤗 HuggingFace</a>
   &nbsp;|
   <a href="https://arxiv.org/abs" target="_blank">📔 Technical Report</a>
