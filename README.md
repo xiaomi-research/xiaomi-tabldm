@@ -1,16 +1,12 @@
 # Xiaomi-TabLDM: A Tabular Foundation Model
 
 <div align="center">
-  <a href="assets/Xiaomi-TabLDM.pdf">
-    <img
-      src="assets/Xiaomi-TabLDM.png"
-      alt="Xiaomi-TabLDM"
-      width="800"
-    >
+  <img
+    src="assets/Xiaomi-TabLDM.png"
+    alt="Xiaomi-TabLDM"
+    width="800"
+  >
   </a>
-  <p>
-    <a href="assets/Xiaomi-TabLDM.pdf">查看完整 PDF</a>
-  </p>
   <br>
   <a href="https://huggingface.co/occams/Xiaomi-TabLDM">
     <img
