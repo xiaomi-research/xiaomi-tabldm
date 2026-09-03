@@ -6,15 +6,35 @@
     alt="Xiaomi-TabLDM"
     width="800"
   >
-  </a>
-  <br>
-  <a href="https://huggingface.co/occams/Xiaomi-TabLDM">
-    <img
-      src="https://img.shields.io/badge/Hugging%20Face-Model-yellow?logo=huggingface&logoColor=black"
-      alt="Hugging Face"
-    >
-  </a>
 </div>
+
+<h3 align="center">
+  <b>
+    <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+    <br/>
+    Unlocking the Reasoning Potential of Language Model<br/>From Pretraining to Posttraining
+    <br/>
+    <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+    <br/>
+  </b>
+</h3>
+
+<br/>
+
+<div align="center" style="line-height: 1;">
+  |
+  <a href="https://huggingface.co/XiaomiMiMo" target="_blank">🤗 HuggingFace</a>
+  &nbsp;|
+  <a href="https://www.modelscope.cn/organization/XiaomiMiMo" target="_blank">🤖️ ModelScope</a>
+  &nbsp;|
+  <a href="https://arxiv.org/abs/2505.07608" target="_blank">📔 Technical Report</a>
+  &nbsp;|
+  <br/>
+</div>
+
+<br/>
+
+---
 
 This repository is the official implementation of **Xiaomi-TabLDM**, featuring the tabular foundation model **TabLDM**.
 
