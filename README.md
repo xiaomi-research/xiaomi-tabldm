@@ -1,15 +1,3 @@
-<p align="left">
-    <a href="README_CN.md">中文</a>&nbsp ｜ &nbspEnglish&nbsp</a>
-</p>
-
-<div align="center">
-  <img
-    src="assets/Xiaomi-TabLDM.png"
-    alt="Xiaomi-TabLDM"
-    width="800"
-  >
-</div>
-
 <h3 align="center">
   <b>
     <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
@@ -21,7 +9,9 @@
   </b>
 </h3>
 
-<br/>
+<p align="left">
+    <a href="README_CN.md">中文</a>&nbsp ｜ &nbspEnglish&nbsp</a>
+</p>
 
 <div align="center" style="line-height: 1;">
   |
@@ -51,6 +41,15 @@ Tabular foundation models establish a general prediction paradigm based on in-co
 Predictions are produced through in-context learning in a single forward pass.
 
 **Fast:** With KV caching, repeated calls to `predict` on the same training data can reuse cached context projections, significantly accelerating repeated inference. A GPU is recommended for larger datasets, and CPU/disk offloading can be used to scale to larger data sizes.
+
+
+<div align="center">
+  <img
+    src="assets/Xiaomi-TabLDM.png"
+    alt="Xiaomi-TabLDM"
+    width="800"
+  >
+</div>
 
 ## Performance
 
