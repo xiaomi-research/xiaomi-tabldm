@@ -9,15 +9,15 @@
   </b>
 </h3>
 
-<p align="left">
-    <a href="README_CN.md">中文</a>&nbsp ｜ &nbspEnglish&nbsp</a>
-</p>
-
 <div align="center" style="line-height: 1;">
   |
   <a href="https://huggingface.co/occams/Xiaomi-TabLDM" target="_blank">🤗 HuggingFace</a>
   &nbsp;|
-  <a href="https://arxiv.org/abs/2505.07608" target="_blank">📔 Technical Report</a>
+  <a href="https://arxiv.org/abs" target="_blank">📔 Technical Report</a>
+  &nbsp;|
+  <a href="README_CN.md" target="_blank">中文</a>
+  &nbsp;|
+  English
   &nbsp;|
   <br/>
 </div>
