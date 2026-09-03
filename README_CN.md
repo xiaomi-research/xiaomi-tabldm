@@ -2,7 +2,7 @@
 
 <div align="center">
   <img
-    src="image/README/1787623284744.jpg"
+    src="assets/Xiaomi-TabLDM.png"
     alt="Xiaomi-TabLDM"
     width="800"
   >
@@ -35,7 +35,7 @@
 
 <div align="center">
   <img
-    src="image/README/Xiaomi-TabLDM_TALENT_Fig1.png"
+    src="assets/Xiaomi-TabLDM_TALENT_Fig1.png"
     alt="TALENT 上的整体排名"
     width="800"
   >
@@ -45,7 +45,7 @@
 
 <div align="center">
   <img
-    src="image/README/Xiaomi-TabLDM_TabArena_Fig1.png"
+    src="assets/Xiaomi-TabLDM_TabArena_Fig1.png"
     alt="TabArena 上的回归 Elo 性能"
     width="800"
   >
@@ -55,7 +55,7 @@
 
 <div align="center">
   <img
-    src="image/README/Xiaomi-TabLDM_BCCO_Fig2.png"
+    src="assets/Xiaomi-TabLDM_BCCO_Fig2.png"
     alt="BCCO 上的性能"
     width="800"
   >
@@ -65,7 +65,7 @@
 
 <div align="center">
   <img
-    src="image/README/Xiaomi-TabLDM__OpenML-CTR23_Fig8.png"
+    src="assets/Xiaomi-TabLDM__OpenML-CTR23_Fig8.png"
     alt="OpenML-CTR23 上的性能"
     width="800"
   >
@@ -75,7 +75,7 @@
 
 <div align="center">
   <img
-    src="image/README/Xiaomi-TabLDM_TrainingEfficiency_Fig10.png"
+    src="assets/Xiaomi-TabLDM_TrainingEfficiency_Fig10.png"
     alt="训练效率"
     width="800"
   >
