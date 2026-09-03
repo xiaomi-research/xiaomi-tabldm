@@ -86,7 +86,7 @@ Predictions are produced through in-context learning in a single forward pass.
 ## Installation
 
 ```bash
-cd Xiaomi-TabLDM
+cd xiaomi-tabldm
 pip install .
 ```
 
@@ -117,7 +117,7 @@ Then install `tabldm` as described above.
 ```python
 from tabldm import TabLDMClassifier
 
-clf = TabLDMClassifier(model_path="checkpoints/clf_moe1.ckpt")
+clf = TabLDMClassifier(model_path="checkpoints/clf_default.ckpt")
 clf.fit(X_train, y_train)          # In-context learning: no weight updates
 pred = clf.predict(X_test)
 proba = clf.predict_proba(X_test)  # (n_test, n_classes)
@@ -128,7 +128,7 @@ proba = clf.predict_proba(X_test)  # (n_test, n_classes)
 ```python
 from tabldm import TabLDMRegressor
 
-reg = TabLDMRegressor(model_path="checkpoints/reg_moe1.ckpt")
+reg = TabLDMRegressor(model_path="checkpoints/reg_default.ckpt")
 reg.fit(X_train, y_train)
 pred = reg.predict(X_test)
 ```
@@ -152,7 +152,7 @@ requires additional GPU/CPU memory, so choose the setting based on your use case
 
 ```python
 clf = TabLDMClassifier(
-    kv_cache=True, model_path="checkpoints/clf_moe1.ckpt"
+    kv_cache=True, model_path="checkpoints/clf_default.ckpt"
 )
 clf.fit(X_train, y_train)          # Build the cache once
 clf.predict(X_test_batch_1)        # Reuse the cached context
@@ -242,23 +242,18 @@ clf = TabLDMClassifier(
 
 ## Available Models
 
-| Model          | Architecture                                                                      | Classifier           | Regressor           |
-| -------------- | --------------------------------------------------------------------------------- | -------------------- | ------------------- |
-| **MoE1** | 2 routed experts (top-1) + 1 shared expert, with MoE layers in the final 8 layers | [`TabLDMClassifier`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt) | [`TabLDMRegressor`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/reg_default.ckpt) |
+| Model          | Classifier           | Regressor           |
+| -------------- | -------------------- | ------------------- |
+| **TabLDM** | [`TabLDMClassifier`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt) | [`TabLDMRegressor`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/reg_default.ckpt) |
 
-> The current inference package supports only MoE1 checkpoints to ensure that the
-> model architecture matches the `state_dict`.
 
 ### Example
 
-For a TabLDM-MoE checkpoint, such as a `clf_stage3_..._moe1_...` artifact produced
-by the training project, use the matching estimator:
-
 ```python
-from tabldm import TabLDMClassifier   # 2 experts, top-1
+from tabldm import TabLDMClassifier 
 
 clf = TabLDMClassifier(
-    model_path="outputs/clf_stage3_..._moe1_.../step-40000.ckpt",
+    model_path="outputs/clf_default.ckpt",
     device="cuda",
 )
 clf.fit(X_train, y_train)
@@ -270,11 +265,11 @@ The corresponding regression estimator is `TabLDMRegressor`.
 ## Testing
 
 ```bash
-cd Xiaomi-TabLDM
+cd xiaomi-tabldm
 pytest tests/test_infer_package.py -v
 ```
 
-By default, the tests look for a stage-3 MoE1 checkpoint in `../checkpoints`. Override
+By default, the tests look for checkpoints in `../checkpoints`. Override
 this location with the `TABLDM_CKPT_DIR` environment variable. If no checkpoint is
 found, the tests are skipped automatically.
 
@@ -330,7 +325,7 @@ tabldm/
 ├── _model/              # PyTorch model + inference engine
 │   ├── tabldm.py                 # Base TabLDM module
 │   ├── attnres_light_rmsnorm.py # AttnRes/RMSNorm architecture
-│   ├── attnres_light_rmsnorm_moe.py # MoE1 architecture
+│   ├── attnres_light_rmsnorm_moe.py # MoE architecture
 │   ├── embedding*.py, interaction.py, learning.py, encoders.py, layers.py
 │   ├── attention.py, rope.py, ssmax.py, moe.py, quantile_dist.py
 │   ├── kv_cache.py, kv_cache_attnres.py
@@ -338,7 +333,7 @@ tabldm/
 └── _sklearn/            # scikit-learn interface
     ├── base.py, classifier.py, regressor.py
     ├── preprocessing.py, sklearn_utils.py
-    └── *_dualstream_moe.py   # MoE1 estimators
+    └── *_dualstream_moe.py   # MoE estimators
 ```
 
 ## Citation
