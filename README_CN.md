@@ -92,16 +92,6 @@
   <em>图 4. OpenML-CTR23 上 33 个回归数据集的平均排名对比。</em>
 </div>
 
-<div align="center">
-  <img
-    src="assets/Xiaomi-TabLDM_TrainingEfficiency_Fig10.png"
-    alt="训练效率"
-    width="800"
-  >
-  <br>
-  <em>图 5. 不同任务类型下训练效率与可改进性之间的权衡：（左）分类性能，（右）整体任务。</em>
-</div>
-
 ## 安装
 
 ```bash

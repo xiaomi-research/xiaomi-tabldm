@@ -90,16 +90,6 @@ Predictions are produced through in-context learning in a single forward pass.
   <em>Figure 4. Average-rank comparison on OpenML-CTR23 over 33 regression datasets.</em>
 </div>
 
-<div align="center">
-  <img
-    src="assets/Xiaomi-TabLDM_TrainingEfficiency_Fig10.png"
-    alt="Training efficiency"
-    width="800"
-  >
-  <br>
-  <em>Figure 5. Training efficiency and improvability trade-offs across different task types: (left)classification performance, (right)overall tasks.</em>
-</div>
-
 ## Installation
 
 ```bash
