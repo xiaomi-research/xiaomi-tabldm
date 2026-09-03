@@ -2,7 +2,7 @@
 
 <div align="center">
   <img
-    src="assetsXiaomi-TabLDM.pdf"
+    src="assets/Xiaomi-TabLDM.pdf"
     alt="Xiaomi-TabLDM"
     width="800"
   >
@@ -35,7 +35,7 @@ Predictions are produced through in-context learning in a single forward pass.
 
 <div align="center">
   <img
-    src="assetsXiaomi-TabLDM_TALENT_Fig1.png"
+    src="assets/Xiaomi-TabLDM_TALENT_Fig1.png"
     alt="Overall rank on TALENT"
     width="800"
   >
@@ -45,7 +45,7 @@ Predictions are produced through in-context learning in a single forward pass.
 
 <div align="center">
   <img
-    src="assetsXiaomi-TabLDM_TabArena_Fig1.png"
+    src="assets/Xiaomi-TabLDM_TabArena_Fig1.png"
     alt=" Regression Elo performance on TabArena"
     width="800"
   >
@@ -55,7 +55,7 @@ Predictions are produced through in-context learning in a single forward pass.
 
 <div align="center">
   <img
-    src="assetsXiaomi-TabLDM_BCCO_Fig2.png"
+    src="assets/Xiaomi-TabLDM_BCCO_Fig2.png"
     alt="Performance on BCCO"
     width="800"
   >
@@ -65,7 +65,7 @@ Predictions are produced through in-context learning in a single forward pass.
 
 <div align="center">
   <img
-    src="assetsXiaomi-TabLDM__OpenML-CTR23_Fig8.png"
+    src="assets/Xiaomi-TabLDM__OpenML-CTR23_Fig8.png"
     alt="Performance on OpenML-CTR23"
     width="800"
   >
@@ -75,7 +75,7 @@ Predictions are produced through in-context learning in a single forward pass.
 
 <div align="center">
   <img
-    src="assetsXiaomi-TabLDM_TrainingEfficiency_Fig10.png"
+    src="assets/Xiaomi-TabLDM_TrainingEfficiency_Fig10.png"
     alt="Training efficiency"
     width="800"
   >
