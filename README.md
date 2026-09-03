@@ -20,6 +20,7 @@
 </div>
 
 <br/>
+
 ---
 
 This repository is the official implementation of **Xiaomi-TabLDM**, featuring the tabular foundation model **TabLDM**.
