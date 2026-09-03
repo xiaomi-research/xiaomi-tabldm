@@ -1,7 +1,6 @@
 <p align="left">
     <a href="README_CN.md">中文</a>&nbsp ｜ &nbspEnglish&nbsp</a>
 </p>
-<br><br>
 
 <div align="center">
   <img
@@ -15,7 +14,7 @@
   <b>
     <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
     <br/>
-    Xiaomi-TabLDM：A Tabular Large Data Foundation Model<br/>For Classification and Regression via In-context Learning
+    Xiaomi-TabLDM: A Tabular Large Data Foundation Model<br/>For Classification and Regression via In-Context Learning
     <br/>
     <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
     <br/>
