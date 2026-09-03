@@ -18,8 +18,7 @@
   <a href="README_CN.md" target="_blank">中文</a>
   &nbsp;|
   English
-  &nbsp;|
-  <br/>
+  &nbsp;
 </div>
 
 <br/>
