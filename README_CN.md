@@ -1,15 +1,3 @@
-<p align="left">
-    中文</a>&nbsp ｜ &nbsp<a href="README.md">English</a>
-</p>
-
-<div align="center">
-  <img
-    src="assets/Xiaomi-TabLDM.png"
-    alt="Xiaomi-TabLDM"
-    width="800"
-  >
-</div>
-
 <h3 align="center">
   <b>
     <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
@@ -53,6 +41,14 @@
 预测通过上下文学习在单次前向传播中完成。
 
 **速度快：** 通过 KV 缓存，在同一份训练数据上重复调用 `predict` 时可以复用缓存的上下文投影，从而显著加速重复推理。对于较大的数据集，建议使用 GPU；同时可以通过 CPU / 磁盘卸载扩展到更大的数据规模。
+
+<div align="center">
+  <img
+    src="assets/Xiaomi-TabLDM.png"
+    alt="Xiaomi-TabLDM"
+    width="800"
+  >
+</div>
 
 ## 性能
 

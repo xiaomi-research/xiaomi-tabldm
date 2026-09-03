@@ -40,7 +40,6 @@ Predictions are produced through in-context learning in a single forward pass.
 
 **Fast:** With KV caching, repeated calls to `predict` on the same training data can reuse cached context projections, significantly accelerating repeated inference. A GPU is recommended for larger datasets, and CPU/disk offloading can be used to scale to larger data sizes.
 
-
 <div align="center">
   <img
     src="assets/Xiaomi-TabLDM.png"
