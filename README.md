@@ -3,6 +3,14 @@
 </p>
 <br><br>
 
+<div align="center">
+  <img
+    src="assets/Xiaomi-TabLDM.png"
+    alt="Xiaomi-TabLDM"
+    width="800"
+  >
+</div>
+
 <h3 align="center">
   <b>
     <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
@@ -13,15 +21,6 @@
     <br/>
   </b>
 </h3>
-
-
-<div align="center">
-  <img
-    src="assets/Xiaomi-TabLDM.png"
-    alt="Xiaomi-TabLDM"
-    width="800"
-  >
-</div>
 
 <br/>
 

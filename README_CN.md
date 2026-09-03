@@ -1,4 +1,7 @@
-# Xiaomi-TabLDM：表格基础模型
+<p align="left">
+    中文</a>&nbsp ｜ &nbsp<a href="README.md">English</a>
+</p>
+<br><br>
 
 <div align="center">
   <img
@@ -8,6 +11,16 @@
   >
 </div>
 
+<h3 align="center">
+  <b>
+    <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+    <br/>
+    Xiaomi-TabLDM：一种基于上下文学习的表格大型数据基础模型，用于分类与回归任务
+    <br/>
+    <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+    <br/>
+  </b>
+</h3>
 
 <br/>
 
