@@ -236,7 +236,7 @@ For fully offline inference, point `model_path` to a local file:
 
 ```python
 clf = TabLDMClassifier(
-    model_path="/path/to/step-40000.ckpt", allow_auto_download=False
+    model_path="checkpoints/clf_default.ckpt", allow_auto_download=False
 )
 ```
 
@@ -253,7 +253,7 @@ clf = TabLDMClassifier(
 from tabldm import TabLDMClassifier 
 
 clf = TabLDMClassifier(
-    model_path="outputs/clf_default.ckpt",
+    model_path="checkpoints/clf_default.ckpt",
     device="cuda",
 )
 clf.fit(X_train, y_train)

@@ -86,7 +86,7 @@
 ## 安装
 
 ```bash
-cd Xiaomi-TabLDM
+cd xiaomi-tabldm
 pip install .
 ```
 
@@ -117,7 +117,7 @@ conda install pytorch -c pytorch
 ```python
 from tabldm import TabLDMClassifier
 
-clf = TabLDMClassifier(model_path="checkpoints/clf_moe1.ckpt")
+clf = TabLDMClassifier(model_path="checkpoints/clf_default.ckpt")
 clf.fit(X_train, y_train)          # 上下文学习：不更新权重
 pred = clf.predict(X_test)
 proba = clf.predict_proba(X_test)  # (n_test, n_classes)
@@ -128,7 +128,7 @@ proba = clf.predict_proba(X_test)  # (n_test, n_classes)
 ```python
 from tabldm import TabLDMRegressor
 
-reg = TabLDMRegressor(model_path="checkpoints/reg_moe1.ckpt")
+reg = TabLDMRegressor(model_path="checkpoints/reg_default.ckpt")
 reg.fit(X_train, y_train)
 pred = reg.predict(X_test)
 ```
@@ -143,7 +143,7 @@ pred = reg.predict(X_test)
 
 ```python
 clf = TabLDMClassifier(
-    kv_cache=True, model_path="checkpoints/clf_moe1.ckpt"
+    kv_cache=True, model_path="checkpoints/clf_default.ckpt"
 )
 clf.fit(X_train, y_train)          # 一次性构建缓存
 clf.predict(X_test_batch_1)        # 复用缓存的上下文
@@ -213,34 +213,29 @@ checkpoint 按以下顺序解析：
 
 
 
-`checkpoint_version` 表示Hugging Face 仓库中的文件名，而不是本地文件系统路径。程序会首先从本地 Hugging Face 缓存中查找（通常位于 `~/.cache/huggingface/hub`）；如果缓存中不存在该文件，并且 `allow_auto_download=True`，则会自动下载。
+`checkpoint_version` 表示 Hugging Face 仓库中的文件名，而不是本地文件系统路径。程序会首先从本地 Hugging Face 缓存中查找（通常位于 `~/.cache/huggingface/hub`）；如果缓存中不存在该文件，并且 `allow_auto_download=True`，则会自动下载。
 
 若需完全离线推理，将 `model_path` 指向本地文件：
 
 ```python
 clf = TabLDMClassifier(
-    model_path="/path/to/step-40000.ckpt", allow_auto_download=False
+    model_path="checkpoints/clf_default.ckpt", allow_auto_download=False
 )
 ```
 
 ## 可用模型
 
-| 模型 | 架构说明 | 分类估算器 | 回归估算器 |
-| --- | --- | --- | --- |
-| **MoE1** | 2 个路由专家（top-1）+ 1 个共享专家，MoE 层位于最后 8 层 | [`TabLDMClassifier`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt) | [`TabLDMRegressor`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/reg_default.ckpt) |
-
-> 当前推理包仅支持 MoE1 checkpoint，以确保模型架构与 `state_dict` 匹配。
+| 模型 | 分类估算器 | 回归估算器 |
+| --- | --- | --- |
+| **TabLDM** | [`TabLDMClassifier`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt) | [`TabLDMRegressor`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/reg_default.ckpt) |
 
 ### 示例
 
-对于 TabLDM-MoE checkpoint，例如训练项目生成的
-`clf_stage3_..._moe1_...` 产物，请使用匹配的估算器：
-
 ```python
-from tabldm import TabLDMClassifier   # 2 个专家，top-1
+from tabldm import TabLDMClassifier
 
 clf = TabLDMClassifier(
-    model_path="outputs/clf_stage3_..._moe1_.../step-40000.ckpt",
+    model_path="checkpoints/clf_default.ckpt",
     device="cuda",
 )
 clf.fit(X_train, y_train)
@@ -252,11 +247,11 @@ clf.predict(X_test)
 ## 测试
 
 ```bash
-cd Xiaomi-TabLDM
+cd xiaomi-tabldm
 pytest tests/test_infer_package.py -v
 ```
 
-测试默认在 `../checkpoints` 中查找 stage-3 MoE1 checkpoint。可以通过环境变量
+测试默认在 `../checkpoints` 中查找 checkpoint。可以通过环境变量
 `TABLDM_CKPT_DIR` 覆盖该位置。如果未找到 checkpoint，测试会自动跳过。
 
 ## 许可证
@@ -303,7 +298,7 @@ tabldm/
 ├── _model/              # PyTorch 模型 + 推理引擎
 │   ├── tabldm.py                 # 基础 TabLDM 模块
 │   ├── attnres_light_rmsnorm.py # AttnRes / RMSNorm 架构
-│   ├── attnres_light_rmsnorm_moe.py # MoE1 架构
+│   ├── attnres_light_rmsnorm_moe.py # MoE 架构
 │   ├── embedding*.py, interaction.py, learning.py, encoders.py, layers.py
 │   ├── attention.py, rope.py, ssmax.py, moe.py, quantile_dist.py
 │   ├── kv_cache.py, kv_cache_attnres.py
@@ -311,13 +306,13 @@ tabldm/
 └── _sklearn/            # scikit-learn 接口
     ├── base.py, classifier.py, regressor.py
     ├── preprocessing.py, sklearn_utils.py
-    └── *_dualstream_moe.py   # MoE1 估算器
+    └── *_dualstream_moe.py   # MoE 估算器
 ```
 
 ## Citation
 
-```bibtex
-@article{wang2026xiaomitablldm,
+```bash
+@article{wang2026xiaomitabldm,
   title         = {{Xiaomi-TabLDM}: Technical Report},
   author        = {Penghui Wang and Wei Liu and Hong Wang and Chengyue Huang and Yuxi Sun and Zirui Wang and Hongming Huang and Zhenwei Xin and Chunxiao Liu and Erli Meng and Bin Wang},
   year          = {2026},
@@ -325,4 +320,5 @@ tabldm/
   archivePrefix = {arXiv},
   primaryClass  = {cs.AI}
 }
+
 ```
