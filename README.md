@@ -1,8 +1,19 @@
 # Xiaomi-TabLDM: A Tabular Foundation Model
 
-![1787623284744](image/README/1787623284744.jpg)
-
-![Hugging Face](https://huggingface.co/occams/Xiaomi-TabLDM)
+<div align="center">
+  <img
+    src="image/README/1787623284744.jpg"
+    alt="Xiaomi-TabLDM"
+    width="800"
+  >
+  <br>
+  <a href="https://huggingface.co/occams/Xiaomi-TabLDM">
+    <img
+      src="https://img.shields.io/badge/Hugging%20Face-Model-yellow?logo=huggingface&logoColor=black"
+      alt="Hugging Face"
+    >
+  </a>
+</div>
 
 This repository is the official implementation of **Xiaomi-TabLDM**, featuring the tabular foundation model **TabLDM**.
 
@@ -203,15 +214,7 @@ clf = TabLDMClassifier(
 parameters `class_shuffle_method`, `softmax_temperature`, `average_logits`, and
 `support_many_classes`.
 
-For TALENT classification evaluation, the test script can additionally randomize the
-integer code mapping of categorical feature columns and class labels independently for
-each ensemble member:
 
-```bash
-python tests/infer_talent_cls.py --all --seed-num 3 --cat_randomEncode
-```
-
-`--cat_random` is also accepted as an alias for `--cat_randomEncode`.
 
 ## Loading Checkpoints
 
@@ -223,15 +226,8 @@ Checkpoints are resolved in the following order:
 3. If `model_path` is `None`, the checkpoint is retrieved from the Hugging Face Hub
    cache using `checkpoint_version` as the key.
 
-The public MoE1 loader uses the Hugging Face repository
-`occams/Xiaomi-TabLDM`. Therefore, the default classifier checkpoint
-`checkpoints/clf_default.ckpt` corresponds to:
 
-```text
-https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt
-```
-
-The `checkpoint_version` value is the filename inside this repository, not a
+The `checkpoint_version` value is the filename inside the Hugging Face repository, not a
 local filesystem path. The first lookup uses the local Hugging Face cache
 (typically `~/.cache/huggingface/hub`); if the file is not cached and
 `allow_auto_download=True`, it is downloaded automatically.
@@ -244,27 +240,16 @@ clf = TabLDMClassifier(
 )
 ```
 
-## Model Loading Comparison
-
-The following results compare the model loading cost of TabICLv2 and TabLDM:
-
-| Model | GPU Memory (GB) | Loading Time (s) | Parameters (M) |
-| ----- | --------------- | ---------------- | -------------- |
-| TabICLv2 (clf) | 0.106 | 1.184 | 27.552 |
-| TabLDM (clf) | 0.271 | 4.533 | 70.075 |
-| TabICLv2 (reg) | 0.109 | 1.587 | 28.545 |
-| TabLDM (reg) | 0.275 | 4.627 | 71.083 |
-
 ## Available Models
 
-| Model | Architecture | Classifier | Regressor |
-| ----- | ------------ | ---------- | --------- |
-| **MoE1** | 2 routed experts (top-1) + 1 shared expert, with MoE layers in the final 8 layers | `TabLDMClassifier` | `TabLDMRegressor` |
+| Model          | Architecture                                                                      | Classifier           | Regressor           |
+| -------------- | --------------------------------------------------------------------------------- | -------------------- | ------------------- |
+| **MoE1** | 2 routed experts (top-1) + 1 shared expert, with MoE layers in the final 8 layers | [`TabLDMClassifier`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt) | [`TabLDMRegressor`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/reg_default.ckpt) |
 
 > The current inference package supports only MoE1 checkpoints to ensure that the
 > model architecture matches the `state_dict`.
 
-### MoE Checkpoint Example
+### Example
 
 For a TabLDM-MoE checkpoint, such as a `clf_stage3_..._moe1_...` artifact produced
 by the training project, use the matching estimator:
@@ -356,23 +341,15 @@ tabldm/
     └── *_dualstream_moe.py   # MoE1 estimators
 ```
 
-## To Do
+## Citation
+```bash
+@article{wang2026xiaomitabldm,
+  title         = {{Xiaomi-TabLDM}: Technical Report},
+  author        = {Penghui Wang and Wei Liu and Hong Wang and Chengyue Huang and Yuxi Sun and Zirui Wang and Hongming Huang and Zhenwei Xin and Chunxiao Liu and Erli Meng and Bin Wang},
+  year          = {2026},
+  eprint        = {2609.xxxxx},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.AI}
+}
 
-The following items are organized according to the structure of the
-[TabICL README](https://github.com/soda-inria/tabicl). They are currently missing and
-should be added in the future:
-
-- [ ] **Benchmark figures:** There is no `docs/figures` directory. Add performance
-  comparison figures and Pareto-frontier plots for benchmarks such as TabArena and
-  TALENT.
-- [ ] **Measured speed and scale results:** The complexity description in the FAQ is
-  inherited from TabICL. Add TabLDM-specific measurements of runtime and supported
-  sample/feature sizes on specific hardware such as H100, A100, and CPU.
-- [ ] **Paper citation:** No TabLDM paper link or BibTeX entry is currently available.
-- [ ] **Contributors:** Confirm the list of authors and maintainers.
-- [ ] **Tutorials:** There is no `tutorials/` directory. Add end-to-end examples for
-  classification, regression, KV caching, and MoE.
-- [ ] **Advanced preprocessing (skrub integration):** If support for a skrub
-  `TableVectorizer` pipeline is validated, add a dirty-data preprocessing example
-  similar to the one in TabICL.
-- [ ] **Star History:** Add a Star History chart after the repository becomes public.
+```
