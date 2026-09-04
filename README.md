@@ -24,19 +24,17 @@
 
 ---
 
-This repository is the official implementation of **Xiaomi-TabLDM**, featuring the tabular foundation model **TabLDM**.
+This repository is the official implementation of **Xiaomi-TabLDM**.
 
-Tabular foundation models establish a general prediction paradigm based on in-context learning. Given labeled samples from a downstream dataset as context, a single pretrained model can make predictions directly without task-specific training. Building on this paradigm, we introduce TabLDM, a new tabular foundation model that enables more flexible context utilization and more efficient model-capacity scaling.
+Tabular foundation models establish a general prediction paradigm based on in-context learning. Given labeled samples from a downstream dataset as context, a single pretrained model can make predictions directly without task-specific training. Building on this paradigm, we introduce Xiaomi-TabLDM, a tabular large data foundation model for classification and regression via in-context learning, which delivers superior prediction accuracy without requiring task-specific fine-tuning. Pretrained exclusively on synthetic data generated from structural causal models (SCMs), our model enables more flexible context utilization and more efficient capacity scaling.
 
-**A New Performance Standard.** On the challenging TALENT benchmark, TabLDM outperforms all baselines on binary classification tasks and ranks second overall. On TabArena, TabLDM surpasses traditional machine-learning baselines, ranks third overall, and ranks second on regression tasks. Notably, TabLDM outperforms TabPFN-3 at a similar model scale and approaches TabFM while using substantially fewer total and activated parameters.
+**A New Performance Standard.** _Strong regression performance across benchmarks_: Xiaomi-TabLDM ranks 1st on OpenML-CTR23 and 2nd on regression across TALENT, TabArena, and BCCO, demonstrating consistently strong regression performance across four complementary benchmark suites. _Favorable performance–efficiency trade-off_: Xiaomi-TabLDM combines strong predictive performance with substantially lower computational cost. For example, on TabArena regression, it achieves the second-highest Elo while using 82% less training time and 68% less prediction time than the top-ranked TabFM.
 
-**Large-Scale Synthetic Pretraining.** TabLDM expands the coverage and diversity of synthetic tabular data used for pretraining. We also improve the three-stage training strategy by progressively introducing dual-stream feature groups, lightweight Attention Residual, and sparse Mixture-of-Experts. These components enable TabLDM to learn richer feature interactions and develop expert specialization across diverse tabular tasks.
+**Large-Scale Synthetic Pretraining.** Xiaomi-TabLDM expands the coverage and diversity of synthetic tabular data used for pretraining. We also adopt a three-stage training strategy together with dual-stream feature grouping, lightweight Attention Residual, and sparse Mixture-of-Experts, enabling Xiaomi-TabLDM to learn richer feature interactions and expert specialization across diverse tabular tasks.
 
-**Test-Time Scaling.** TabLDM further improves tabular prediction through test-time compute scaling: allocating additional compute during inference consistently improves predictive performance over the base model.
+**Test-Time Scaling.** Xiaomi-TabLDM further extends tabular prediction through test-time compute scaling: allocating additional computation at inference time consistently improves predictive performance over the base model.
 
-**Easy to Use:** TabLDM can be installed with `pip` and provides a scikit-learn-compatible interface.
-`fit` does not update model weights; it only preprocesses the context and loads the pretrained model.
-Predictions are produced through in-context learning in a single forward pass.
+**Easy to Use:** Xiaomi-TabLDM can be installed with `pip` and provides a scikit-learn-compatible interface. `fit` does not update model weights; it only preprocesses the context and loads the pretrained model. Predictions are produced through in-context learning in a single forward pass.
 
 **Fast:** With KV caching, repeated calls to `predict` on the same training data can reuse cached context projections, significantly accelerating repeated inference. A GPU is recommended for larger datasets, and CPU/disk offloading can be used to scale to larger data sizes.
 
