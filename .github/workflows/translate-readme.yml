@@ -48,6 +48,6 @@ jobs:
           git add README_CN.md
 
           if ! git diff --cached --quiet; then
-            git commit -m "docs: update Chinese README"
+            git commit -m "update Chinese README"
             git push
           fi
