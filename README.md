@@ -1,10 +1,10 @@
 <h3 align="center">
   <b>
-    <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+    <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
     <br/>
     Xiaomi-TabLDM: A Tabular Large Data Foundation Model<br/>For Classification and Regression via In-Context Learning
     <br/>
-    <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+    <span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
     <br/>
   </b>
 </h3>
