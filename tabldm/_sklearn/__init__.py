@@ -14,14 +14,10 @@
 # limitations under the License.
 """Private. Access estimators via ``from tabldm import TabLDMClassifier, TabLDMRegressor``."""
 
-from .classifier_attnres_dualstream_moe import TabLDMClassifier
-from .classifier_enhanced import TabLDMEnhancedClassifier
-from .regressor_attnres_dualstream_moe import TabLDMRegressor
-from .regressor_enhanced import TabLDMEnhancedRegressor
+from .classifier import TabLDMClassifier
+from .regressor import TabLDMRegressor
 
 __all__ = [
     "TabLDMClassifier",
-    "TabLDMEnhancedClassifier",
     "TabLDMRegressor",
-    "TabLDMEnhancedRegressor",
 ]

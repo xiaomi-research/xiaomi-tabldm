@@ -55,8 +55,8 @@ def _latest_ckpt(pattern: str) -> pathlib.Path | None:
     return ckpts[-1] if ckpts else None
 
 
-CLF_CKPT = _latest_ckpt("clf_stage3_moe1_*/step-*.ckpt")
-REG_CKPT = _latest_ckpt("reg_stage3_moe1_*/step-*.ckpt")
+CLF_CKPT = _latest_ckpt("clf_default.ckpt")
+REG_CKPT = _latest_ckpt("reg_default.ckpt")
 
 # --- fixtures -------------------------------------------------------------
 
