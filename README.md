@@ -24,7 +24,7 @@
 
 ---
 
-This repository is the official implementation of **Xiaomi-TabLDM**
+This repository is the official implementation of **Xiaomi-TabLDM**.
 
 Tabular foundation models establish a general prediction paradigm based on in-context learning. Given labeled samples from a downstream dataset as context, a single pretrained model can make predictions directly without task-specific training. Building on this paradigm, we introduce Xiaomi-TabLDM, a tabular large data foundation model for classification and regression via in-context learning, which delivers superior prediction accuracy without requiring task-specific fine-tuning. Pretrained exclusively on synthetic data generated from structural causal models (SCMs), our model enables more flexible context utilization and more efficient capacity scaling.
 
