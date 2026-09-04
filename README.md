@@ -58,6 +58,7 @@ Tabular foundation models establish a general prediction paradigm based on in-co
   <em>Figure 1. Regression average-rank performance on TALENT (lower is better)</em>
 </div>
 
+<br>
 
 <div align="center">
   <img
@@ -69,6 +70,7 @@ Tabular foundation models establish a general prediction paradigm based on in-co
   <em>Figure 2. Regression Elo performance on TabArena (higher is better).</em>
 </div>
 
+<br>
 
 <div align="center">
   <img
@@ -80,6 +82,8 @@ Tabular foundation models establish a general prediction paradigm based on in-co
   <em>Figure 3. Average-rank comparison on BCCO. Circles denote the average ranks on BCCO-CLS and BCCO-REG, while diamonds denote the overall average rank across the two settings. Models are ordered
 by the combined average rank; lower is better. </em>
 </div>
+
+<br>
 
 <div align="center">
   <img
