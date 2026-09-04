@@ -26,16 +26,12 @@ TabLDMClassifier`` works out of the box.
 from ._model import InferenceConfig
 from ._sklearn import (
     TabLDMClassifier,
-    TabLDMEnhancedClassifier,
     TabLDMRegressor,
-    TabLDMEnhancedRegressor,
 )
 from .__about__ import __version__
 
 __all__ = [
     "TabLDMClassifier",
-    "TabLDMEnhancedClassifier",
     "TabLDMRegressor",
-    "TabLDMEnhancedRegressor",
     "InferenceConfig",
 ]

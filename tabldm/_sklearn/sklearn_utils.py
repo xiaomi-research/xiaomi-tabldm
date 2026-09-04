@@ -22,6 +22,7 @@ Adapted from: https://github.com/scikit-learn/scikit-learn/blob/1eb422d6c5/sklea
 
 from __future__ import annotations
 
+import re
 import sys
 import warnings
 from typing import Any
@@ -414,3 +415,20 @@ def validate_data(
         _check_n_features(_estimator, X, reset=reset)
 
     return out
+
+
+def _moe_load_mismatch(model_keys, missing, unexpected):
+    """Return real load mismatches after :meth:`drop_dense_ffn`.
+
+    The frozen dense FFN copy (``linear1``/``linear2``) is dropped from
+    MoE layers, so checkpoints saved before that removal still carry those
+    tensors. They are dead weights, so they are tolerated as the only
+    unexpected keys; any other missing/unexpected key is a real mismatch.
+    """
+    bad_unexpected = set()
+    for key in unexpected:
+        match = re.match(r"^(.*)\.(linear1|linear2)\.(weight|bias)$", key)
+        if match and f"{match.group(1)}.moe_ffn.router.weight" in model_keys:
+            continue
+        bad_unexpected.add(key)
+    return set(missing), bad_unexpected
