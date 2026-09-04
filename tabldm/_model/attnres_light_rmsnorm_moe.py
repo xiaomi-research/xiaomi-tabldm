@@ -28,7 +28,7 @@ from .attnres_light_rmsnorm import (
     TabLDMAttnResLightRMSNorm,
 )
 from .embedding_dual_stream import ColEmbeddingDualStream
-from .moe import SparseMoEFeedForward, collect_moe_aux_loss, collect_moe_aux_stats
+from .moe import SparseMoEFeedForward, collect_moe_aux_loss, collect_moe_aux_stats, collect_moe_update_bias
 
 
 class AttnResTransformerLayerLightRMSNormMoE(AttnResTransformerLayerLightRMSNorm):
@@ -43,6 +43,10 @@ class AttnResTransformerLayerLightRMSNormMoE(AttnResTransformerLayerLightRMSNorm
         moe_router_jitter: float = 0.0,
         moe_router_weight_mode: str = "normalized",
         moe_expert_init_noise: float = 0.0,
+        moe_auxiliary_free: bool = False,
+        moe_bias_lr: float = 0.3,
+        moe_expert_init: str = "warmstart",
+        moe_routed_linear2_scale: float = 0.05,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -61,6 +65,10 @@ class AttnResTransformerLayerLightRMSNormMoE(AttnResTransformerLayerLightRMSNorm
                 router_jitter=moe_router_jitter,
                 router_weight_mode=moe_router_weight_mode,
                 expert_init_noise=moe_expert_init_noise,
+                auxiliary_free=moe_auxiliary_free,
+                bias_lr=moe_bias_lr,
+                expert_init=moe_expert_init,
+                routed_linear2_scale=moe_routed_linear2_scale,
             )
             self.linear1.requires_grad_(False)
             self.linear2.requires_grad_(False)
@@ -104,6 +112,10 @@ class AttnResEncoderLightRMSNormMoE(AttnResEncoderLightRMSNorm):
         moe_router_jitter: float = 0.0,
         moe_router_weight_mode: str = "normalized",
         moe_expert_init_noise: float = 0.0,
+        moe_auxiliary_free: bool = False,
+        moe_bias_lr: float = 0.3,
+        moe_expert_init: str = "warmstart",
+        moe_routed_linear2_scale: float = 0.05,
         **kwargs,
     ):
         ssmax = kwargs.get("ssmax", False)
@@ -127,6 +139,10 @@ class AttnResEncoderLightRMSNormMoE(AttnResEncoderLightRMSNorm):
                 moe_router_jitter=moe_router_jitter,
                 moe_router_weight_mode=moe_router_weight_mode,
                 moe_expert_init_noise=moe_expert_init_noise,
+                moe_auxiliary_free=moe_auxiliary_free,
+                moe_bias_lr=moe_bias_lr,
+                moe_expert_init=moe_expert_init,
+                moe_routed_linear2_scale=moe_routed_linear2_scale,
             )
             moe_layer.load_state_dict(dense_layer.state_dict(), strict=False)
             self.layers[block_idx] = moe_layer
@@ -177,6 +193,9 @@ class AttnResEncoderLightRMSNormMoE(AttnResEncoderLightRMSNorm):
     def moe_aux_stats(self) -> dict[str, float]:
         return collect_moe_aux_stats(self)
 
+    def update_moe_bias(self) -> None:
+        collect_moe_update_bias(self)
+
 
 class ICLearningAttnResLightRMSNormMoE(ICLearningAttnResLightRMSNorm):
     def __init__(
@@ -194,6 +213,10 @@ class ICLearningAttnResLightRMSNormMoE(ICLearningAttnResLightRMSNorm):
         moe_router_jitter: float = 0.0,
         moe_router_weight_mode: str = "normalized",
         moe_expert_init_noise: float = 0.0,
+        moe_auxiliary_free: bool = False,
+        moe_bias_lr: float = 0.3,
+        moe_expert_init: str = "warmstart",
+        moe_routed_linear2_scale: float = 0.05,
         moe_init_from_dense: bool = True,
         recompute: bool = False,
         **kwargs,
@@ -224,6 +247,10 @@ class ICLearningAttnResLightRMSNormMoE(ICLearningAttnResLightRMSNorm):
             moe_router_jitter=moe_router_jitter,
             moe_router_weight_mode=moe_router_weight_mode,
             moe_expert_init_noise=moe_expert_init_noise,
+            moe_auxiliary_free=moe_auxiliary_free,
+            moe_bias_lr=moe_bias_lr,
+            moe_expert_init=moe_expert_init,
+            moe_routed_linear2_scale=moe_routed_linear2_scale,
             recompute=recompute,
         )
         self.tf_icl.load_state_dict(dense_encoder.state_dict(), strict=False)
@@ -236,6 +263,9 @@ class ICLearningAttnResLightRMSNormMoE(ICLearningAttnResLightRMSNorm):
 
     def moe_aux_stats(self) -> dict[str, float]:
         return self.tf_icl.moe_aux_stats()
+
+    def update_moe_bias(self) -> None:
+        self.tf_icl.update_moe_bias()
 
     @torch.no_grad()
     def initialize_moe_from_dense(self) -> None:
@@ -269,6 +299,10 @@ class TabLDMMoE(TabLDMAttnResLightRMSNorm):
         moe_router_jitter: float = 0.0,
         moe_router_weight_mode: str = "normalized",
         moe_expert_init_noise: float = 0.0,
+        moe_auxiliary_free: Optional[bool] = None,
+        moe_bias_lr: Optional[float] = None,
+        moe_expert_init: Optional[str] = None,
+        moe_routed_linear2_scale: Optional[float] = None,
         moe_init_from_dense: bool = True,
         dual_stream: bool = True,
         global_dilation="adaptive",
@@ -325,6 +359,14 @@ class TabLDMMoE(TabLDMAttnResLightRMSNorm):
             else moe_num_shared_experts
         )
         moe_layers = preset.get("moe_layers", "none") if moe_layers is None else moe_layers
+        moe_auxiliary_free = preset.get("moe_auxiliary_free", False) if moe_auxiliary_free is None else moe_auxiliary_free
+        moe_bias_lr = preset.get("moe_bias_lr", 0.3) if moe_bias_lr is None else moe_bias_lr
+        moe_expert_init = preset.get("moe_expert_init", "warmstart") if moe_expert_init is None else moe_expert_init
+        moe_routed_linear2_scale = (
+            preset.get("moe_routed_linear2_scale", 0.05)
+            if moe_routed_linear2_scale is None
+            else moe_routed_linear2_scale
+        )
 
         parent_kwargs = {
             key: value
@@ -340,6 +382,10 @@ class TabLDMMoE(TabLDMAttnResLightRMSNorm):
                 "moe_router_jitter",
                 "moe_router_weight_mode",
                 "moe_expert_init_noise",
+                "moe_auxiliary_free",
+                "moe_bias_lr",
+                "moe_expert_init",
+                "moe_routed_linear2_scale",
                 "moe_init_from_dense",
                 "global_dilation",
                 "global_max_span",
@@ -369,6 +415,10 @@ class TabLDMMoE(TabLDMAttnResLightRMSNorm):
             moe_router_jitter=moe_router_jitter,
             moe_router_weight_mode=moe_router_weight_mode,
             moe_expert_init_noise=moe_expert_init_noise,
+            moe_auxiliary_free=moe_auxiliary_free,
+            moe_bias_lr=moe_bias_lr,
+            moe_expert_init=moe_expert_init,
+            moe_routed_linear2_scale=moe_routed_linear2_scale,
             moe_init_from_dense=False,
             recompute=kwargs.get("recompute", False),
         )
@@ -386,6 +436,10 @@ class TabLDMMoE(TabLDMAttnResLightRMSNorm):
         self.moe_router_jitter = moe_router_jitter
         self.moe_router_weight_mode = moe_router_weight_mode
         self.moe_expert_init_noise = moe_expert_init_noise
+        self.moe_auxiliary_free = moe_auxiliary_free
+        self.moe_bias_lr = moe_bias_lr
+        self.moe_expert_init = moe_expert_init
+        self.moe_routed_linear2_scale = moe_routed_linear2_scale
         self.moe_init_from_dense = moe_init_from_dense
 
         if dual_stream:
@@ -418,6 +472,9 @@ class TabLDMMoE(TabLDMAttnResLightRMSNorm):
 
     def moe_aux_stats(self) -> dict[str, float]:
         return self.icl_predictor.moe_aux_stats()
+
+    def update_moe_bias(self) -> None:
+        self.icl_predictor.update_moe_bias()
 
     @torch.no_grad()
     def initialize_moe_from_dense(self) -> None:

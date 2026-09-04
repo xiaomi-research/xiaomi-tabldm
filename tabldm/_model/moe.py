@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 from torch import Tensor, nn
@@ -69,6 +69,10 @@ class SparseMoEFeedForward(nn.Module):
         router_jitter: float = 0.0,
         router_weight_mode: str = "normalized",
         expert_init_noise: float = 0.0,
+        auxiliary_free: bool = False,
+        bias_lr: float = 0.3,
+        expert_init: str = "warmstart",
+        routed_linear2_scale: float = 0.05,
     ):
         super().__init__()
         if num_experts < 1:
@@ -88,6 +92,12 @@ class SparseMoEFeedForward(nn.Module):
             raise ValueError(f"router_weight_mode must be 'normalized' or 'raw', got {router_weight_mode!r}")
         self.router_weight_mode = router_weight_mode
         self.expert_init_noise = expert_init_noise
+        self.auxiliary_free = auxiliary_free
+        self.bias_lr = bias_lr
+        if expert_init not in {"warmstart", "independent"}:
+            raise ValueError(f"expert_init must be 'warmstart' or 'independent', got {expert_init!r}")
+        self.expert_init = expert_init
+        self.routed_linear2_scale = routed_linear2_scale
 
         self.router = nn.Linear(d_model, num_experts, bias=False)
         self.experts = nn.ModuleList(
@@ -96,8 +106,17 @@ class SparseMoEFeedForward(nn.Module):
         self.shared_experts = nn.ModuleList(
             FeedForwardExpert(d_model, hidden_dim, dropout, activation) for _ in range(num_shared_experts)
         )
-        self.register_buffer("residual_format", torch.tensor(1, dtype=torch.uint8), persistent=True)
+        self.register_buffer(
+            "residual_format",
+            torch.tensor(2 if auxiliary_free else 1, dtype=torch.uint8),
+            persistent=True,
+        )
+        if auxiliary_free:
+            self.register_buffer("bias", torch.zeros(num_experts), persistent=True)
+        else:
+            self.bias = None
         self._last_aux: Dict[str, Tensor] = {}
+        self._last_load: Optional[Tensor] = None
         nn.init.normal_(self.router.weight, mean=0.0, std=1e-2)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -110,7 +129,13 @@ class SparseMoEFeedForward(nn.Module):
 
         logits = self.router(router_input)
         probs = torch.softmax(logits, dim=-1)
-        top_probs, top_indices = torch.topk(probs, k=self.top_k, dim=-1)
+        if self.auxiliary_free:
+            top_indices = torch.topk(
+                probs + self.bias.to(probs.dtype), k=self.top_k, dim=-1
+            ).indices
+            top_probs = probs.gather(-1, top_indices)
+        else:
+            top_probs, top_indices = torch.topk(probs, k=self.top_k, dim=-1)
         if self.router_weight_mode == "raw":
             top_weights = top_probs
         else:
@@ -138,6 +163,9 @@ class SparseMoEFeedForward(nn.Module):
 
         flat_out = routed_out + base_out + unused_expert_dep.to(dtype=routed_out.dtype)
         self._last_aux = self._compute_aux(logits, probs, top_indices, routed_out, base_out)
+        with torch.no_grad():
+            _mask = F.one_hot(top_indices, num_classes=self.num_experts).sum(dim=1).float()
+            self._last_load = (_mask.mean(dim=0) / self.top_k).detach()
         return flat_out.reshape(orig_shape)
 
     @staticmethod
@@ -156,20 +184,21 @@ class SparseMoEFeedForward(nn.Module):
         base_out: Tensor,
     ) -> Dict[str, Tensor]:
         aux: Dict[str, Tensor] = {}
-        if self.router_z_loss_coef > 0:
-            z_loss = torch.logsumexp(logits, dim=-1).pow(2).mean()
-            aux["z_loss"] = z_loss * self.router_z_loss_coef
-        if self.load_balance_loss_coef > 0:
-            expert_mask = F.one_hot(top_indices, num_classes=self.num_experts).sum(dim=1).float()
-            tokens_per_expert = expert_mask.mean(dim=0) / self.top_k
+        z_coef = 0.0 if self.auxiliary_free else self.router_z_loss_coef
+        lb_coef = 0.0 if self.auxiliary_free else self.load_balance_loss_coef
+        expert_mask = F.one_hot(top_indices, num_classes=self.num_experts).sum(dim=1).float()
+        tokens_per_expert = expert_mask.mean(dim=0) / self.top_k
+        if z_coef > 0:
+            aux["z_loss"] = torch.logsumexp(logits, dim=-1).pow(2).mean() * z_coef
+        if lb_coef > 0:
             router_prob_per_expert = probs.mean(dim=0)
             balance = self.num_experts * torch.sum(tokens_per_expert * router_prob_per_expert)
-            aux["load_balance_loss"] = balance * self.load_balance_loss_coef
-            aux["load_entropy"] = -(tokens_per_expert * tokens_per_expert.clamp_min(1e-9).log()).sum()
-            aux["load_entropy_norm"] = aux["load_entropy"] / torch.log(
-                routed_out.new_tensor(float(self.num_experts))
-            ).clamp_min(1e-9)
-            aux["load_max"] = tokens_per_expert.max()
+            aux["load_balance_loss"] = balance * lb_coef
+        aux["load_entropy"] = -(tokens_per_expert * tokens_per_expert.clamp_min(1e-9).log()).sum()
+        aux["load_entropy_norm"] = aux["load_entropy"] / torch.log(
+            routed_out.new_tensor(float(self.num_experts))
+        ).clamp_min(1e-9)
+        aux["load_max"] = tokens_per_expert.max()
         aux["router_entropy"] = -(
             probs * probs.clamp_min(1e-9).log()
         ).sum(dim=-1).mean()
@@ -190,21 +219,38 @@ class SparseMoEFeedForward(nn.Module):
         return {key: float(value.detach().float().cpu()) for key, value in self._last_aux.items()}
 
     @torch.no_grad()
+    def update_bias(self) -> None:
+        if not self.auxiliary_free or self._last_load is None:
+            return
+        load = self._last_load.clone()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(load, op=torch.distributed.ReduceOp.SUM)
+            load = load / torch.distributed.get_world_size()
+        self.bias -= self.bias_lr * (load.to(self.bias.dtype) - (1.0 / self.num_experts))
+
+    @torch.no_grad()
     def copy_from_dense(self, linear1: nn.Linear, linear2: nn.Linear) -> None:
         for expert in self.shared_experts:
             expert.copy_from_dense(linear1, linear2)
-        for expert in self.experts:
-            expert.copy_from_dense(linear1, linear2)
-            if self.router_weight_mode == "normalized":
-                nn.init.zeros_(expert.linear2.weight)
-                nn.init.zeros_(expert.linear2.bias)
-            elif self.expert_init_noise > 0:
-                expert.linear1.weight.add_(torch.randn_like(expert.linear1.weight) * self.expert_init_noise)
-                expert.linear2.weight.add_(torch.randn_like(expert.linear2.weight) * self.expert_init_noise)
-                if expert.linear1.bias is not None:
-                    expert.linear1.bias.add_(torch.randn_like(expert.linear1.bias) * self.expert_init_noise)
+        if self.expert_init == "independent":
+            for expert in self.experts:
+                expert.linear1.reset_parameters()
+                nn.init.normal_(expert.linear2.weight, std=self.routed_linear2_scale)
                 if expert.linear2.bias is not None:
-                    expert.linear2.bias.add_(torch.randn_like(expert.linear2.bias) * self.expert_init_noise)
+                    nn.init.zeros_(expert.linear2.bias)
+        else:
+            for expert in self.experts:
+                expert.copy_from_dense(linear1, linear2)
+                if self.router_weight_mode == "normalized":
+                    nn.init.zeros_(expert.linear2.weight)
+                    nn.init.zeros_(expert.linear2.bias)
+                elif self.expert_init_noise > 0:
+                    expert.linear1.weight.add_(torch.randn_like(expert.linear1.weight) * self.expert_init_noise)
+                    expert.linear2.weight.add_(torch.randn_like(expert.linear2.weight) * self.expert_init_noise)
+                    if expert.linear1.bias is not None:
+                        expert.linear1.bias.add_(torch.randn_like(expert.linear1.bias) * self.expert_init_noise)
+                    if expert.linear2.bias is not None:
+                        expert.linear2.bias.add_(torch.randn_like(expert.linear2.bias) * self.expert_init_noise)
 
 
 def collect_moe_aux_loss(module: nn.Module) -> Tensor:
@@ -228,3 +274,9 @@ def collect_moe_aux_stats(module: nn.Module) -> Dict[str, float]:
             totals[f"layer_{layer_idx}/{key}"] = value
             counts[f"layer_{layer_idx}/{key}"] = 1
     return {f"moe/{key}": totals[key] / max(counts[key], 1) for key in totals}
+
+
+def collect_moe_update_bias(module: nn.Module) -> None:
+    for submodule in module.modules():
+        if isinstance(submodule, SparseMoEFeedForward):
+            submodule.update_bias()
