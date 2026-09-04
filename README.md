@@ -242,33 +242,12 @@ local filesystem path. The first lookup uses the local Hugging Face cache
 (typically `~/.cache/huggingface/hub`); if the file is not cached and
 `allow_auto_download=True`, it is downloaded automatically.
 
-For fully offline inference, point `model_path` to a local file:
-
-```python
-clf = TabLDMClassifier(
-    model_path="checkpoints/clf_default.ckpt", allow_auto_download=False
-)
-```
-
 ## Available Models
 
 | Model          | Classifier           | Regressor           |
 | -------------- | -------------------- | ------------------- |
 | **Xiaomi-TabLDM** | [`XiaomiTabLDMClassifier`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt) | [`XiaomiTabLDMRegressor`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/reg_default.ckpt) |
 
-
-### Example
-
-```python
-from tabldm import TabLDMClassifier 
-
-clf = TabLDMClassifier(
-    model_path="checkpoints/clf_default.ckpt",
-    device="cuda",
-)
-clf.fit(X_train, y_train)
-clf.predict(X_test)
-```
 
 ## Testing
 

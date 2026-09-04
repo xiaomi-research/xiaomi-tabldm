@@ -219,13 +219,6 @@ clf = TabLDMClassifier(
 
 `checkpoint_version` 的值是 Hugging Face 仓库中的文件名，而不是本地文件系统路径。程序首先会查找本地 Hugging Face 缓存（通常位于 `~/.cache/huggingface/hub`）；如果文件尚未缓存且 `allow_auto_download=True`，则会自动下载。
 
-如需进行完全离线的推理，请将 `model_path` 指向本地文件：
-
-```python
-clf = TabLDMClassifier(
-    model_path="checkpoints/clf_default.ckpt", allow_auto_download=False
-)
-```
 
 ## 可用模型
 
@@ -233,18 +226,6 @@ clf = TabLDMClassifier(
 | --- | --- | --- |
 | **Xiaomi-TabLDM** | [`XiaomiTabLDMClassifier`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt) | [`XiaomiTabLDMRegressor`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/reg_default.ckpt) |
 
-### 示例
-
-```python
-from tabldm import TabLDMClassifier
-
-clf = TabLDMClassifier(
-    model_path="checkpoints/clf_default.ckpt",
-    device="cuda",
-)
-clf.fit(X_train, y_train)
-clf.predict(X_test)
-```
 
 ## 测试
 
