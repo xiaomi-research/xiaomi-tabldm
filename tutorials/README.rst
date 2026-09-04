@@ -3,11 +3,6 @@ Tutorials
 
 A collection of runnable examples demonstrating typical TabLDM workflows.
 
-Before running the examples, install the project in editable mode from the
-repository root::
-
-    pip install -e .
-
 The examples use ``cpu`` by default to make them portable. Set ``device="cuda"``
 to run on a GPU, or use ``CUDA_VISIBLE_DEVICES`` to select a specific card.
 

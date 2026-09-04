@@ -31,6 +31,7 @@ dependencies = [
     "psutil",                # memory estimation at inference
     "tqdm>=4.64.0",
     "huggingface-hub",       # checkpoint download / cache
+    "pandas"
 ]
 
 [project.optional-dependencies]
