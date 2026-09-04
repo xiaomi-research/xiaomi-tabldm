@@ -58,6 +58,7 @@ Tabular foundation models establish a general prediction paradigm based on in-co
   <em>Figure 1. Regression average-rank performance on TALENT (lower is better)</em>
 </div>
 
+
 <div align="center">
   <img
     src="assets/Xiaomi-TabLDM_TabArena_Fig1.png"
@@ -67,6 +68,7 @@ Tabular foundation models establish a general prediction paradigm based on in-co
   <br>
   <em>Figure 2. Regression Elo performance on TabArena (higher is better).</em>
 </div>
+
 
 <div align="center">
   <img
@@ -108,8 +110,6 @@ Installing PyTorch with `pip` may fail on Intel Macs. If so, install PyTorch fir
 ```bash
 conda install pytorch -c pytorch
 ```
-
-Then install `tabldm` as described above.
 
 ### Dependencies
 
@@ -184,7 +184,7 @@ weights must be reloaded from `model_path` or the Hub when loading the estimator
 
 ## Advanced Configuration
 
-TabLDM provides a set of parameters for customizing inference behavior. The following
+Xiaomi-TabLDM provides a set of parameters for customizing inference behavior. The following
 example shows all available classifier parameters and their default values:
 
 ```python
@@ -250,7 +250,7 @@ clf = TabLDMClassifier(
 
 | Model          | Classifier           | Regressor           |
 | -------------- | -------------------- | ------------------- |
-| **TabLDM** | [`TabLDMClassifier`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt) | [`TabLDMRegressor`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/reg_default.ckpt) |
+| **Xiaomi-TabLDM** | [`XiaomiTabLDMClassifier`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt) | [`XiaomiTabLDMRegressor`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/reg_default.ckpt) |
 
 
 ### Example
@@ -265,8 +265,6 @@ clf = TabLDMClassifier(
 clf.fit(X_train, y_train)
 clf.predict(X_test)
 ```
-
-The corresponding regression estimator is `TabLDMRegressor`.
 
 ## Testing
 
@@ -287,13 +285,13 @@ Copyright (C) 2026 Xiaomi Corporation
 
 ## FAQ
 
-**What is TabLDM?**
-TabLDM is a tabular foundation model similar to TabPFN and TabICL. It learns new data
+**What is Xiaomi-TabLDM?**
+Xiaomi-TabLDM is a tabular foundation model similar to TabPFN and TabICL. It learns new data
 through in-context learning in a single forward pass of a pretrained Transformer:
 `y_pred = model(X_train, y_train, X_test)` (called internally by `predict()`).
 Its learning capability comes from pretraining on large-scale synthetic data.
 
-**How fast is TabLDM?**
+**How fast is Xiaomi-TabLDM?**
 For a dataset with $n$ training rows and $m$ columns, the runtime complexity is
 $O(n^2 + nm^2)$. KV caching accelerates repeated inference on the same training data,
 while CPU/disk offloading enables larger datasets to be processed without running
@@ -310,7 +308,7 @@ evaluation.
 
 ### Built-In Preprocessing
 
-For `X`, TabLDM accepts either a pandas DataFrame or a NumPy array and performs the
+For `X`, Xiaomi-TabLDM accepts either a pandas DataFrame or a NumPy array and performs the
 following operations:
 
 - Detect and ordinal-encode categorical columns, including string, object, category,
