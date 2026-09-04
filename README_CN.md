@@ -15,9 +15,9 @@
   &nbsp;|
   <a href="https://arxiv.org/abs" target="_blank">📔 Technical Report</a>
   &nbsp;|
-  <a href="README_CN.md" target="_blank">中文</a>
+  中文
   &nbsp;|
-  English
+  <a href="README.md" target="_blank">English</a>
   &nbsp;
 </div>
 
@@ -25,13 +25,13 @@
 
 ***
 
-这个存储库是官方的实现**小米-TabLDM**.
+这个存储库是官方的实现**Xiaomi-TabLDM**.
 
 表格基础模型建立了基于上下文学习的通用预测范式。将来自下游数据集的标记样本作为上下文，单个预训练模型可以直接进行预测，而无需特定于任务的训练。在此范例的基础上，我们引入了Xiaomi-TabLDM，这是一种通过上下文学习进行分类和回归的表格大数据基础模型，它无需针对特定任务进行微调即可提供卓越的预测精度。我们的模型专门针对结构因果模型 (SCM) 生成的合成数据进行预训练，可实现更灵活的上下文利用和更高效的容量扩展。
 
 **新的绩效标准。** *跨基准的强大回归性能*：Xiaomi-TabLDM 在 OpenML-CTR23 上排名第一，在 TALENT、TabArena 和 BCCO 的回归上排名第二，在四个互补的基准套件中表现出持续强大的回归性能。*有利的性能-效率权衡*：Xiaomi-TabLDM 结合了强大的预测性能和大幅降低的计算成本。例如，在 TabArena 回归中，它实现了第二高的 Elo，同时比排名第一的 TabFM 减少了 82% 的训练时间和 68% 的预测时间。
 
-**大规模综合预训练。**&#x5C0F;米-TabLDM扩展了用于预训练的合成表格数据的覆盖范围和多样性。我们还采用三阶段训练策略，结合双流特征分组、轻量级注意力残差和稀疏专家混合，使小米-TabLDM能够在不同的表格任务中学习更丰富的特征交互和专家专业化。
+**大规模综合预训练。**&#x5C0F;米-TabLDM扩展了用于预训练的合成表格数据的覆盖范围和多样性。我们还采用三阶段训练策略，结合双流特征分组、轻量级注意力残差和稀疏专家混合，使Xiaomi-TabLDM能够在不同的表格任务中学习更丰富的特征交互和专家专业化。
 
 **测试时间缩放。**&#x5C0F;米-TabLDM通过测试时计算扩展进一步扩展了表格预测：在推理时分配额外的计算持续提高了基础模型的预测性能。
 
@@ -188,7 +188,7 @@ clf = TabLDMClassifier.load("classifier.pkl")
 
 ## 高级配置
 
-小米-TabLDM提供了一组用于定制推理行为的参数。以下
+Xiaomi-TabLDM提供了一组用于定制推理行为的参数。以下
 示例显示所有可用的分类器参数及其默认值：
 
 ```python
@@ -249,7 +249,7 @@ clf = TabLDMClassifier(
 
 |型号|分类器|回归器 |
 | -------------- | -------------------- | ------------------- |
-|**小米-TabLDM**|[`XiaomiTabLDMClassifier`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt)|[`XiaomiTabLDMRegressor`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/reg_default.ckpt)|
+|**Xiaomi-TabLDM**|[`XiaomiTabLDMClassifier`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/clf_default.ckpt)|[`XiaomiTabLDMRegressor`](https://huggingface.co/occams/Xiaomi-TabLDM/resolve/main/checkpoints/reg_default.ckpt)|
 
 ### 例子
 
@@ -283,11 +283,11 @@ pytest tests/test_infer_package.py -v
 
 ## FAQ
 
-**什么是小米-TabLDM？**&#x5C0F;米-TabLDM是一个类似于TabPFN和TabICL的表格基础模型。它学习新数据
+**什么是Xiaomi-TabLDM？**&#x5C0F;米-TabLDM是一个类似于TabPFN和TabICL的表格基础模型。它学习新数据
 通过预训练 Transformer 的单次前向传递中的上下文学习：`y_pred = model(X_train, y_train, X_test)`（由内部调用`predict()`）。
 它的学习能力来自于大规模合成数据的预训练。
 
-**小米-TabLDM 有多快？**&#x5BF9;于具有 $n$ 训练行和 $m$ 列的数据集，运行时复杂度为
+**Xiaomi-TabLDM 有多快？**&#x5BF9;于具有 $n$ 训练行和 $m$ 列的数据集，运行时复杂度为
 $O(n^2 + nm^2)$。 KV缓存加速对相同训练数据的重复推理，
 而 CPU/磁盘卸载可以在不运行的情况下处理更大的数据集
 内存不足。
