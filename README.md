@@ -40,7 +40,7 @@ Tabular foundation models establish a general prediction paradigm based on in-co
 
 <div align="center">
   <img
-    src="assets/Xiaomi-TabLDM.png"
+    src="assets/Xiaomi-TabLDM_Framework.png"
     alt="Xiaomi-TabLDM"
     width="800"
   >
@@ -50,7 +50,7 @@ Tabular foundation models establish a general prediction paradigm based on in-co
 
 <div align="center">
   <img
-    src="assets/Xiaomi-TabLDM_TALENT_Fig1.png"
+    src="assets/Xiaomi-TabLDM_TALENT.png"
     alt="Regression average-rank performance on TALENT (lower is better)"
     width="800"
   >
@@ -62,7 +62,7 @@ Tabular foundation models establish a general prediction paradigm based on in-co
 
 <div align="center">
   <img
-    src="assets/Xiaomi-TabLDM_TabArena_Fig1.png"
+    src="assets/Xiaomi-TabLDM_TabArena.png"
     alt=" Regression Elo performance on TabArena"
     width="800"
   >
@@ -74,7 +74,7 @@ Tabular foundation models establish a general prediction paradigm based on in-co
 
 <div align="center">
   <img
-    src="assets/Xiaomi-TabLDM_BCCO_Fig2.png"
+    src="assets/Xiaomi-TabLDM_BCCO.png"
     alt="Performance on BCCO"
     width="800"
   >
@@ -87,7 +87,7 @@ by the combined average rank; lower is better. </em>
 
 <div align="center">
   <img
-    src="assets/Xiaomi-TabLDM__OpenML-CTR23_Fig8.png"
+    src="assets/Xiaomi-TabLDM_OpenML-CTR23.png"
     alt="Performance on OpenML-CTR23"
     width="800"
   >
