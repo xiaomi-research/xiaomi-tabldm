@@ -4,7 +4,7 @@ Tutorials
 A collection of runnable examples demonstrating typical TabLDM workflows.
 
 The examples use ``cpu`` by default to make them portable. Set ``device="cuda"``
-to run on a GPU, or use ``CUDA_VISIBLE_DEVICES`` to select a specific card.
+to run on a GPU.
 
 Examples
 --------
