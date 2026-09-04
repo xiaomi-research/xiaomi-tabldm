@@ -53,11 +53,11 @@ Predictions are produced through in-context learning in a single forward pass.
 <div align="center">
   <img
     src="assets/Xiaomi-TabLDM_TALENT_Fig1.png"
-    alt="Overall rank on TALENT"
+    alt="Regression average-rank performance on TALENT (lower is better)"
     width="800"
   >
   <br>
-  <em>Figure 1. Overall rank on TALENT (lower is better).</em>
+  <em>Figure 1. Regression average-rank performance on TALENT (lower is better)</em>
 </div>
 
 <div align="center">
@@ -77,7 +77,8 @@ Predictions are produced through in-context learning in a single forward pass.
     width="800"
   >
   <br>
-  <em>Figure 3. Average-rank comparison on BCCO. Circles denote the average ranks on BCCO-CLS and BCCO-REG, while diamonds denote the overall average rank across the two settings. </em>
+  <em>Figure 3. Average-rank comparison on BCCO. Circles denote the average ranks on BCCO-CLS and BCCO-REG, while diamonds denote the overall average rank across the two settings. Models are ordered
+by the combined average rank; lower is better. </em>
 </div>
 
 <div align="center">
@@ -87,7 +88,7 @@ Predictions are produced through in-context learning in a single forward pass.
     width="800"
   >
   <br>
-  <em>Figure 4. Average-rank comparison on OpenML-CTR23 over 33 regression datasets.</em>
+  <em>Figure 4. Average-rank comparison on OpenML-CTR23 over 33 regression datasets (lower is better).</em>
 </div>
 
 ## Installation
