@@ -239,10 +239,11 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
     def __init__(
         self,
         # -- base parameters --
-        n_estimators: int = 8,
+        n_estimators: int = 16,
         norm_methods: Optional[str | List[str]] = None,
-        feat_shuffle_method: str = "latin",
+        feat_shuffle_method: str = "random",
         class_shuffle_method: str = "shift",
+        max_num_features: Optional[int] = 300,
         outlier_threshold: float = 4.0,
         softmax_temperature: float = 0.9,
         average_logits: bool = True,
@@ -253,7 +254,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         allow_auto_download: bool = True,
         checkpoint_version: str = "checkpoints/clf_default.ckpt",
         device: Optional[str | torch.device] = None,
-        use_amp: bool | str = "auto",
+        use_amp: bool | str = True,
         use_fa3: bool | str = "auto",
         offload_mode: str | bool = "auto",
         disk_offload_dir: Optional[str] = None,
@@ -264,15 +265,15 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         categorical_indices: Optional[List[int]] = None,
         cat_random_encode: bool = False,
         # -- enhancement parameters --
-        enhance_candidates: bool = False,
-        n_quantile_estimators: int = 16,
+        enhance_candidates: bool = True,
+        n_quantile_estimators: int = 0,
         use_cross_feature: bool = True,
         validation: bool = True,
         k_fold: bool = True,
         n_splits: int = 5,
-        use_svd_ens: bool = True,
+        use_svd_ens: bool = False,
         n_svd_ens_estimators: int = 16,
-        svd_ens_norm_methods: Optional[List[str]] = None,
+        svd_ens_norm_methods: Optional[List[str]] = ["none", "power", "quantile", "robust"],
         svd_ens_n_components: int = 10,
         use_adaptive_plus_candidate: bool = True,
         adaptive_plus_enable_augmentations: bool = True,
@@ -286,6 +287,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.norm_methods = norm_methods
         self.feat_shuffle_method = feat_shuffle_method
         self.class_shuffle_method = class_shuffle_method
+        self.max_num_features = max_num_features
         self.outlier_threshold = outlier_threshold
         self.softmax_temperature = softmax_temperature
         self.average_logits = average_logits
@@ -516,11 +518,55 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             if self.use_adaptive_plus_candidate:
                 self._freeze_adaptive_plus_structure(X)
             self._fit_enhanced_generators(X, y)
+
+            # Feature sampling: build per-estimator column indices for ALL
+            # estimator groups when n_features exceeds max_num_features.
+            # Index layout mirrors the candidate order in
+            # _collect_candidate_probs: [main | quantile_safe | svd_ens |
+            # adaptive_plus | gaussian_rank]. Computed after
+            # _fit_enhanced_generators so we use the generator's actual
+            # n_features_in_ (post UniqueFeatureFilter), avoiding
+            # out-of-bounds column indices.
+            n_features = self.ensemble_generator_.n_features_in_
+            _n_ap_est = (
+                self.adaptive_plus_structure_.get("n_estimators", 0)
+                if self.use_adaptive_plus_candidate else 0
+            )
+            n_total_estimators = (
+                self.n_estimators
+                + (self.n_quantile_estimators or 0)
+                + (self.n_svd_ens_estimators or 0)
+                + _n_ap_est
+                + (self.n_gaussian_rank_estimators or 0)
+            )
+            self.feat_sample_indices_ = None
+            if self.max_num_features is not None and n_features > self.max_num_features:
+                seed_base = self.random_state if self.random_state is not None else 0
+                self.feat_sample_indices_ = [
+                    np.sort(
+                        np.random.default_rng(seed_base + est_idx).choice(
+                            n_features, size=self.max_num_features, replace=False
+                        )
+                    )
+                    for est_idx in range(n_total_estimators)
+                ]
+                print(
+                    f"[TabLDM] feature sampling triggered: "
+                    f"n_features={n_features} -> max_num_features={self.max_num_features}, "
+                    f"n_estimators={n_total_estimators}"
+                )
+            else:
+                print(
+                    f"[TabLDM] feature sampling off: n_features={n_features}, "
+                    f"max_num_features={self.max_num_features}"
+                )
+
             self._fit_nnls_weights(X, y)
             if self.enable_calibration:
                 self._fit_calibration()
         else:
             # Original single-generator path
+            self.feat_sample_indices_ = None
             self.ensemble_generator_ = EnsembleGenerator(
                 classification=True,
                 n_estimators=self.n_estimators,
@@ -643,7 +689,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             n_estimators=self.n_estimators,
             norm_methods=norm_methods,
             feat_shuffle_method=self.feat_shuffle_method,
-            class_shuffle_method="none",
+            class_shuffle_method=self.class_shuffle_method,
             outlier_threshold=self.outlier_threshold,
             random_state=self.random_state,
             cat_random_encode=self.cat_random_encode,
@@ -664,7 +710,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 n_estimators=self.n_quantile_estimators,
                 norm_methods=["quantile"],
                 feat_shuffle_method=self.feat_shuffle_method,
-                class_shuffle_method="none",
+                class_shuffle_method=self.class_shuffle_method,
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
             )
@@ -678,7 +724,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 n_estimators=self.n_svd_ens_estimators,
                 norm_methods=self.svd_ens_norm_methods,
                 feat_shuffle_method=self.feat_shuffle_method,
-                class_shuffle_method="none",
+                class_shuffle_method=self.class_shuffle_method,
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
                 use_svd=True,
@@ -714,7 +760,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 n_estimators=s["n_estimators"],
                 norm_methods=s["norm_methods"],
                 feat_shuffle_method=self.feat_shuffle_method,
-                class_shuffle_method="none",
+                class_shuffle_method=self.class_shuffle_method,
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
             )
@@ -891,13 +937,20 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
     # Forward helpers
     # ==================================================================
 
-    def _forward_candidates(self, Xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    def _forward_candidates(
+        self, Xs: np.ndarray, ys: np.ndarray, feat_indices: Optional[List[np.ndarray]] = None
+    ) -> np.ndarray:
         """Forward a batch of ensemble members and return per-estimator probabilities."""
         n_bad_xs = int(np.sum(~np.isfinite(Xs)))
         if n_bad_xs > 0:
             print(
                 f"[TabLDM:forward_candidates] WARNING: transformed input Xs has "
                 f"{n_bad_xs}/{Xs.size} non-finite values (shape={Xs.shape})"
+            )
+
+        if feat_indices is not None:
+            Xs = np.stack(
+                [Xs[i][:, feat_indices[i]] for i in range(Xs.shape[0])], axis=0
             )
 
         batch_size = self.batch_size_ or Xs.shape[0]
@@ -1031,6 +1084,8 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 )
             return valid
 
+        fsi = getattr(self, "feat_sample_indices_", None)
+
         # ---- main group ----
         data = main_gen.transform(X, mode="both")
         use_augment = getattr(self, "svd_", None) is not None and self.n_estimators == 32
@@ -1044,18 +1099,22 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 n_train_rows = ys.shape[1]
 
                 even_idxs, odd_idxs, odd_locals = [], [], []
+                even_global, odd_global = [], []
                 for local in range(n_est_this_method):
                     if global_est_idx % 2 == 0:
                         even_idxs.append(local)
+                        even_global.append(global_est_idx)
                     else:
                         odd_idxs.append(local)
                         odd_locals.append(odd_local)
+                        odd_global.append(global_est_idx)
                         odd_local += 1
                     global_est_idx += 1
 
                 per_est_probs = {}
                 if even_idxs:
-                    _p = self._forward_candidates(Xs_both[even_idxs], ys[even_idxs])
+                    fi = [fsi[g] for g in even_global] if fsi is not None else None
+                    _p = self._forward_candidates(Xs_both[even_idxs], ys[even_idxs], feat_indices=fi)
                     for i, li in enumerate(even_idxs):
                         per_est_probs[li] = _p[i]
                 if odd_idxs:
@@ -1068,17 +1127,31 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                             x_both_i[n_train_rows:], X_raw_test, ol, is_train=False)
                         Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
                     Xs_odd = np.stack(Xs_odd_list, axis=0)
-                    _p = self._forward_candidates(Xs_odd, ys[odd_idxs])
+                    fi = [fsi[g] for g in odd_global] if fsi is not None else None
+                    _p = self._forward_candidates(Xs_odd, ys[odd_idxs], feat_indices=fi)
                     for i, li in enumerate(odd_idxs):
                         per_est_probs[li] = _p[i]
 
                 stacked = np.stack(
                     [per_est_probs[li] for li in range(n_est_this_method)], axis=0
                 )
+                if hasattr(main_gen, "class_shuffles_") and norm_method in main_gen.class_shuffles_:
+                    shuffles = main_gen.class_shuffles_[norm_method]
+                    for _si in range(n_est_this_method):
+                        stacked[_si] = stacked[_si][:, shuffles[_si]]
                 all_probs.append(stacked)
         else:
+            _grp_offset = 0
             for norm_method, (Xs, ys) in data.items():
-                all_probs.append(self._forward_candidates(Xs, ys))
+                n_est = Xs.shape[0]
+                fi = [fsi[_grp_offset + i] for i in range(n_est)] if fsi is not None else None
+                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi)
+                if hasattr(main_gen, "class_shuffles_") and norm_method in main_gen.class_shuffles_:
+                    shuffles = main_gen.class_shuffles_[norm_method]
+                    for _si in range(n_est):
+                        probs_arr[_si] = probs_arr[_si][:, shuffles[_si]]
+                all_probs.append(probs_arr)
+                _grp_offset += n_est
 
         n_main = sum(p.shape[0] for p in all_probs)
         rep_shape = all_probs[0].shape[1:] if all_probs else (0, 0)
@@ -1092,8 +1165,17 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         if q_gen is not None:
             q_probs = []
             q_data = q_gen.transform(X, mode="both")
+            _q_offset = n_main
             for norm_method, (Xs, ys) in q_data.items():
-                q_probs.append(self._forward_candidates(Xs, ys))
+                n_est = Xs.shape[0]
+                fi = [fsi[_q_offset + i] for i in range(n_est)] if fsi is not None else None
+                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi)
+                if hasattr(q_gen, "class_shuffles_") and norm_method in q_gen.class_shuffles_:
+                    shuffles = q_gen.class_shuffles_[norm_method]
+                    for _si in range(n_est):
+                        probs_arr[_si] = probs_arr[_si][:, shuffles[_si]]
+                q_probs.append(probs_arr)
+                _q_offset += n_est
             all_probs.extend(q_probs)
             n_q = sum(p.shape[0] for p in q_probs)
             print(f"[TabLDM:enhance:{tag}] mode=quantile_safe n_estimators={n_q}")
@@ -1103,8 +1185,17 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         if svd_ens_gen is not None:
             s_probs = []
             s_data = svd_ens_gen.transform(X, mode="both")
+            _s_offset = n_main + n_q
             for norm_method, (Xs, ys) in s_data.items():
-                s_probs.append(self._forward_candidates(Xs, ys))
+                n_est = Xs.shape[0]
+                fi = [fsi[_s_offset + i] for i in range(n_est)] if fsi is not None else None
+                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi)
+                if hasattr(svd_ens_gen, "class_shuffles_") and norm_method in svd_ens_gen.class_shuffles_:
+                    shuffles = svd_ens_gen.class_shuffles_[norm_method]
+                    for _si in range(n_est):
+                        probs_arr[_si] = probs_arr[_si][:, shuffles[_si]]
+                s_probs.append(probs_arr)
+                _s_offset += n_est
             all_probs.extend(s_probs)
             n_svd_ens = sum(p.shape[0] for p in s_probs)
             print(f"[TabLDM:enhance:{tag}] mode=svd_ens(group6) n_estimators={n_svd_ens}")
@@ -1119,8 +1210,17 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 X_ap = adaptive_plus_ia.transform(X_ap)
             ap_probs = []
             ap_data = adaptive_plus_gen.transform(X_ap, mode="both")
+            _ap_offset = n_main + n_q + n_svd_ens
             for norm_method, (Xs, ys) in ap_data.items():
-                ap_probs.append(self._forward_candidates(Xs, ys))
+                n_est = Xs.shape[0]
+                fi = [fsi[_ap_offset + i] for i in range(n_est)] if fsi is not None else None
+                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi)
+                if hasattr(adaptive_plus_gen, "class_shuffles_") and norm_method in adaptive_plus_gen.class_shuffles_:
+                    shuffles = adaptive_plus_gen.class_shuffles_[norm_method]
+                    for _si in range(n_est):
+                        probs_arr[_si] = probs_arr[_si][:, shuffles[_si]]
+                ap_probs.append(probs_arr)
+                _ap_offset += n_est
             all_probs.extend(ap_probs)
             n_adaptive = sum(p.shape[0] for p in ap_probs)
             print(f"[TabLDM:enhance:{tag}] mode=adaptive_plus(group7) n_estimators={n_adaptive}")
@@ -1130,8 +1230,12 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         if gaussian_rank_gen is not None:
             gr_probs = []
             gr_data = gaussian_rank_gen.transform(X, mode="both")
+            _gr_offset = n_main + n_q + n_svd_ens + n_adaptive
             for norm_method, (Xs, ys) in gr_data.items():
-                gr_probs.append(self._forward_candidates(Xs, ys))
+                n_est = Xs.shape[0]
+                fi = [fsi[_gr_offset + i] for i in range(n_est)] if fsi is not None else None
+                gr_probs.append(self._forward_candidates(Xs, ys, feat_indices=fi))
+                _gr_offset += n_est
             all_probs.extend(gr_probs)
             n_gaussian_rank = sum(p.shape[0] for p in gr_probs)
             print(f"[TabLDM:enhance:{tag}] mode=gaussian_rank(group8) n_estimators={n_gaussian_rank}")
@@ -1313,7 +1417,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             n_estimators=self.n_estimators,
             norm_methods=norm_methods,
             feat_shuffle_method=self.feat_shuffle_method,
-            class_shuffle_method="none",
+            class_shuffle_method=self.class_shuffle_method,
             outlier_threshold=self.outlier_threshold,
             random_state=self.random_state,
             cat_random_encode=self.cat_random_encode,
@@ -1342,7 +1446,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 n_estimators=self.n_quantile_estimators,
                 norm_methods=["quantile"],
                 feat_shuffle_method=self.feat_shuffle_method,
-                class_shuffle_method="none",
+                class_shuffle_method=self.class_shuffle_method,
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
             )
@@ -1356,7 +1460,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 n_estimators=self.n_svd_ens_estimators,
                 norm_methods=self.svd_ens_norm_methods,
                 feat_shuffle_method=self.feat_shuffle_method,
-                class_shuffle_method="none",
+                class_shuffle_method=self.class_shuffle_method,
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
                 use_svd=True,
@@ -1388,7 +1492,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 n_estimators=s["n_estimators"],
                 norm_methods=s["norm_methods"],
                 feat_shuffle_method=self.feat_shuffle_method,
-                class_shuffle_method="none",
+                class_shuffle_method=self.class_shuffle_method,
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
             )
