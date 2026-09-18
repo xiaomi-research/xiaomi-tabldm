@@ -60,7 +60,7 @@ from sklearn.preprocessing import OneHotEncoder, PowerTransformer, StandardScale
 from sklearn.utils.validation import check_is_fitted
 
 from .base import TabLDMBaseEstimator
-from .preprocessing import EnsembleGenerator, TransformToNumerical
+from .preprocessing import EnsembleGenerator, TransformToNumerical, UniqueFeatureFilter
 from .sklearn_utils import _moe_load_mismatch, _num_samples, validate_data
 
 from tabldm import InferenceConfig
@@ -204,6 +204,12 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
     high_kurtosis_n_estimators : int, default=8
         Number of HK candidates (split evenly between asinh and Yeo-Johnson).
+
+    adaptive_enhancement : bool, default=True
+        When ``enhance_candidates=True``, adapt the enhancement configuration
+        from the effective post-filter feature count, training sample count,
+        and target kurtosis. This uses a no-K-Fold strategy. Set to False to
+        preserve all manually supplied enhancement parameters.
     """
 
     def __init__(
@@ -228,7 +234,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
         # -- enhancement parameters --
-        enhance_candidates: bool = False,
+        enhance_candidates: bool = True,
         n_quantile_estimators: int = 16,
         use_cross_feature: bool = True,
         validation: bool = True,
@@ -239,6 +245,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         enable_high_kurtosis_target_ensemble: bool = True,
         high_kurtosis_threshold: float = 10.0,
         high_kurtosis_n_estimators: int = 8,
+        adaptive_enhancement: bool = True,
     ):
         # base
         self.n_estimators = n_estimators
@@ -271,6 +278,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         self.enable_high_kurtosis_target_ensemble = enable_high_kurtosis_target_ensemble
         self.high_kurtosis_threshold = high_kurtosis_threshold
         self.high_kurtosis_n_estimators = high_kurtosis_n_estimators
+        self.adaptive_enhancement = adaptive_enhancement
 
     # ==================================================================
     # Model loading (MoE architecture)
@@ -626,9 +634,91 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             return "single_validation" if n_train >= 1000 else "default"
         return "single_validation" if n_val > 2000 else "kfold"
 
-    # ==================================================================
-    # SVD + cross feature fitting
-    # ==================================================================
+    @staticmethod
+    def _adaptive_enhancement_config(n_train: int, n_features: int) -> dict[str, Any]:
+        """Return the recommended no-K-Fold enhancement configuration.
+
+        High-dimensional feature rules intentionally take precedence over the
+        sample-count rules because feature subspaces are the dominant source of
+        candidate variance in those cases.
+        """
+        config = {
+            "k_fold": False,
+            "use_cross_feature": False,
+            "n_estimators": 8,
+        }
+        if n_features > 300:
+            return {
+                **config,
+                "branch": "high_dimensional",
+                "validation": True,
+                "n_quantile_estimators": 12,
+                "foundation_rate": 0.50,
+            }
+        if n_features > 100:
+            return {
+                **config,
+                "branch": "medium_high_dimensional",
+                "validation": True,
+                "n_quantile_estimators": 12,
+                "foundation_rate": 0.40,
+            }
+        if n_train < 1_000:
+            return {
+                **config,
+                "branch": "small_sample",
+                "validation": False,
+                "n_quantile_estimators": min(8, n_features),
+                "foundation_rate": 1.00,
+            }
+        if n_train < 5_000:
+            return {
+                **config,
+                "branch": "medium_sample",
+                "validation": True,
+                "n_quantile_estimators": 8,
+                "foundation_rate": 0.50,
+            }
+        return {
+            **config,
+            "branch": "large_sample",
+            "validation": True,
+            "n_quantile_estimators": 16,
+            "foundation_rate": 0.25,
+        }
+
+    def _configure_adaptive_enhancement(
+        self, n_train: int, n_features: int, y: np.ndarray
+    ) -> tuple[bool, float]:
+        """Apply data-adaptive enhancement settings and return HK status."""
+        config = self._adaptive_enhancement_config(n_train, n_features)
+        for name, value in config.items():
+            if name != "branch":
+                setattr(self, name, value)
+
+        # These global settings are part of the recommended no-K-Fold policy.
+        self.enable_high_kurtosis_target_ensemble = True
+        self.high_kurtosis_threshold = 10.0
+        self.high_kurtosis_n_estimators = 8
+        triggered, kurtosis_value = self._check_high_kurtosis(y)
+        self.adaptive_enhancement_config_ = {
+            **config,
+            "n_train": n_train,
+            "n_features": n_features,
+            "target_kurtosis": kurtosis_value,
+            "high_kurtosis_triggered": triggered,
+            "high_kurtosis_threshold": self.high_kurtosis_threshold,
+            "high_kurtosis_n_estimators": self.high_kurtosis_n_estimators,
+        }
+        print(
+            f"[TabLDM:enhance] adaptive routing: branch={config['branch']}, "
+            f"n_train={n_train}, n_features={n_features}, "
+            f"validation={self.validation}, main={self.n_estimators}, "
+            f"quantile={self.n_quantile_estimators}, foundation_rate={self.foundation_rate}, "
+            f"k_fold={self.k_fold}, use_cross_feature={self.use_cross_feature}"
+        )
+        return triggered, kurtosis_value
+
 
     def _fit_svd_cross(self, X_raw: np.ndarray, attr_prefix: str = "") -> None:
         """Fit SVD pipeline and build crossing pool on unique-filtered raw training features.
@@ -1077,7 +1167,13 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
     def _candidate_name(self, idx: int, n_main: int) -> str:
         """Human-readable candidate label for NNLS weight logging."""
         if idx < n_main:
-            return f"default[{idx}]" if idx % 2 == 0 else f"svd+cross[{idx}]"
+            uses_svd_cross = (
+                getattr(self, "svd_", None) is not None
+                and n_main == 32
+            )
+            if uses_svd_cross and idx % 2:
+                return f"svd+cross[{idx}]"
+            return f"default[{idx}]"
         n_q = self.n_quantile_estimators if getattr(self, "n_quantile_estimators", 0) > 0 else 0
         if idx < n_main + n_q:
             return f"quantile[{idx - n_main}]"
@@ -1191,13 +1287,24 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     "Disable one of them."
                 )
 
-            # Kurtosis check (uses original-scale y before StandardScaler)
-            self.hk_triggered_ = False
-            self.hk_kurtosis_ = float("nan")
-            self.hk_triggered_, self.hk_kurtosis_ = self._check_high_kurtosis(y)
+            # Determine the actual feature count seen by generators: encoded X
+            # after constant-column filtering. This is the routing statistic and
+            # the dimensionality used by per-candidate feature sampling.
+            effective_feature_filter = UniqueFeatureFilter()
+            effective_feature_filter.fit(X)
+            n_effective_features = int(effective_feature_filter.n_features_out_)
+
+            if self.adaptive_enhancement:
+                self.hk_triggered_, self.hk_kurtosis_ = self._configure_adaptive_enhancement(
+                    n_train=X.shape[0], n_features=n_effective_features, y=y
+                )
+            else:
+                # Kurtosis check uses the original-scale y before StandardScaler.
+                self.hk_triggered_, self.hk_kurtosis_ = self._check_high_kurtosis(y)
+                self.adaptive_enhancement_config_ = None
 
             # Feature sampling
-            n_orig_features = X.shape[1]
+            n_orig_features = n_effective_features
             _n_hk_est = self.high_kurtosis_n_estimators if self.hk_triggered_ else 0
             n_total_estimators = (
                 self.n_estimators

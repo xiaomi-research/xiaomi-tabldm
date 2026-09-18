@@ -257,6 +257,98 @@ def test_regressor_inference(reg_data):
     assert np.isfinite(pred).all()
 
 
+@pytest.mark.parametrize(
+    ("n_train", "n_features", "expected"),
+    [
+        (999, 5, {"branch": "small_sample", "validation": False, "n_quantile_estimators": 5, "foundation_rate": 1.0}),
+        (1_000, 100, {"branch": "medium_sample", "validation": True, "n_quantile_estimators": 8, "foundation_rate": 0.5}),
+        (5_000, 100, {"branch": "large_sample", "validation": True, "n_quantile_estimators": 16, "foundation_rate": 0.25}),
+        (999, 101, {"branch": "medium_high_dimensional", "validation": True, "n_quantile_estimators": 12, "foundation_rate": 0.4}),
+        (999, 301, {"branch": "high_dimensional", "validation": True, "n_quantile_estimators": 12, "foundation_rate": 0.5}),
+    ],
+)
+def test_regressor_adaptive_enhancement_routing(n_train, n_features, expected):
+    """Adaptive regression routing follows the documented no-K-Fold matrix."""
+    from tabldm import TabLDMRegressor
+
+    config = TabLDMRegressor._adaptive_enhancement_config(n_train, n_features)
+
+    assert config["k_fold"] is False
+    assert config["use_cross_feature"] is False
+    assert config["n_estimators"] == 8
+    for key, value in expected.items():
+        assert config[key] == value
+
+
+def test_regressor_adaptive_configuration_enables_hk_and_records_stats():
+    """Adaptive configuration enables the fixed HK policy and records its decision."""
+    from tabldm import TabLDMRegressor
+
+    y = np.concatenate([np.zeros(99), [1_000.0]])
+    reg = TabLDMRegressor(
+        enhance_candidates=True,
+        enable_high_kurtosis_target_ensemble=False,
+        high_kurtosis_threshold=999.0,
+        high_kurtosis_n_estimators=2,
+    )
+
+    triggered, kurtosis_value = reg._configure_adaptive_enhancement(1_200, 10, y)
+
+    assert triggered
+    assert kurtosis_value > 10.0
+    assert reg.enable_high_kurtosis_target_ensemble is True
+    assert reg.high_kurtosis_threshold == 10.0
+    assert reg.high_kurtosis_n_estimators == 8
+    assert reg.adaptive_enhancement_config_["branch"] == "medium_sample"
+    assert reg.adaptive_enhancement_config_["high_kurtosis_triggered"] is True
+
+
+def test_regressor_effective_feature_count_ignores_constant_columns():
+    """Routing can use the post-filter count required by the recommendation."""
+    from tabldm._sklearn.preprocessing import UniqueFeatureFilter
+    from tabldm import TabLDMRegressor
+
+    X = np.column_stack([np.arange(20), np.ones(20)])
+    feature_filter = UniqueFeatureFilter().fit(X)
+    config = TabLDMRegressor._adaptive_enhancement_config(
+        n_train=X.shape[0], n_features=feature_filter.n_features_out_
+    )
+
+    assert feature_filter.n_features_out_ == 1
+    assert config["n_quantile_estimators"] == 1
+
+
+def test_regressor_adaptive_enhancement_can_be_disabled():
+    """Disabling adaptive enhancement leaves manual enhancement values intact."""
+    from tabldm import TabLDMRegressor
+
+    reg = TabLDMRegressor(
+        adaptive_enhancement=False,
+        n_estimators=32,
+        n_quantile_estimators=3,
+        validation=True,
+        k_fold=True,
+        foundation_rate=0.1,
+        use_cross_feature=True,
+    )
+
+    assert reg.adaptive_enhancement is False
+    assert reg.n_estimators == 32
+    assert reg.n_quantile_estimators == 3
+    assert reg.validation is True
+    assert reg.k_fold is True
+    assert reg.foundation_rate == 0.1
+    assert reg.use_cross_feature is True
+
+
+def test_regressor_candidate_name_does_not_claim_inactive_svd_cross():
+    """Candidate logs label plain candidates accurately when SVD/cross is off."""
+    from tabldm import TabLDMRegressor
+
+    reg = TabLDMRegressor()
+    assert reg._candidate_name(1, 8) == "default[1]"
+
+
 @pytest.mark.skipif(CLF_CKPT is None, reason="no clf MoE1 checkpoint")
 def test_save_load_roundtrip(clf_data, tmp_path):
     """A self-contained save/load reproduces predictions exactly."""
