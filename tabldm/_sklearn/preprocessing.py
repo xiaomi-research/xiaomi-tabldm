@@ -164,6 +164,21 @@ class TransformToNumerical(TransformerMixin, BaseEstimator):
 
         self.tfm_.fit(X)
 
+        if hasattr(self.tfm_, "transformers_"):
+            numeric_positions = []
+            categorical_positions = []
+            for name, _, positions in self.tfm_.transformers_:
+                if name == "continuous":
+                    numeric_positions.extend(list(positions))
+                elif name == "categorical":
+                    categorical_positions.extend(list(positions))
+            # ColumnTransformer emits continuous values before categorical ones.
+            self.categorical_indices_ = list(
+                range(len(numeric_positions), len(numeric_positions) + len(categorical_positions))
+            )
+        else:
+            self.categorical_indices_ = []
+
         if self.verbose and hasattr(self.tfm_, "transformers_"):
             selected_cols = []
             for name, tfm, pos in self.tfm_.transformers_:
@@ -689,11 +704,16 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
     """
 
     def __init__(
-        self, normalization_method: str = "power", outlier_threshold: float = 4.0, random_state: Optional[int] = None
+        self,
+        normalization_method: str = "power",
+        outlier_threshold: float = 4.0,
+        random_state: Optional[int] = None,
+        categorical_indices: Optional[List[int]] = None,
     ):
         self.normalization_method = normalization_method
         self.outlier_threshold = outlier_threshold
         self.random_state = random_state
+        self.categorical_indices = categorical_indices
 
     def fit(self, X, y=None):
         """Fit the preprocessing pipeline.
@@ -712,12 +732,26 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
             Returns self.
         """
         X = validate_data(self, X)
+        categorical_indices = np.asarray(self.categorical_indices or [], dtype=np.intp)
+        categorical_indices = categorical_indices[
+            (categorical_indices >= 0) & (categorical_indices < X.shape[1])
+        ]
+        numeric_mask = np.ones(X.shape[1], dtype=bool)
+        numeric_mask[categorical_indices] = False
 
-        # 1. Apply standard scaling
+        self.numeric_mask_ = numeric_mask
+
+        # 1. Apply standard scaling to real numerical columns only.
         self.standard_scaler_ = CustomStandardScaler()
-        X_scaled = self.standard_scaler_.fit_transform(X)
+        if numeric_mask.any():
+            self.standard_scaler_.fit(X[:, numeric_mask])
+            X_scaled = np.array(X, copy=True, dtype=np.float64)
+            X_scaled[:, numeric_mask] = self.standard_scaler_.transform(X[:, numeric_mask])
+        else:
+            self.standard_scaler_ = None
+            X_scaled = np.array(X, copy=True, dtype=np.float64)
 
-        # 2. Apply normalization
+        # 2. Apply normalization to real numerical columns only.
         if self.normalization_method != "none":
             if self.normalization_method == "power":
                 self.normalizer_ = PowerTransformer(method="yeo-johnson", standardize=True)
@@ -738,9 +772,15 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
             else:
                 raise ValueError(f"Unknown normalization method: {self.normalization_method}")
 
-            self.X_min_ = np.min(X_scaled, axis=0, keepdims=True)
-            self.X_max_ = np.max(X_scaled, axis=0, keepdims=True)
-            X_normalized = self.normalizer_.fit_transform(X_scaled)
+            X_normalized = np.array(X_scaled, copy=True)
+            if numeric_mask.any():
+                self.X_min_ = np.min(X_scaled[:, numeric_mask], axis=0, keepdims=True)
+                self.X_max_ = np.max(X_scaled[:, numeric_mask], axis=0, keepdims=True)
+                X_normalized[:, numeric_mask] = self.normalizer_.fit_transform(X_scaled[:, numeric_mask])
+            else:
+                self.X_min_ = np.empty((1, 0), dtype=X_scaled.dtype)
+                self.X_max_ = np.empty((1, 0), dtype=X_scaled.dtype)
+                self.normalizer_ = None
         else:
             self.normalizer_ = None
             X_normalized = X_scaled
@@ -766,21 +806,22 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
         """
         check_is_fitted(self)
         X = validate_data(self, X, reset=False, copy=True)
-        # Standard scaling
-        X = self.standard_scaler_.transform(X)
-        # Normalization
-        if self.normalizer_ is not None:
-            try:
-                # this can fail in rare cases if there is an outlier in X that was not present in fit()
-                X = self.normalizer_.transform(X)
-            except ValueError:
-                # clip values to train min/max
-                X = np.clip(X, self.X_min_, self.X_max_)
-                X = self.normalizer_.transform(X)
-        # Outlier removal
-        X = self.outlier_remover_.transform(X)
+        # Standard scaling and normalization apply only to real numerical columns.
+        numeric_mask = self.numeric_mask_
+        X_out = np.array(X, copy=True, dtype=np.float64)
+        if numeric_mask.any():
+            X_scaled = self.standard_scaler_.transform(X[:, numeric_mask])
+            if self.normalizer_ is not None:
+                try:
+                    X_scaled = self.normalizer_.transform(X_scaled)
+                except ValueError:
+                    X_scaled = np.clip(X_scaled, self.X_min_, self.X_max_)
+                    X_scaled = self.normalizer_.transform(X_scaled)
+            X_out[:, numeric_mask] = X_scaled
+        # Outlier removal remains a final safeguard for all columns.
+        X_out = self.outlier_remover_.transform(X_out)
 
-        return X
+        return X_out
 
 
 class Shuffler:
@@ -1125,7 +1166,10 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
             if n_comp is None:
                 n_comp = max(1, int(X.shape[1] * self.svd_ratio))
                 n_comp = min(n_comp, min(X.shape[0], X.shape[1]))
-            self.svd_augmentor_ = SVDFeatureAugmentor(n_components=n_comp)
+            self.svd_augmentor_ = SVDFeatureAugmentor(
+                n_components=n_comp,
+                categorical_indices=self.category_columns_,
+            )
             self.svd_augmentor_.fit(X)
             X = self.svd_augmentor_.transform(X)
             if not np.isfinite(X).all():
@@ -1161,6 +1205,7 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
                 normalization_method=norm_method,
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
+                categorical_indices=self.category_columns_,
             )
             preprocessor.fit(X)
             self.preprocessors_[norm_method] = preprocessor
@@ -1172,6 +1217,7 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
                         normalization_method=norm_method,
                         outlier_threshold=self.outlier_threshold,
                         random_state=self.random_state,
+                        categorical_indices=self.category_columns_,
                     )
                     member_preprocessor.fit(self._apply_category_code_mapping(X, mapping))
                     member_preprocessors.append(member_preprocessor)
@@ -1452,24 +1498,40 @@ class SVDFeatureAugmentor(TransformerMixin, BaseEstimator):
         Number of SVD components to keep.
     """
 
-    def __init__(self, n_components: int = 10):
+    def __init__(
+        self, n_components: int = 10, categorical_indices: Optional[List[int]] = None
+    ):
         self.n_components = n_components
+        self.categorical_indices = categorical_indices
 
     def fit(self, X, y=None):
         X = np.asarray(X, dtype=np.float64)
-        col_means = np.nanmean(X, axis=0)
-        nan_mask = np.isnan(X)
+        categorical = np.asarray(self.categorical_indices or [], dtype=np.intp)
+        numeric_mask = np.ones(X.shape[1], dtype=bool)
+        numeric_mask[categorical[(categorical >= 0) & (categorical < X.shape[1])]] = False
+        if not numeric_mask.any():
+            self.components_ = np.empty((0, 0), dtype=np.float64)
+            self.mean_ = np.empty(0, dtype=np.float64)
+            self.std_ = np.empty(0, dtype=np.float64)
+            self.numeric_mask_ = numeric_mask
+            self.n_features_in_ = X.shape[1]
+            self.n_components_ = 0
+            self.n_features_out_ = X.shape[1]
+            return self
+        X_num = X[:, numeric_mask]
+        col_means = np.nanmean(X_num, axis=0)
+        nan_mask = np.isnan(X_num)
         if nan_mask.any():
-            X = X.copy()
-            X[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
+            X_num = X_num.copy()
+            X_num[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
 
-        self.mean_ = np.mean(X, axis=0)
-        self.std_ = np.std(X, axis=0)
+        self.mean_ = np.mean(X_num, axis=0)
+        self.std_ = np.std(X_num, axis=0)
         self.std_[self.std_ < 1e-10] = 1.0
-        X_scaled = (X - self.mean_) / self.std_
+        X_scaled = (X_num - self.mean_) / self.std_
         X_scaled = np.clip(X_scaled, -10, 10)
 
-        n_comp = min(self.n_components, min(X.shape[0], X.shape[1]))
+        n_comp = min(self.n_components, min(X_num.shape[0], X_num.shape[1]))
         try:
             from sklearn.utils.extmath import randomized_svd
             _, _, Vt = randomized_svd(X_scaled, n_components=n_comp, random_state=42)
@@ -1478,6 +1540,7 @@ class SVDFeatureAugmentor(TransformerMixin, BaseEstimator):
             Vt = Vt[:n_comp]
 
         self.components_ = Vt
+        self.numeric_mask_ = numeric_mask
         self.n_features_in_ = X.shape[1]
         self.n_components_ = n_comp
         self.n_features_out_ = X.shape[1] + n_comp
@@ -1486,17 +1549,20 @@ class SVDFeatureAugmentor(TransformerMixin, BaseEstimator):
     def transform(self, X):
         check_is_fitted(self, ["components_", "mean_", "std_"])
         X = np.asarray(X, dtype=np.float64)
-        nan_mask = np.isnan(X)
+        if self.n_components_ == 0:
+            return X
+        X_num = X[:, self.numeric_mask_]
+        nan_mask = np.isnan(X_num)
         if nan_mask.any():
-            X = X.copy()
+            X_num = X_num.copy()
             import warnings
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
-                col_means = np.nanmean(X, axis=0)
+                col_means = np.nanmean(X_num, axis=0)
             col_means = np.where(np.isnan(col_means), self.mean_, col_means)
-            X[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
+            X_num[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
 
-        X_scaled = (X - self.mean_) / self.std_
+        X_scaled = (X_num - self.mean_) / self.std_
         X_scaled = np.clip(X_scaled, -10, 10)
         X_svd = X_scaled @ self.components_.T
 
@@ -1526,20 +1592,32 @@ class GaussianRankNormalizer(TransformerMixin, BaseEstimator):
         Seed for the noise generator.
     """
 
-    def __init__(self, random_state=None):
+    def __init__(self, random_state=None, numeric_mask=None):
         self.random_state = random_state
+        self.numeric_mask = numeric_mask
 
     def fit(self, X, y=None):
         X = np.asarray(X, dtype=np.float64)
         n_samples, n_features = X.shape
         rng = np.random.default_rng(self.random_state)
 
-        self.n_features_ = n_features
+        if self.numeric_mask is None:
+            numeric_mask = np.ones(n_features, dtype=bool)
+        else:
+            numeric_mask = np.asarray(self.numeric_mask, dtype=bool)
+            if numeric_mask.shape != (n_features,):
+                raise ValueError("numeric_mask must match the number of features")
+        self.numeric_mask_ = numeric_mask
         self.references_ = []
         self.noise_scales_ = []
         self.noise_per_col_ = []
 
         for col in range(n_features):
+            if not numeric_mask[col]:
+                self.references_.append(np.array([], dtype=np.float64))
+                self.noise_scales_.append(0.0)
+                self.noise_per_col_.append(np.zeros(n_samples, dtype=np.float64))
+                continue
             observed = X[:, col]
             mask = ~np.isnan(observed)
             vals = observed[mask]
@@ -1613,10 +1691,17 @@ class GaussianRankGenerator:
         Base seed for reproducibility.
     """
 
-    def __init__(self, n_estimators, feat_shuffle_method="random", random_state=None):
+    def __init__(
+        self,
+        n_estimators,
+        feat_shuffle_method="random",
+        random_state=None,
+        categorical_indices: Optional[List[int]] = None,
+    ):
         self.n_estimators = n_estimators
         self.feat_shuffle_method = feat_shuffle_method
         self.random_state = random_state
+        self.categorical_indices = categorical_indices
 
     def fit(self, X, y, frozen_unique_filter=None):
         if frozen_unique_filter is not None:
@@ -1629,19 +1714,39 @@ class GaussianRankGenerator:
         self.X_ = X.copy()
         self.y_ = y.copy()
         n_train, n_features = X.shape
+        if self.categorical_indices is not None:
+            original_indices = set(self.categorical_indices)
+            categorical_indices = [
+                filtered_index
+                for filtered_index, original_index in enumerate(
+                    np.flatnonzero(self.unique_filter_.features_to_keep_)
+                )
+                if original_index in original_indices
+            ]
+        else:
+            categorical_indices = None
         n_estimators = self.n_estimators
 
-        # Detect numeric columns (unique values > 10) vs categorical.
-        is_numeric = np.array(
-            [len(np.unique(X[~np.isnan(X[:, c]), c])) > 10 for c in range(n_features)],
-            dtype=bool,
-        )
+        # Detect real numerical columns. Explicit categorical metadata takes
+        # precedence over the historical unique-count heuristic.
+        if categorical_indices is None:
+            is_numeric = np.array(
+                [len(np.unique(X[~np.isnan(X[:, c]), c])) > 10 for c in range(n_features)],
+                dtype=bool,
+            )
+        else:
+            categorical = np.asarray(categorical_indices, dtype=np.intp)
+            is_numeric = np.ones(n_features, dtype=bool)
+            is_numeric[categorical[(categorical >= 0) & (categorical < n_features)]] = False
         self.is_numeric_ = is_numeric
 
         # Fit one GaussianRankNormalizer per estimator (different noise).
         self.normalizers_ = []
         for i in range(n_estimators):
-            norm = GaussianRankNormalizer(random_state=self.random_state + i)
+            norm = GaussianRankNormalizer(
+                random_state=self.random_state + i,
+                numeric_mask=is_numeric,
+            )
             norm.fit(X)
             self.normalizers_.append(norm)
 

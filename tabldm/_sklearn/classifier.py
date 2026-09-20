@@ -97,6 +97,21 @@ def _get_adaptive_inference_config(n_features, n_num, enable_augmentations=False
     return cfg
 
 
+def _multiclass_conservative_weights(weights: dict[str, float]) -> dict[str, float]:
+    """Increase default weight by .10 and scale other active groups down."""
+    result = dict(weights)
+    non_default = sum(value for name, value in result.items() if name != "default")
+    if non_default <= 0:
+        return result
+    increase = min(0.10, non_default)
+    result["default"] = result.get("default", 0.0) + increase
+    scale = (non_default - increase) / non_default
+    for name in result:
+        if name != "default":
+            result[name] *= scale
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Enhanced Classifier
 # ---------------------------------------------------------------------------
@@ -234,6 +249,11 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
     n_gaussian_rank_estimators : int, default=16
         Number of Gaussian rank candidates.
+
+    adaptive_enhancement : bool, default=True
+        When ``enhance_candidates=True``, select the documented no-K-Fold,
+        fixed-weight enhancement plan from post-filter feature composition.
+        Set to False to preserve manually supplied enhancement settings.
     """
 
     def __init__(
@@ -281,6 +301,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         calibration_lambda: float = 1e-2,
         use_gaussian_rank_ens: bool = True,
         n_gaussian_rank_estimators: int = 16,
+        adaptive_enhancement: bool = True,
     ):
         # base
         self.n_estimators = n_estimators
@@ -325,6 +346,148 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.calibration_lambda = calibration_lambda
         self.use_gaussian_rank_ens = use_gaussian_rank_ens
         self.n_gaussian_rank_estimators = n_gaussian_rank_estimators
+        self.adaptive_enhancement = adaptive_enhancement
+
+    # ==================================================================
+    # Adaptive no-K-Fold enhancement routing
+    # ==================================================================
+
+    @staticmethod
+    def _adaptive_enhancement_config(
+        n_train: int, n_features: int, n_num: int, n_cat: int, n_classes: int
+    ) -> dict[str, Any]:
+        """Return the documented fixed-weight classification enhancement plan."""
+        cat_ratio = n_cat / max(n_features, 1)
+        dim_ratio = n_features / max(n_train, 1)
+
+        def _plan(branch, groups):
+            return {
+                "branch": branch,
+                "n_train": n_train,
+                "n_features": n_features,
+                "n_num": n_num,
+                "n_cat": n_cat,
+                "n_classes": n_classes,
+                "cat_ratio": cat_ratio,
+                "dim_ratio": dim_ratio,
+                "groups": groups,
+                "validation": False,
+                "k_fold": False,
+                "enable_calibration": False,
+                "use_cross_feature": False,
+            }
+
+        if cat_ratio >= 0.80:
+            if cat_ratio >= 0.95:
+                groups = {"default": (8, 0.80), "quantile_safe": (4, 0.20)}
+            else:
+                groups = {"default": (8, 0.70), "quantile_safe": (8, 0.30)}
+            return _plan("P-CAT", groups)
+        if cat_ratio >= 0.70 and n_features >= 20:
+            return _plan("P-MIX", {
+                "default": (8, 0.55),
+                "quantile_safe": (8, 0.20),
+                "gaussian_rank": (8, 0.15),
+                "adaptive_plus": (8, 0.10),
+            })
+        if n_train < 1_200 or dim_ratio > 0.10:
+            weights = (0.80, 0.10, 0.10) if dim_ratio > 0.20 else (0.70, 0.15, 0.15)
+            return _plan("P0", {
+                "default": (8, weights[0]),
+                "quantile_safe": (4, weights[1]),
+                "gaussian_rank": (4, weights[2]),
+            })
+        if n_train < 2_000:
+            return _plan("P1", {
+                "default": (8, 0.60),
+                "quantile_safe": (8, 0.20),
+                "gaussian_rank": (8, 0.20),
+            })
+        if n_train < 15_000 and n_features <= 50:
+            groups = {
+                "default": (8, 0.45),
+                "quantile_safe": (8, 0.20),
+                "adaptive_plus": (16, 0.25),
+                "gaussian_rank": (8, 0.10),
+            }
+            if n_classes >= 5:
+                groups = {
+                    "default": (8, 0.55),
+                    "quantile_safe": (4, 0.15),
+                    "adaptive_plus": (8, 0.20),
+                    "gaussian_rank": (4, 0.10),
+                }
+            return _plan("P2", groups)
+        if n_train < 15_000:
+            if dim_ratio > 0.10:
+                groups = {
+                    "default": (8, 0.60),
+                    "quantile_safe": (4, 0.15),
+                    "svd_ens": (4, 0.15),
+                    "gaussian_rank": (4, 0.10),
+                }
+            else:
+                groups = {
+                    "default": (8, 0.45),
+                    "quantile_safe": (8, 0.15),
+                    "svd_ens": (8, 0.20),
+                    "adaptive_plus": (8, 0.10),
+                    "gaussian_rank": (8, 0.10),
+                }
+            if n_classes >= 5:
+                weights = _multiclass_conservative_weights(
+                    {name: weight for name, (_, weight) in groups.items()}
+                )
+                groups = {name: (count, weights[name]) for name, (count, _) in groups.items()}
+            return _plan("P3", groups)
+        groups = {
+            "default": (8, 0.35),
+            "quantile_safe": (16, 0.20),
+            "svd_ens": (16, 0.20),
+            "adaptive_plus": (16, 0.15),
+            "gaussian_rank": (16, 0.10),
+        }
+        if n_classes >= 5:
+            weights = _multiclass_conservative_weights(
+                {name: weight for name, (_, weight) in groups.items()}
+            )
+            groups = {name: (count, weights[name]) for name, (count, _) in groups.items()}
+        return _plan("P4", groups)
+
+    def _configure_adaptive_enhancement(
+        self, n_train: int, n_features: int, n_num: int, n_cat: int
+    ) -> None:
+        """Apply a fixed classification plan and record the routing decision."""
+        config = self._adaptive_enhancement_config(
+            n_train, n_features, n_num, n_cat, self.n_classes_
+        )
+        groups = dict(config["groups"])
+        if n_num == 0:
+            groups.pop("quantile_safe", None)
+            groups.pop("gaussian_rank", None)
+        if n_num == 0 or config["branch"] in {"P-CAT", "P-MIX"}:
+            groups.pop("svd_ens", None)
+        if config["branch"] in {"P-CAT", "P-MIX"}:
+            groups.pop("adaptive_plus", None)
+
+        self.n_estimators = groups.get("default", (0, 0.0))[0]
+        self.n_quantile_estimators = groups.get("quantile_safe", (0, 0.0))[0]
+        self.use_svd_ens = "svd_ens" in groups
+        self.n_svd_ens_estimators = groups.get("svd_ens", (0, 0.0))[0]
+        self.use_adaptive_plus_candidate = "adaptive_plus" in groups
+        self.use_gaussian_rank_ens = "gaussian_rank" in groups
+        self.n_gaussian_rank_estimators = groups.get("gaussian_rank", (0, 0.0))[0]
+        self.validation = config["validation"]
+        self.k_fold = config["k_fold"]
+        self.enable_calibration = config["enable_calibration"]
+        self.use_cross_feature = config["use_cross_feature"]
+        self.adaptive_group_weights_ = {name: weight for name, (_, weight) in groups.items()}
+        self.adaptive_enhancement_config_ = {**config, "enabled_groups": groups}
+        print(
+            f"[TabLDM:enhance] adaptive routing: branch={config['branch']}, "
+            f"n_train={n_train}, n_features={n_features}, n_num={n_num}, n_cat={n_cat}, "
+            f"groups={groups}"
+        )
 
     # ==================================================================
     # Model loading (MoE architecture)
@@ -514,6 +677,33 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.calibration_params_ = None
 
         if self.enhance_candidates:
+            # Route from the actual encoded, constant-filtered feature matrix.
+            # Explicit indices override dtype-derived metadata for ndarray input.
+            effective_feature_filter = UniqueFeatureFilter().fit(X)
+            kept_original = np.flatnonzero(effective_feature_filter.features_to_keep_)
+            source_categorical = (
+                list(self.categorical_indices)
+                if self.categorical_indices is not None
+                else list(getattr(self.X_encoder_, "categorical_indices_", []))
+            )
+            source_categorical = {int(index) for index in source_categorical}
+            self._encoded_categorical_indices_ = sorted(source_categorical)
+            self._filtered_categorical_indices_ = [
+                filtered_index
+                for filtered_index, original_index in enumerate(kept_original)
+                if original_index in source_categorical
+            ]
+            n_features = int(effective_feature_filter.n_features_out_)
+            n_cat = len(self._filtered_categorical_indices_)
+            n_num = n_features - n_cat
+            if self.adaptive_enhancement:
+                self._configure_adaptive_enhancement(
+                    n_train=X.shape[0], n_features=n_features, n_num=n_num, n_cat=n_cat
+                )
+            else:
+                self.adaptive_enhancement_config_ = None
+                self.adaptive_group_weights_ = None
+
             # Freeze adaptive_plus structure before any fold splitting
             if self.use_adaptive_plus_candidate:
                 self._freeze_adaptive_plus_structure(X)
@@ -576,7 +766,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
                 cat_random_encode=self.cat_random_encode,
-                categorical_indices=self.categorical_indices,
+                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
             )
             self.ensemble_generator_.fit(X, y)
 
@@ -693,7 +883,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             outlier_threshold=self.outlier_threshold,
             random_state=self.random_state,
             cat_random_encode=self.cat_random_encode,
-            categorical_indices=self.categorical_indices,
+            categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
         )
         self.ensemble_generator_.fit(X, y)
 
@@ -713,6 +903,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 class_shuffle_method=self.class_shuffle_method,
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
+                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
             )
             self.quantile_ensemble_generator_.fit(X, y)
 
@@ -763,6 +954,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 class_shuffle_method=self.class_shuffle_method,
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
+                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
             )
             if s["use_svd"]:
                 gen_kwargs["use_svd"] = True
@@ -778,6 +970,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 n_estimators=self.n_gaussian_rank_estimators,
                 feat_shuffle_method="random",
                 random_state=self.random_state,
+                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
             )
             self.gaussian_rank_generator_.fit(X, y)
 
@@ -1421,7 +1614,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             outlier_threshold=self.outlier_threshold,
             random_state=self.random_state,
             cat_random_encode=self.cat_random_encode,
-            categorical_indices=self.categorical_indices,
+            categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
         )
         main_gen.fit(X_tr, y_tr, frozen_unique_filter=main_frozen_filter)
 
@@ -1449,6 +1642,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 class_shuffle_method=self.class_shuffle_method,
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
+                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
             )
             q_gen.fit(X_tr, y_tr, frozen_unique_filter=q_frozen_filter)
 
@@ -1495,6 +1689,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 class_shuffle_method=self.class_shuffle_method,
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
+                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
             )
             if s["use_svd"]:
                 gen_kwargs["use_svd"] = True
@@ -1510,6 +1705,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 n_estimators=self.n_gaussian_rank_estimators,
                 feat_shuffle_method="random",
                 random_state=self.random_state,
+                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
             )
             gaussian_rank_gen.fit(X_tr, y_tr, frozen_unique_filter=gr_frozen_filter)
 
@@ -1713,6 +1909,33 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             print(f"[TabLDM:calibration] WARNING: applying calibration failed ({exc!r}); using uncalibrated.")
             return P
 
+    @staticmethod
+    def _fixed_group_average(
+        probs: np.ndarray, candidate_indices: np.ndarray, group_sizes: dict[str, int], group_weights: dict[str, float]
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        """Average valid candidates within groups, then apply fixed group weights."""
+        starts = {}
+        offset = 0
+        for name, size in group_sizes.items():
+            starts[name] = (offset, offset + size)
+            offset += size
+        enabled = {}
+        group_probs = {}
+        for name, weight in group_weights.items():
+            start, end = starts.get(name, (0, 0))
+            local = (candidate_indices >= start) & (candidate_indices < end)
+            if np.any(local):
+                group_probs[name] = probs[local].mean(axis=0)
+                enabled[name] = weight
+        total_weight = sum(enabled.values())
+        if total_weight <= 0:
+            raise RuntimeError("[TabLDM:enhance] no fixed-weight candidate groups remain.")
+        averaged = sum(
+            (weight / total_weight) * group_probs[name]
+            for name, weight in enabled.items()
+        )
+        return averaged, {name: weight / total_weight for name, weight in enabled.items()}
+
     # ==================================================================
     # Enhanced probability prediction
     # ==================================================================
@@ -1784,7 +2007,26 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                         weights = raw_w / w_sum
                         weight_mode = "nnls_blend"
 
-        if weights is not None:
+        adaptive_weights = getattr(self, "adaptive_group_weights_", None)
+        if adaptive_weights is not None:
+            candidate_indices = np.where(effective_mask)[0]
+            avg, normalized_group_weights = self._fixed_group_average(
+                probs,
+                candidate_indices,
+                {
+                    "default": n_main,
+                    "quantile_safe": n_q,
+                    "svd_ens": n_svd_ens,
+                    "adaptive_plus": n_adaptive,
+                    "gaussian_rank": n_gaussian_rank,
+                },
+                adaptive_weights,
+            )
+            weight_mode = "fixed_group"
+            print(
+                f"[TabLDM:enhance] fixed group weights={normalized_group_weights}"
+            )
+        elif weights is not None:
             avg = np.einsum("e,enc->nc", weights, probs)
         else:
             avg = probs.mean(axis=0)

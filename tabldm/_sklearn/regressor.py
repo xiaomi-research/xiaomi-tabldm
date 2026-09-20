@@ -46,7 +46,7 @@ import re
 import warnings
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import numpy as np
 import torch
@@ -208,8 +208,19 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
     adaptive_enhancement : bool, default=True
         When ``enhance_candidates=True``, adapt the enhancement configuration
         from the effective post-filter feature count, training sample count,
-        and target kurtosis. This uses a no-K-Fold strategy. Set to False to
-        preserve all manually supplied enhancement parameters.
+        and target kurtosis. This uses the documented no-K-Fold policy. Set to
+        False to preserve all manually supplied enhancement parameters.
+
+    fixed_candidate_names : list[str] or None, default=None
+        Names of the only base candidates to fuse for a documented fixed plan.
+        Supported names are ``default[i]``, ``quantile[i]``, and the legacy
+        positional alias ``svd+cross[i]``. A fixed plan skips holdout/NNLS and
+        is valid only for the low-sample, low-dimensional adaptive route.
+
+    fixed_candidate_weights : list[float] or "equal" or None, default=None
+        Weights paired with ``fixed_candidate_names``. ``"equal"`` (or None)
+        gives each named candidate equal weight. Numeric weights must be
+        finite, non-negative, and sum to a positive value.
     """
 
     def __init__(
@@ -246,6 +257,8 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         high_kurtosis_threshold: float = 10.0,
         high_kurtosis_n_estimators: int = 8,
         adaptive_enhancement: bool = True,
+        fixed_candidate_names: Optional[List[str]] = None,
+        fixed_candidate_weights: Optional[List[float] | Literal["equal"]] = None,
     ):
         # base
         self.n_estimators = n_estimators
@@ -279,6 +292,8 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         self.high_kurtosis_threshold = high_kurtosis_threshold
         self.high_kurtosis_n_estimators = high_kurtosis_n_estimators
         self.adaptive_enhancement = adaptive_enhancement
+        self.fixed_candidate_names = fixed_candidate_names
+        self.fixed_candidate_weights = fixed_candidate_weights
 
     # ==================================================================
     # Model loading (MoE architecture)
@@ -635,68 +650,135 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         return "single_validation" if n_val > 2000 else "kfold"
 
     @staticmethod
-    def _adaptive_enhancement_config(n_train: int, n_features: int) -> dict[str, Any]:
-        """Return the recommended no-K-Fold enhancement configuration.
+    def _adaptive_enhancement_config(
+        n_train: int, n_features: int, has_fixed_plan: bool = False
+    ) -> dict[str, Any]:
+        """Return the documented no-K-Fold regression route.
 
-        High-dimensional feature rules intentionally take precedence over the
-        sample-count rules because feature subspaces are the dominant source of
-        candidate variance in those cases.
+        The fixed route is selected only when the caller supplies a named
+        candidate plan.  Dataset identity is intentionally not inferred here;
+        the evaluation runner owns the dataset-specific candidate table.
         """
         config = {
             "k_fold": False,
             "use_cross_feature": False,
+            "foundation_rate": 0.0,
             "n_estimators": 8,
         }
-        if n_features > 300:
-            return {
-                **config,
-                "branch": "high_dimensional",
-                "validation": True,
-                "n_quantile_estimators": 12,
-                "foundation_rate": 0.50,
-            }
         if n_features > 100:
             return {
                 **config,
-                "branch": "medium_high_dimensional",
+                "branch": "nnls_high_dimensional",
                 "validation": True,
-                "n_quantile_estimators": 12,
-                "foundation_rate": 0.40,
+                "n_quantile_estimators": 16,
             }
-        if n_train < 1_000:
+        if n_train < 1_000 and n_features <= 10:
             return {
                 **config,
-                "branch": "small_sample",
+                "branch": "fixed" if has_fixed_plan else "fixed_plan_required",
                 "validation": False,
-                "n_quantile_estimators": min(8, n_features),
-                "foundation_rate": 1.00,
+                "n_quantile_estimators": 8,
             }
         if n_train < 5_000:
             return {
                 **config,
-                "branch": "medium_sample",
+                "branch": "nnls_medium",
                 "validation": True,
                 "n_quantile_estimators": 8,
-                "foundation_rate": 0.50,
             }
         return {
             **config,
-            "branch": "large_sample",
+            "branch": "nnls_large",
             "validation": True,
             "n_quantile_estimators": 16,
-            "foundation_rate": 0.25,
         }
+
+    @staticmethod
+    def _parse_candidate_name(name: str) -> tuple[str, int]:
+        """Parse a fixed-plan candidate name into group and local index."""
+        if not isinstance(name, str):
+            raise TypeError("fixed_candidate_names must contain strings")
+        match = re.fullmatch(r"(default|quantile|svd\+cross)\[(\d+)\]", name)
+        if match is None:
+            raise ValueError(
+                f"Invalid fixed candidate name {name!r}; expected default[i], "
+                "quantile[i], or svd+cross[i]."
+            )
+        return match.group(1), int(match.group(2))
+
+    def _resolve_fixed_candidate_plan(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Resolve named fixed candidates to global base-candidate indices."""
+        names = self.fixed_candidate_names
+        if names is None:
+            return None
+        if not names:
+            raise ValueError("fixed_candidate_names must not be empty")
+        if len(set(names)) != len(names):
+            raise ValueError("fixed_candidate_names must not contain duplicates")
+
+        indices = []
+        for name in names:
+            group, local_idx = self._parse_candidate_name(name)
+            if group in {"default", "svd+cross"}:
+                if local_idx >= self.n_estimators:
+                    raise ValueError(
+                        f"Fixed candidate {name!r} is unavailable: main group has "
+                        f"{self.n_estimators} candidates."
+                    )
+                indices.append(local_idx)
+            else:
+                if local_idx >= self.n_quantile_estimators:
+                    raise ValueError(
+                        f"Fixed candidate {name!r} is unavailable: quantile group has "
+                        f"{self.n_quantile_estimators} candidates."
+                    )
+                indices.append(self.n_estimators + local_idx)
+
+        weights = self.fixed_candidate_weights
+        if weights is None or (isinstance(weights, str) and weights == "equal"):
+            resolved_weights = np.ones(len(indices), dtype=np.float64)
+        else:
+            if isinstance(weights, str) or len(weights) != len(indices):
+                raise ValueError(
+                    "fixed_candidate_weights must be 'equal' or have one value per candidate"
+                )
+            resolved_weights = np.asarray(weights, dtype=np.float64)
+            if (
+                not np.isfinite(resolved_weights).all()
+                or (resolved_weights < 0).any()
+                or not float(resolved_weights.sum()) > 0
+            ):
+                raise ValueError(
+                    "fixed_candidate_weights must be finite, non-negative, and have a positive sum"
+                )
+        resolved_weights /= resolved_weights.sum()
+        return np.asarray(indices, dtype=np.int64), resolved_weights
 
     def _configure_adaptive_enhancement(
         self, n_train: int, n_features: int, y: np.ndarray
     ) -> tuple[bool, float]:
-        """Apply data-adaptive enhancement settings and return HK status."""
-        config = self._adaptive_enhancement_config(n_train, n_features)
+        """Apply the documented route and return the HK status."""
+        config = self._adaptive_enhancement_config(
+            n_train, n_features, has_fixed_plan=self.fixed_candidate_names is not None
+        )
+        if config["branch"] == "fixed_plan_required":
+            raise ValueError(
+                "Adaptive regression enhancement requires fixed_candidate_names for "
+                "datasets with n_train < 1000 and n_features <= 10."
+            )
+        if self.fixed_candidate_names is not None and config["branch"] != "fixed":
+            raise ValueError(
+                "fixed_candidate_names is supported only by the low-sample, "
+                "low-dimensional adaptive route."
+            )
+        if self.fixed_candidate_weights is not None and self.fixed_candidate_names is None:
+            raise ValueError(
+                "fixed_candidate_weights requires fixed_candidate_names."
+            )
         for name, value in config.items():
             if name != "branch":
                 setattr(self, name, value)
 
-        # These global settings are part of the recommended no-K-Fold policy.
         self.enable_high_kurtosis_target_ensemble = True
         self.high_kurtosis_threshold = 10.0
         self.high_kurtosis_n_estimators = 8
@@ -709,6 +791,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             "high_kurtosis_triggered": triggered,
             "high_kurtosis_threshold": self.high_kurtosis_threshold,
             "high_kurtosis_n_estimators": self.high_kurtosis_n_estimators,
+            "fixed_candidate_names": None if self.fixed_candidate_names is None else list(self.fixed_candidate_names),
         }
         print(
             f"[TabLDM:enhance] adaptive routing: branch={config['branch']}, "
@@ -1013,7 +1096,8 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             print(f"[TabLDM:hk] full-train HK generators fitted: {len(self.hk_generators_)}")
 
     def _make_and_fit_generators(self, X_tr: np.ndarray, y_tr: np.ndarray):
-        """Fit all generators on a (possibly reduced) training split."""
+        """Fit validation generators in the full-train feature space."""
+        main_frozen_filter = getattr(self.ensemble_generator_, "unique_filter_", None)
         main_gen = EnsembleGenerator(
             classification=False,
             n_estimators=self.n_estimators,
@@ -1022,7 +1106,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             outlier_threshold=self.outlier_threshold,
             random_state=self.random_state,
         )
-        main_gen.fit(X_tr, y_tr)
+        main_gen.fit(X_tr, y_tr, frozen_unique_filter=main_frozen_filter)
 
         # Save and wire SVD/cross state
         svd_attrs = ["svd_", "_svd_pre_", "_X_train_svd_", "_svd_selections_",
@@ -1039,6 +1123,11 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
         q_gen = None
         if self.n_quantile_estimators > 0:
+            q_frozen_filter = getattr(
+                getattr(self, "quantile_ensemble_generator_", None),
+                "unique_filter_",
+                None,
+            )
             q_gen = EnsembleGenerator(
                 classification=False,
                 n_estimators=self.n_quantile_estimators,
@@ -1047,7 +1136,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
             )
-            q_gen.fit(X_tr, y_tr)
+            q_gen.fit(X_tr, y_tr, frozen_unique_filter=q_frozen_filter)
 
         return {
             "main_gen": main_gen,
@@ -1302,6 +1391,24 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 # Kurtosis check uses the original-scale y before StandardScaler.
                 self.hk_triggered_, self.hk_kurtosis_ = self._check_high_kurtosis(y)
                 self.adaptive_enhancement_config_ = None
+
+            self.fixed_candidate_indices_ = None
+            self.fixed_candidate_weights_ = None
+            self.nan_valid_mask_ = None
+            if self.adaptive_enhancement and self.adaptive_enhancement_config_["branch"] == "fixed":
+                (
+                    self.fixed_candidate_indices_,
+                    self.fixed_candidate_weights_,
+                ) = self._resolve_fixed_candidate_plan()
+                self.adaptive_enhancement_config_.update(
+                    fixed_candidate_indices=self.fixed_candidate_indices_.tolist(),
+                    fixed_candidate_weights=self.fixed_candidate_weights_.tolist(),
+                )
+                print(
+                    "[TabLDM:enhance] fixed candidates: "
+                    f"names={self.fixed_candidate_names}, "
+                    f"weights={self.fixed_candidate_weights_.tolist()}"
+                )
 
             # Feature sampling
             n_orig_features = n_effective_features
@@ -1821,6 +1928,9 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             getattr(self, "nnls_weights_", None) is not None
             and self.validation
         )
+        fixed_indices = getattr(self, "fixed_candidate_indices_", None)
+        fixed_weights = getattr(self, "fixed_candidate_weights_", None)
+        use_fixed_plan = fixed_indices is not None and fixed_weights is not None
         nan_valid_mask = getattr(self, "nan_valid_mask_", None)
         final_results = {}
         for key in output_type:
@@ -1849,7 +1959,15 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     arr = np.concatenate([arr, hk_preds_orig.astype(np.float64)], axis=0)
                     n_estimators = arr.shape[0]
 
-                if use_nnls:
+                if use_fixed_plan:
+                    if hk_preds_orig is not None:
+                        print("[TabLDM:hk] fixed plan excludes HK candidates")
+                    if fixed_indices.max(initial=-1) >= arr.shape[0]:
+                        raise RuntimeError(
+                            "Fixed candidate plan no longer matches generated base candidates."
+                        )
+                    final_results[key] = fixed_weights @ arr[fixed_indices]
+                elif use_nnls:
                     w = self.nnls_weights_
                     if len(w) != n_estimators:
                         w = np.ones(n_estimators) / n_estimators
