@@ -61,6 +61,8 @@ from .preprocessing import (
     GaussianRankGenerator,
     PCADecorrelator,
     InteractionAugmentor,
+    PipelineEnsemble,
+    default_classifier_pipeline_specs,
 )
 from .sklearn_utils import _moe_load_mismatch, validate_data, _num_samples
 
@@ -302,6 +304,8 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         use_gaussian_rank_ens: bool = True,
         n_gaussian_rank_estimators: int = 16,
         adaptive_enhancement: bool = True,
+        pipeline_specs=None,
+        validation_size: float = 0.2,
     ):
         # base
         self.n_estimators = n_estimators
@@ -347,6 +351,8 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.use_gaussian_rank_ens = use_gaussian_rank_ens
         self.n_gaussian_rank_estimators = n_gaussian_rank_estimators
         self.adaptive_enhancement = adaptive_enhancement
+        self.pipeline_specs = pipeline_specs
+        self.validation_size = validation_size
 
     # ==================================================================
     # Adaptive no-K-Fold enhancement routing
@@ -677,83 +683,8 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.calibration_params_ = None
 
         if self.enhance_candidates:
-            # Route from the actual encoded, constant-filtered feature matrix.
-            # Explicit indices override dtype-derived metadata for ndarray input.
-            effective_feature_filter = UniqueFeatureFilter().fit(X)
-            kept_original = np.flatnonzero(effective_feature_filter.features_to_keep_)
-            source_categorical = (
-                list(self.categorical_indices)
-                if self.categorical_indices is not None
-                else list(getattr(self.X_encoder_, "categorical_indices_", []))
-            )
-            source_categorical = {int(index) for index in source_categorical}
-            self._encoded_categorical_indices_ = sorted(source_categorical)
-            self._filtered_categorical_indices_ = [
-                filtered_index
-                for filtered_index, original_index in enumerate(kept_original)
-                if original_index in source_categorical
-            ]
-            n_features = int(effective_feature_filter.n_features_out_)
-            n_cat = len(self._filtered_categorical_indices_)
-            n_num = n_features - n_cat
-            if self.adaptive_enhancement:
-                self._configure_adaptive_enhancement(
-                    n_train=X.shape[0], n_features=n_features, n_num=n_num, n_cat=n_cat
-                )
-            else:
-                self.adaptive_enhancement_config_ = None
-                self.adaptive_group_weights_ = None
-
-            # Freeze adaptive_plus structure before any fold splitting
-            if self.use_adaptive_plus_candidate:
-                self._freeze_adaptive_plus_structure(X)
-            self._fit_enhanced_generators(X, y)
-
-            # Feature sampling: build per-estimator column indices for ALL
-            # estimator groups when n_features exceeds max_num_features.
-            # Index layout mirrors the candidate order in
-            # _collect_candidate_probs: [main | quantile_safe | svd_ens |
-            # adaptive_plus | gaussian_rank]. Computed after
-            # _fit_enhanced_generators so we use the generator's actual
-            # n_features_in_ (post UniqueFeatureFilter), avoiding
-            # out-of-bounds column indices.
-            n_features = self.ensemble_generator_.n_features_in_
-            _n_ap_est = (
-                self.adaptive_plus_structure_.get("n_estimators", 0)
-                if self.use_adaptive_plus_candidate else 0
-            )
-            n_total_estimators = (
-                self.n_estimators
-                + (self.n_quantile_estimators or 0)
-                + (self.n_svd_ens_estimators or 0)
-                + _n_ap_est
-                + (self.n_gaussian_rank_estimators or 0)
-            )
-            self.feat_sample_indices_ = None
-            if self.max_num_features is not None and n_features > self.max_num_features:
-                seed_base = self.random_state if self.random_state is not None else 0
-                self.feat_sample_indices_ = [
-                    np.sort(
-                        np.random.default_rng(seed_base + est_idx).choice(
-                            n_features, size=self.max_num_features, replace=False
-                        )
-                    )
-                    for est_idx in range(n_total_estimators)
-                ]
-                print(
-                    f"[TabLDM] feature sampling triggered: "
-                    f"n_features={n_features} -> max_num_features={self.max_num_features}, "
-                    f"n_estimators={n_total_estimators}"
-                )
-            else:
-                print(
-                    f"[TabLDM] feature sampling off: n_features={n_features}, "
-                    f"max_num_features={self.max_num_features}"
-                )
-
-            self._fit_nnls_weights(X, y)
-            if self.enable_calibration:
-                self._fit_calibration()
+            self._fit_pipeline_enhancement(X, y)
+            self.n_features_in_ = X.shape[1]
         else:
             # Original single-generator path
             self.feat_sample_indices_ = None
@@ -783,7 +714,104 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         return self
 
-    def _build_kv_cache(self) -> None:
+    def _fit_pipeline_enhancement(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Fit LimiX V2 member views and learn one holdout NNLS ensemble."""
+        if not 0 < self.validation_size < 1:
+            raise ValueError("validation_size must be in (0, 1)")
+        if self.enable_calibration:
+            warnings.warn(
+                "enable_calibration is not supported by the LimiX pipeline ensemble; ignoring it.",
+                UserWarning,
+                stacklevel=2,
+            )
+        self.calibration_params_ = None
+        self._cal_P_ = None
+        self._cal_y_ = None
+        self.pipeline_specs_ = tuple(self.pipeline_specs or default_classifier_pipeline_specs())
+        encoded_categories = list(getattr(self.X_encoder_, "categorical_indices_", []))
+        categorical_indices = encoded_categories or (self.categorical_indices or [])
+        self.pipeline_member_names_ = [spec.name for spec in self.pipeline_specs_]
+        self.pipeline_validation_audit_ = []
+        self.pipeline_failed_members_ = []
+        valid_indices = list(range(len(self.pipeline_specs_)))
+        weights = None
+
+        if self.validation:
+            counts = np.bincount(y.astype(int), minlength=self.n_classes_)
+            if counts.size == 0 or (counts[counts > 0].size and counts[counts > 0].min() < 2):
+                self.pipeline_validation_audit_.append({"status": "skipped", "reason": "smallest class has fewer than two samples"})
+            else:
+                try:
+                    X_tr, X_val, y_tr, y_val = train_test_split(
+                        X, y, test_size=self.validation_size, stratify=y,
+                        shuffle=True, random_state=self.random_state,
+                    )
+                    holdout = PipelineEnsemble(
+                        classification=True, specs=self.pipeline_specs_, categorical_indices=categorical_indices,
+                        random_state=self.random_state,
+                    ).fit(X_tr, y_tr)
+                    predictions, successful = [], []
+                    for local_index, member in zip(holdout.member_indices_, holdout.members_):
+                        try:
+                            probabilities = self._pipeline_member_probabilities(member, X_val)
+                            if probabilities.shape != (X_val.shape[0], self.n_classes_):
+                                raise ValueError(f"unexpected probability shape {probabilities.shape}")
+                            if not np.isfinite(probabilities).all() or (probabilities < 0).any():
+                                raise ValueError("probabilities are non-finite or negative")
+                        except Exception as exc:
+                            self.pipeline_failed_members_.append({"index": local_index, "name": member.spec.name, "stage": "validation", "reason": repr(exc)})
+                            continue
+                        predictions.append(probabilities)
+                        successful.append(local_index)
+                    self.pipeline_failed_members_.extend(holdout.failed_members_)
+                    if successful:
+                        valid_indices = successful
+                        prediction_array = np.stack(predictions)
+                        A = prediction_array.reshape(len(successful), -1).T
+                        onehot = np.eye(self.n_classes_, dtype=np.float64)[y_val.astype(int)].reshape(-1)
+                        try:
+                            raw_weights, _ = _scipy_nnls(A, onehot)
+                            if np.isfinite(raw_weights).all() and raw_weights.sum() > 0:
+                                weights = raw_weights / raw_weights.sum()
+                            else:
+                                raise ValueError("degenerate NNLS result")
+                        except Exception as exc:
+                            weights = np.full(len(successful), 1 / len(successful), dtype=np.float64)
+                            self.pipeline_validation_audit_.append({"status": "equal_weight_fallback", "reason": repr(exc)})
+                        self.pipeline_validation_audit_.append({"status": "nnls", "n_validation": len(y_val), "valid_member_indices": successful})
+                    else:
+                        valid_indices = []
+                        self.pipeline_validation_audit_.append({"status": "no_valid_members", "reason": "all holdout members failed"})
+                except Exception as exc:
+                    self.pipeline_validation_audit_.append({"status": "split_failed", "reason": repr(exc)})
+
+        full = PipelineEnsemble(
+            classification=True, specs=self.pipeline_specs_, categorical_indices=categorical_indices,
+            random_state=self.random_state,
+        ).fit(X, y, member_indices=valid_indices)
+        self.pipeline_failed_members_.extend(full.failed_members_)
+        self.pipeline_members_ = full.members_
+        self.nnls_valid_member_indices_ = full.member_indices_
+        if not self.pipeline_members_:
+            raise RuntimeError("All LimiX pipeline members failed during full-data fitting.")
+        if weights is None or len(weights) != len(self.pipeline_members_):
+            weights = np.full(len(self.pipeline_members_), 1 / len(self.pipeline_members_), dtype=np.float64)
+        self.nnls_weights_ = weights
+        self.nnls_valid_candidate_mask_ = np.array(
+            [index in self.nnls_valid_member_indices_ for index in range(len(self.pipeline_specs_))], dtype=bool,
+        )
+        self.ensemble_generator_ = None
+
+    def _pipeline_member_probabilities(self, member, X: np.ndarray) -> np.ndarray:
+        X_both = np.concatenate([member.X_train_, member.transform(X)], axis=0)[None, ...]
+        y_train = np.asarray(member.y_train_, dtype=np.float32)[None, ...]
+        raw = self._batch_forward(X_both, y_train, feature_shuffles=None)[0]
+        if not self.average_logits:
+            probabilities = raw
+        else:
+            probabilities = self.softmax(raw, axis=-1, temperature=self.softmax_temperature)
+        return member.inverse_class_probabilities(probabilities)
+
         """Pre-compute KV caches for training data across all ensemble batches."""
         train_data = self.ensemble_generator_.transform(X=None, mode="train")
         self.model_kv_cache_ = OrderedDict()
@@ -2042,9 +2070,31 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         return proba
 
-    # ==================================================================
-    # predict_proba() / predict()
-    # ==================================================================
+    def _predict_proba_pipeline(self, X: np.ndarray) -> np.ndarray:
+        """Predict with the retained LimiX pipeline members and NNLS weights."""
+        probabilities, weights = [], []
+        for member, weight in zip(self.pipeline_members_, self.nnls_weights_):
+            try:
+                probability = self._pipeline_member_probabilities(member, X)
+                if probability.shape != (X.shape[0], self.n_classes_):
+                    raise ValueError(f"unexpected probability shape {probability.shape}")
+                if not np.isfinite(probability).all() or (probability < 0).any():
+                    raise ValueError("probabilities are non-finite or negative")
+            except Exception as exc:
+                warnings.warn(f"Skipping pipeline member {member.spec.name}: {exc}", UserWarning, stacklevel=2)
+                continue
+            probabilities.append(probability)
+            weights.append(weight)
+        if not probabilities:
+            raise RuntimeError("All retained LimiX pipeline members failed during prediction.")
+        weights = np.asarray(weights, dtype=np.float64)
+        weights /= weights.sum()
+        proba = np.einsum("e,enc->nc", weights, np.stack(probabilities))
+        row_sums = proba.sum(axis=1, keepdims=True)
+        if np.any(row_sums <= 0) or not np.isfinite(proba).all():
+            raise RuntimeError("LimiX pipeline ensemble produced invalid probabilities.")
+        return proba / row_sums
+
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Predict class probabilities for test samples."""
@@ -2056,7 +2106,8 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         has_training_data = (
             hasattr(self, "ensemble_generator_") and getattr(self.ensemble_generator_, "X_", None) is not None
         )
-        if not has_kv_cache and not has_training_data:
+        has_pipeline_training_data = bool(getattr(self, "pipeline_members_", []))
+        if not has_kv_cache and not has_training_data and not has_pipeline_training_data:
             raise RuntimeError(
                 "Cannot predict: this estimator was saved without training data and has no KV cache. "
                 "Re-fit the estimator or load from a file saved with save_training_data=True or save_kv_cache=True."
@@ -2102,7 +2153,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         # Enhanced path
         if getattr(self, "enhance_candidates", False):
-            proba = self._predict_proba_enhanced(X)
+            proba = self._predict_proba_pipeline(X)
             if self.n_jobs is not None:
                 torch.set_num_threads(old_n_threads)
             return proba

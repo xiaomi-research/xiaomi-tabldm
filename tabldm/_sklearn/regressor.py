@@ -60,7 +60,13 @@ from sklearn.preprocessing import OneHotEncoder, PowerTransformer, StandardScale
 from sklearn.utils.validation import check_is_fitted
 
 from .base import TabLDMBaseEstimator
-from .preprocessing import EnsembleGenerator, TransformToNumerical, UniqueFeatureFilter
+from .preprocessing import (
+    EnsembleGenerator,
+    TransformToNumerical,
+    UniqueFeatureFilter,
+    PipelineEnsemble,
+    default_regressor_pipeline_specs,
+)
 from .sklearn_utils import _moe_load_mismatch, _num_samples, validate_data
 
 from tabldm import InferenceConfig
@@ -259,6 +265,8 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         adaptive_enhancement: bool = True,
         fixed_candidate_names: Optional[List[str]] = None,
         fixed_candidate_weights: Optional[List[float] | Literal["equal"]] = None,
+        pipeline_specs=None,
+        validation_size: float = 0.2,
     ):
         # base
         self.n_estimators = n_estimators
@@ -294,6 +302,8 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         self.adaptive_enhancement = adaptive_enhancement
         self.fixed_candidate_names = fixed_candidate_names
         self.fixed_candidate_weights = fixed_candidate_weights
+        self.pipeline_specs = pipeline_specs
+        self.validation_size = validation_size
 
     # ==================================================================
     # Model loading (MoE architecture)
@@ -1321,9 +1331,82 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             return X
         return X[:, self.feat_sample_indices_[est_idx]]
 
-    # ==================================================================
-    # fit()
-    # ==================================================================
+    def _fit_pipeline_enhancement(self, X: np.ndarray, y: np.ndarray, y_scaled: np.ndarray) -> None:
+        """Fit LimiX V2 regression views and one holdout NNLS ensemble."""
+        if not 0 < self.validation_size < 1:
+            raise ValueError("validation_size must be in (0, 1)")
+        self.pipeline_specs_ = tuple(self.pipeline_specs or default_regressor_pipeline_specs())
+        categorical_indices = getattr(self.X_encoder_, "categorical_indices_", [])
+        self.pipeline_member_names_ = [spec.name for spec in self.pipeline_specs_]
+        self.pipeline_validation_audit_ = []
+        self.pipeline_failed_members_ = []
+        valid_indices = list(range(len(self.pipeline_specs_)))
+        weights = None
+
+        if self.validation:
+            try:
+                X_tr, X_val, y_tr_scaled, _, _, y_val = train_test_split(
+                    X, y_scaled, y, test_size=self.validation_size, shuffle=True,
+                    random_state=self.random_state,
+                )
+                holdout = PipelineEnsemble(
+                    classification=False, specs=self.pipeline_specs_, categorical_indices=categorical_indices,
+                    random_state=self.random_state,
+                ).fit(X_tr, y_tr_scaled)
+                predictions, successful = [], []
+                for index, member in zip(holdout.member_indices_, holdout.members_):
+                    try:
+                        prediction = self._pipeline_member_predictions(member, X_val)
+                        prediction = self.y_scaler_.inverse_transform(prediction.reshape(-1, 1)).ravel()
+                        if prediction.shape != y_val.shape or not np.isfinite(prediction).all():
+                            raise ValueError(f"invalid prediction shape or values: {prediction.shape}")
+                    except Exception as exc:
+                        self.pipeline_failed_members_.append({"index": index, "name": member.spec.name, "stage": "validation", "reason": repr(exc)})
+                        continue
+                    predictions.append(prediction)
+                    successful.append(index)
+                self.pipeline_failed_members_.extend(holdout.failed_members_)
+                if successful:
+                    valid_indices = successful
+                    matrix = np.column_stack(predictions)
+                    try:
+                        raw_weights, _ = _scipy_nnls(matrix, y_val)
+                        if np.isfinite(raw_weights).all() and raw_weights.sum() > 0:
+                            weights = raw_weights / raw_weights.sum()
+                        else:
+                            raise ValueError("degenerate NNLS result")
+                    except Exception as exc:
+                        weights = np.full(len(successful), 1 / len(successful), dtype=np.float64)
+                        self.pipeline_validation_audit_.append({"status": "equal_weight_fallback", "reason": repr(exc)})
+                    self.pipeline_validation_audit_.append({"status": "nnls", "n_validation": len(y_val), "valid_member_indices": successful})
+                else:
+                    valid_indices = []
+                    self.pipeline_validation_audit_.append({"status": "no_valid_members", "reason": "all holdout members failed"})
+            except Exception as exc:
+                self.pipeline_validation_audit_.append({"status": "split_failed", "reason": repr(exc)})
+
+        full = PipelineEnsemble(
+            classification=False, specs=self.pipeline_specs_, categorical_indices=categorical_indices,
+            random_state=self.random_state,
+        ).fit(X, y_scaled, member_indices=valid_indices)
+        self.pipeline_failed_members_.extend(full.failed_members_)
+        self.pipeline_members_ = full.members_
+        self.nnls_valid_member_indices_ = full.member_indices_
+        if not self.pipeline_members_:
+            raise RuntimeError("All LimiX pipeline members failed during full-data fitting.")
+        if weights is None or len(weights) != len(self.pipeline_members_):
+            weights = np.full(len(self.pipeline_members_), 1 / len(self.pipeline_members_), dtype=np.float64)
+        self.nnls_weights_ = weights
+        self.ensemble_generator_ = None
+        self.hk_triggered_ = False
+        self.feat_sample_indices_ = None
+
+    def _pipeline_member_predictions(self, member, X: np.ndarray) -> np.ndarray:
+        X_both = np.concatenate([member.X_train_, member.transform(X)], axis=0)[None, ...]
+        y_train = np.asarray(member.y_train_, dtype=np.float32)[None, ...]
+        output = self._batch_forward(X_both, y_train, output_type="mean")
+        return np.asarray(output)[0]
+
 
     def fit(self, X: np.ndarray, y: np.ndarray, kv_cache: bool | str = False) -> "TabLDMRegressor":
         """Fit the regressor to training data.
@@ -1375,326 +1458,8 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     "kv_cache is not supported together with enhance_candidates=True. "
                     "Disable one of them."
                 )
-
-            # Determine the actual feature count seen by generators: encoded X
-            # after constant-column filtering. This is the routing statistic and
-            # the dimensionality used by per-candidate feature sampling.
-            effective_feature_filter = UniqueFeatureFilter()
-            effective_feature_filter.fit(X)
-            n_effective_features = int(effective_feature_filter.n_features_out_)
-
-            if self.adaptive_enhancement:
-                self.hk_triggered_, self.hk_kurtosis_ = self._configure_adaptive_enhancement(
-                    n_train=X.shape[0], n_features=n_effective_features, y=y
-                )
-            else:
-                # Kurtosis check uses the original-scale y before StandardScaler.
-                self.hk_triggered_, self.hk_kurtosis_ = self._check_high_kurtosis(y)
-                self.adaptive_enhancement_config_ = None
-
-            self.fixed_candidate_indices_ = None
-            self.fixed_candidate_weights_ = None
-            self.nan_valid_mask_ = None
-            if self.adaptive_enhancement and self.adaptive_enhancement_config_["branch"] == "fixed":
-                (
-                    self.fixed_candidate_indices_,
-                    self.fixed_candidate_weights_,
-                ) = self._resolve_fixed_candidate_plan()
-                self.adaptive_enhancement_config_.update(
-                    fixed_candidate_indices=self.fixed_candidate_indices_.tolist(),
-                    fixed_candidate_weights=self.fixed_candidate_weights_.tolist(),
-                )
-                print(
-                    "[TabLDM:enhance] fixed candidates: "
-                    f"names={self.fixed_candidate_names}, "
-                    f"weights={self.fixed_candidate_weights_.tolist()}"
-                )
-
-            # Feature sampling
-            n_orig_features = n_effective_features
-            _n_hk_est = self.high_kurtosis_n_estimators if self.hk_triggered_ else 0
-            n_total_estimators = (
-                self.n_estimators
-                + (self.n_quantile_estimators or 0)
-                + _n_hk_est
-            )
-            self.feat_sample_indices_ = None
-            if self.max_num_features is not None and n_orig_features > self.max_num_features:
-                seed_base = self.random_state if self.random_state is not None else 0
-                self.feat_sample_indices_ = [
-                    np.sort(
-                        np.random.default_rng(seed_base + est_idx).choice(
-                            n_orig_features, size=self.max_num_features, replace=False
-                        )
-                    )
-                    for est_idx in range(n_total_estimators)
-                ]
-                print(
-                    f"[TabLDM:enhance] feature sampling triggered: "
-                    f"n_features={n_orig_features} -> max_num_features={self.max_num_features}, "
-                    f"n_estimators={n_total_estimators}"
-                )
-            else:
-                print(
-                    f"[TabLDM:enhance] feature sampling off: n_features={n_orig_features}, "
-                    f"max_num_features={self.max_num_features}"
-                )
-
-            if self.foundation_rate < 0.0 or self.foundation_rate > 1.0:
-                raise ValueError(
-                    f"foundation_rate must be in [0, 1], got {self.foundation_rate}"
-                )
-
-            print(f"[TabLDM:enhance] use_cross_feature={self.use_cross_feature}")
-
-            # Fit generators
-            self._fit_full_generators(X, y_scaled)
-
-            # Validation + NNLS routing
-            n_full = X.shape[0]
-            n_val = math.ceil(0.2 * n_full)
-            route = self._route_validation(self.validation, self.k_fold, n_full, n_val)
-            print(
-                f"[TabLDM:enhance] routing: k_fold={self.k_fold}, n_train={n_full}, "
-                f"n_val={n_val}, path={route}"
-            )
-
-            if route == "kfold":
-                n_splits = self.n_splits
-                y_orig = self.y_scaler_.inverse_transform(
-                    y_scaled.reshape(-1, 1)
-                ).flatten()
-                kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
-                print(f"[TabLDM:enhance] k_fold enabled: n_splits={n_splits}, n_train={n_full}")
-
-                oof_preds_scaled = None
-                hk_oof_rows = []
-                coverage = np.zeros(n_full, dtype=np.int64)
-                for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(X)):
-                    X_tr, X_val = X[tr_idx], X[val_idx]
-                    y_tr_scaled = y_scaled[tr_idx]
-                    y_tr_orig_fold = self.y_scaler_.inverse_transform(
-                        y_tr_scaled.reshape(-1, 1)
-                    ).flatten()
-                    print(
-                        f"[TabLDM:enhance] fold {fold_idx + 1}/{n_splits}: "
-                        f"n_fold_train={X_tr.shape[0]}, n_fold_val={X_val.shape[0]}"
-                    )
-                    fold_gen = self._make_and_fit_generators(X_tr, y_tr_scaled)
-                    fold_preds_scaled = self._collect_val_predictions(
-                        X_tr, y_tr_scaled, X_val, fold_gen
-                    )
-                    if oof_preds_scaled is None:
-                        n_est_total = fold_preds_scaled.shape[0]
-                        oof_preds_scaled = np.full(
-                            (n_est_total, n_full), np.nan, dtype=np.float64
-                        )
-                    oof_preds_scaled[:, val_idx] = fold_preds_scaled
-                    coverage[val_idx] += 1
-
-                    # HK fold predictions
-                    if self.hk_triggered_:
-                        fold_hk_infos = self._make_hk_generators(
-                            X_tr, y_tr_orig_fold, seed_offset=fold_idx * 100
-                        )
-                        fold_hk_preds = self._collect_hk_val_predictions_orig(X_val, fold_hk_infos)
-                        hk_oof_rows.append((val_idx, fold_hk_preds))
-
-                if not np.all(coverage == 1):
-                    n_missing = int((coverage == 0).sum())
-                    n_dup = int((coverage > 1).sum())
-                    raise RuntimeError(
-                        f"[TabLDM:enhance] OOF coverage error: {n_missing} samples never predicted, "
-                        f"{n_dup} samples predicted more than once"
-                    )
-                print(
-                    f"[TabLDM:enhance] OOF prediction matrix shape={oof_preds_scaled.shape}; "
-                    f"coverage OK (each of {n_full} train samples predicted exactly once)."
-                )
-
-                # Detect and skip NaN estimators
-                nan_per_est = np.isnan(oof_preds_scaled).any(axis=1)
-                n_nan_est = int(nan_per_est.sum())
-                if n_nan_est > 0:
-                    valid_mask = ~nan_per_est
-                    nan_indices = np.where(nan_per_est)[0].tolist()
-                    oof_preds_scaled = oof_preds_scaled[valid_mask]
-                    print(
-                        f"[TabLDM:enhance] WARNING: {n_nan_est}/{len(nan_per_est)} estimators "
-                        f"produced NaN and were SKIPPED: indices={nan_indices}"
-                    )
-                else:
-                    valid_mask = np.ones(oof_preds_scaled.shape[0], dtype=bool)
-                self.nan_valid_mask_ = valid_mask
-
-                oof_preds_orig = self.y_scaler_.inverse_transform(
-                    oof_preds_scaled.reshape(-1, 1)
-                ).reshape(oof_preds_scaled.shape)
-                if not np.isfinite(oof_preds_orig).all():
-                    n_bad = int((~np.isfinite(oof_preds_orig)).sum())
-                    oof_preds_orig = np.nan_to_num(
-                        oof_preds_orig, nan=0.0, posinf=0.0, neginf=0.0
-                    )
-                    print(
-                        f"[TabLDM:enhance] WARNING: OOF inverse transform produced {n_bad} "
-                        f"NaN/Inf values, replaced with 0.0"
-                    )
-
-                n_base_valid = oof_preds_orig.shape[0]
-
-                # Assemble HK OOF matrix
-                if self.hk_triggered_ and hk_oof_rows:
-                    n_hk_valid = 0
-                    for _, fp in hk_oof_rows:
-                        if fp.shape[0] > 0:
-                            n_hk_valid = fp.shape[0]
-                            break
-                    if n_hk_valid > 0:
-                        hk_oof_matrix = np.full((n_hk_valid, n_full), np.nan, dtype=np.float64)
-                        for val_idx_f, fp in hk_oof_rows:
-                            if fp.shape[0] == n_hk_valid:
-                                hk_oof_matrix[:, val_idx_f] = fp
-                        if not np.isnan(hk_oof_matrix).any():
-                            oof_preds_orig = np.concatenate(
-                                [oof_preds_orig, hk_oof_matrix], axis=0
-                            )
-                            print(f"[TabLDM:hk] appended {n_hk_valid} HK OOF rows; total candidates={oof_preds_orig.shape[0]}")
-                        else:
-                            print("[TabLDM:hk] HK OOF matrix contains NaN (fold size mismatch?), skipping HK in NNLS")
-
-                # NNLS
-                raw_weights, _ = _scipy_nnls(oof_preds_orig.T, y_orig)
-                w_sum = raw_weights.sum()
-                n_nonzero = int((raw_weights > 0).sum())
-                if w_sum > 0:
-                    weights = raw_weights / w_sum
-                else:
-                    weights = np.ones(oof_preds_orig.shape[0]) / oof_preds_orig.shape[0]
-                    w_sum = 1.0
-
-                # Log group-level weight sums
-                n_main = self.n_estimators
-                n_q = self.n_quantile_estimators if (self.n_quantile_estimators > 0) else 0
-                vm = valid_mask
-                def _group_sum(start, end):
-                    kept = np.where(vm[start:end])[0]
-                    return weights[kept].sum() if len(kept) > 0 else 0.0
-                w_default = _group_sum(0, n_main // 2) if n_main >= 2 else _group_sum(0, n_main)
-                w_svd = _group_sum(n_main // 2, n_main) if n_main >= 2 else 0.0
-                w_q = _group_sum(n_main, n_main + n_q)
-                n_hk_nnls = oof_preds_orig.shape[0] - n_base_valid
-                w_hk = weights[n_base_valid:].sum() if n_hk_nnls > 0 else 0.0
-                print(
-                    f"[TabLDM:enhance] NNLS (OOF): n_nonzero={n_nonzero}/{len(weights)}, "
-                    f"weights.sum()={w_sum:.4f}, "
-                    f"w_default={w_default:.4f}, w_svd/cross={w_svd:.4f}, "
-                    f"w_quantile={w_q:.4f}, w_hk={w_hk:.4f}"
-                )
-                nonzero_str = ", ".join(
-                    f"{self._candidate_name(i, n_main):s}={weights[i]:.4f}"
-                    for i in range(len(weights)) if weights[i] > 0
-                )
-                print(f"[TabLDM:enhance] NNLS (OOF) nonzero weights: {nonzero_str}")
-
-                # OOF ensemble quality
-                oof_ensemble = weights @ oof_preds_orig
-                rmse = float(np.sqrt(np.mean((oof_ensemble - y_orig) ** 2)))
-                ss_res = float(np.sum((y_orig - oof_ensemble) ** 2))
-                ss_tot = float(np.sum((y_orig - y_orig.mean()) ** 2))
-                r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-                print(f"[TabLDM:enhance] OOF ensemble: RMSE={rmse:.6f}, R2={r2:.6f}")
-
-                self.nnls_weights_ = weights
-
-            if route == "single_validation":
-                X_tr, X_val, y_tr_scaled, y_val_scaled = train_test_split(
-                    X, y_scaled,
-                    test_size=0.2,
-                    shuffle=True,
-                    random_state=self.random_state,
-                )
-                y_val_orig = self.y_scaler_.inverse_transform(
-                    y_val_scaled.reshape(-1, 1)
-                ).flatten()
-                y_tr_orig_sv = self.y_scaler_.inverse_transform(
-                    y_tr_scaled.reshape(-1, 1)
-                ).flatten()
-                print(
-                    f"[TabLDM:enhance] validation split: n_train={X_tr.shape[0]}, n_val={X_val.shape[0]}"
-                )
-                val_gen = self._make_and_fit_generators(X_tr, y_tr_scaled)
-                val_preds_scaled = self._collect_val_predictions(
-                    X_tr, y_tr_scaled, X_val, val_gen
-                )
-                # Detect and skip NaN estimators
-                nan_per_est = np.isnan(val_preds_scaled).any(axis=1)
-                n_nan_est = int(nan_per_est.sum())
-                if n_nan_est > 0:
-                    valid_mask = ~nan_per_est
-                    nan_indices = np.where(nan_per_est)[0].tolist()
-                    val_preds_scaled = val_preds_scaled[valid_mask]
-                    print(
-                        f"[TabLDM:enhance] WARNING: {n_nan_est}/{len(nan_per_est)} estimators "
-                        f"produced NaN and were SKIPPED: indices={nan_indices}"
-                    )
-                else:
-                    valid_mask = np.ones(val_preds_scaled.shape[0], dtype=bool)
-                self.nan_valid_mask_ = valid_mask
-
-                val_preds_orig = self.y_scaler_.inverse_transform(
-                    val_preds_scaled.reshape(-1, 1)
-                ).reshape(val_preds_scaled.shape)
-                if not np.isfinite(val_preds_orig).all():
-                    n_bad = int((~np.isfinite(val_preds_orig)).sum())
-                    val_preds_orig = np.nan_to_num(
-                        val_preds_orig, nan=0.0, posinf=0.0, neginf=0.0
-                    )
-                    print(
-                        f"[TabLDM:enhance] WARNING: val inverse transform produced {n_bad} "
-                        f"NaN/Inf values, replaced with 0.0"
-                    )
-
-                n_base_valid = val_preds_orig.shape[0]
-
-                # HK single-validation predictions
-                if self.hk_triggered_:
-                    sv_hk_infos = self._make_hk_generators(X_tr, y_tr_orig_sv, seed_offset=0)
-                    sv_hk_preds = self._collect_hk_val_predictions_orig(X_val, sv_hk_infos)
-                    if sv_hk_preds.shape[0] > 0:
-                        val_preds_orig = np.concatenate([val_preds_orig, sv_hk_preds], axis=0)
-                        print(f"[TabLDM:hk] appended {sv_hk_preds.shape[0]} HK val rows; total={val_preds_orig.shape[0]}")
-
-                print(f"[TabLDM:enhance] val_predictions shape={val_preds_orig.shape}")
-
-                # NNLS
-                raw_weights, _ = _scipy_nnls(val_preds_orig.T, y_val_orig)
-                w_sum = raw_weights.sum()
-                n_nonzero = int((raw_weights > 0).sum())
-                if w_sum > 0:
-                    weights = raw_weights / w_sum
-                else:
-                    weights = np.ones(val_preds_orig.shape[0]) / val_preds_orig.shape[0]
-                    w_sum = 1.0
-
-                n_main = self.n_estimators
-                n_q = self.n_quantile_estimators if (self.n_quantile_estimators > 0) else 0
-                vm = valid_mask
-                def _group_sum(start, end):
-                    kept = np.where(vm[start:end])[0]
-                    return weights[kept].sum() if len(kept) > 0 else 0.0
-                w_default = _group_sum(0, n_main // 2) if n_main >= 2 else _group_sum(0, n_main)
-                w_svd = _group_sum(n_main // 2, n_main) if n_main >= 2 else 0.0
-                w_q = _group_sum(n_main, n_main + n_q)
-                n_hk_sv = val_preds_orig.shape[0] - n_base_valid
-                w_hk = weights[n_base_valid:].sum() if n_hk_sv > 0 else 0.0
-                print(
-                    f"[TabLDM:enhance] NNLS: n_nonzero={n_nonzero}/{len(weights)}, "
-                    f"weights.sum()={w_sum:.4f}, "
-                    f"w_default={w_default:.4f}, w_svd/cross={w_svd:.4f}, "
-                    f"w_quantile={w_q:.4f}, w_hk={w_hk:.4f}"
-                )
-                self.nnls_weights_ = weights
-
+            self._fit_pipeline_enhancement(X, y, y_scaled)
+            self.n_features_in_ = X.shape[1]
         else:
             # ---- Non-enhanced path ----
             self.hk_triggered_ = False
@@ -1744,7 +1509,8 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         has_training_data = (
             hasattr(self, "ensemble_generator_") and getattr(self.ensemble_generator_, "X_", None) is not None
         )
-        if not has_kv_cache and not has_training_data:
+        has_pipeline_training_data = bool(getattr(self, "pipeline_members_", []))
+        if not has_kv_cache and not has_training_data and not has_pipeline_training_data:
             raise RuntimeError(
                 "Cannot predict: this estimator was saved without training data and has no KV cache. "
                 "Predictions require either cached KV projections or the original training data. "
@@ -1817,186 +1583,29 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             return final_results
 
         # ---- Enhanced path ----
-        output_type = ["mean"]  # enhanced path only supports mean
-        results = {key: [] for key in output_type}
-        fsi = getattr(self, "feat_sample_indices_", None)
-
-        # Main group
-        use_augment = (
-            getattr(self, "svd_", None) is not None
-            and self.n_estimators == 32
-        )
-        if use_augment:
-            data = self.ensemble_generator_.transform(X, mode="both")
-            X_raw_test = self.ensemble_generator_.unique_filter_.transform(X)
-            X_raw_train = self.ensemble_generator_.X_
-
-            global_est_idx = 0
-            odd_local = 0
-            for norm_method, (Xs_both, ys) in data.items():
-                n_est_this_method = Xs_both.shape[0]
-                n_train_rows = ys.shape[1]
-
-                even_idxs, odd_idxs, odd_locals = [], [], []
-                even_global, odd_global = [], []
-                for local in range(n_est_this_method):
-                    if global_est_idx % 2 == 0:
-                        even_idxs.append(local)
-                        even_global.append(global_est_idx)
-                    else:
-                        odd_idxs.append(local)
-                        odd_locals.append(odd_local)
-                        odd_global.append(global_est_idx)
-                        odd_local += 1
-                    global_est_idx += 1
-
-                per_est_preds = {}
-
-                if even_idxs:
-                    fi = [fsi[g] for g in even_global] if fsi is not None else None
-                    bout = self._batch_forward(
-                        Xs_both[even_idxs], ys[even_idxs], output_type=output_type, feat_indices=fi
-                    )
-                    preds_val = bout if not isinstance(bout, dict) else bout["mean"]
-                    for i, li in enumerate(even_idxs):
-                        per_est_preds[li] = preds_val[i]
-
-                if odd_idxs:
-                    Xs_odd_list = []
-                    for li, ol in zip(odd_idxs, odd_locals):
-                        x_both_i = Xs_both[li]
-                        x_tr = self._augment_estimator(
-                            x_both_i[:n_train_rows], X_raw_train, ol, is_train=True)
-                        x_te = self._augment_estimator(
-                            x_both_i[n_train_rows:], X_raw_test, ol, is_train=False)
-                        Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
-                    Xs_odd = np.stack(Xs_odd_list, axis=0)
-                    fi = [fsi[g] for g in odd_global] if fsi is not None else None
-                    bout = self._batch_forward(
-                        Xs_odd, ys[odd_idxs], output_type=output_type, feat_indices=fi
-                    )
-                    preds_val = bout if not isinstance(bout, dict) else bout["mean"]
-                    for i, li in enumerate(odd_idxs):
-                        per_est_preds[li] = preds_val[i]
-
-                for key in output_type:
-                    stacked = np.stack(
-                        [per_est_preds[li] for li in range(n_est_this_method)],
-                        axis=0,
-                    )
-                    results[key].append(stacked)
-        else:
-            data = self.ensemble_generator_.transform(X, mode="both")
-            _grp_offset = 0
-            for norm_method, (Xs, ys) in data.items():
-                n_est = Xs.shape[0]
-                fi = [fsi[_grp_offset + i] for i in range(n_est)] if fsi is not None else None
-                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
-                if isinstance(bout, dict):
-                    for key in output_type:
-                        results[key].append(bout[key])
-                else:
-                    results[output_type[0]].append(bout)
-                _grp_offset += n_est
-
-        # Quantile group
-        q_gen = getattr(self, "quantile_ensemble_generator_", None)
-        if q_gen is not None:
-            q_data = q_gen.transform(X, mode="both")
-            _q_offset = self.n_estimators
-            for norm_method, (Xs, ys) in q_data.items():
-                n_est = Xs.shape[0]
-                fi = [fsi[_q_offset + i] for i in range(n_est)] if fsi is not None else None
-                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
-                if isinstance(bout, dict):
-                    for key in output_type:
-                        results[key].append(bout[key])
-                else:
-                    results[output_type[0]].append(bout)
-                _q_offset += n_est
-
-        # Collect HK test predictions in original scale
-        hk_preds_orig = None
-        hk_infos_full = getattr(self, "hk_generators_", [])
-        if self.hk_triggered_ and hk_infos_full:
-            _hk_p = self._collect_hk_test_predictions_orig(X, hk_infos_full)
-            if _hk_p.ndim == 2 and _hk_p.shape[0] > 0:
-                hk_preds_orig = _hk_p
-
-        # Combine predictions
-        use_nnls = (
-            getattr(self, "nnls_weights_", None) is not None
-            and self.validation
-        )
-        fixed_indices = getattr(self, "fixed_candidate_indices_", None)
-        fixed_weights = getattr(self, "fixed_candidate_weights_", None)
-        use_fixed_plan = fixed_indices is not None and fixed_weights is not None
-        nan_valid_mask = getattr(self, "nan_valid_mask_", None)
-        final_results = {}
-        for key in output_type:
-            arr = np.concatenate(results[key], axis=0)
-            if nan_valid_mask is not None and len(nan_valid_mask) == arr.shape[0]:
-                arr = arr[nan_valid_mask]
-            n_estimators = arr.shape[0]
-            n_samples = arr.shape[1]
-
-            if self.verbose:
-                main_n = self.n_estimators
-                q_n = self.n_quantile_estimators if getattr(self, "quantile_ensemble_generator_", None) is not None else 0
-                print(
-                    f"[TabLDM:enhance] Predictions merged: main={main_n}, quantile={q_n}, "
-                    f"total={n_estimators}, shape={arr.shape}"
-                )
-
-            fr = self.foundation_rate
-            if arr.ndim == 2:
-                arr = self.y_scaler_.inverse_transform(arr.reshape(-1, 1)).reshape(n_estimators, n_samples)
-                if not np.isfinite(arr).all():
-                    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-
-                # Append HK predictions (already in original scale)
-                if hk_preds_orig is not None and key == "mean":
-                    arr = np.concatenate([arr, hk_preds_orig.astype(np.float64)], axis=0)
-                    n_estimators = arr.shape[0]
-
-                if use_fixed_plan:
-                    if hk_preds_orig is not None:
-                        print("[TabLDM:hk] fixed plan excludes HK candidates")
-                    if fixed_indices.max(initial=-1) >= arr.shape[0]:
-                        raise RuntimeError(
-                            "Fixed candidate plan no longer matches generated base candidates."
-                        )
-                    final_results[key] = fixed_weights @ arr[fixed_indices]
-                elif use_nnls:
-                    w = self.nnls_weights_
-                    if len(w) != n_estimators:
-                        w = np.ones(n_estimators) / n_estimators
-                    nnls_pred = w @ arr
-                    foundation_pred = _safe_ensemble_mean(arr, axis=0)
-                    final_results[key] = (1.0 - fr) * nnls_pred + fr * foundation_pred
-                else:
-                    final_results[key] = _safe_ensemble_mean(arr, axis=0)
-            else:
-                n_quantiles = arr.shape[2]
-                arr = self.y_scaler_.inverse_transform(arr.reshape(-1, 1)).reshape(n_estimators, n_samples, n_quantiles)
-                if not np.isfinite(arr).all():
-                    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-                if use_nnls:
-                    w = self.nnls_weights_
-                    if len(w) != n_estimators:
-                        w = np.ones(n_estimators) / n_estimators
-                    nnls_pred = np.einsum("e,enq->nq", w, arr)
-                    foundation_pred = np.mean(arr, axis=0)
-                    final_results[key] = (1.0 - fr) * nnls_pred + fr * foundation_pred
-                else:
-                    final_results[key] = np.mean(arr, axis=0)
-
+        if output_type != ["mean"]:
+            raise ValueError("The LimiX pipeline ensemble supports only output_type='mean'.")
+        predictions, weights = [], []
+        for member, weight in zip(self.pipeline_members_, self.nnls_weights_):
+            try:
+                prediction = self._pipeline_member_predictions(member, X)
+                prediction = self.y_scaler_.inverse_transform(prediction.reshape(-1, 1)).ravel()
+                if not np.isfinite(prediction).all():
+                    raise ValueError("prediction contains non-finite values")
+            except Exception as exc:
+                warnings.warn(f"Skipping pipeline member {member.spec.name}: {exc}", UserWarning, stacklevel=2)
+                continue
+            predictions.append(prediction)
+            weights.append(weight)
+        if not predictions:
+            raise RuntimeError("All retained LimiX pipeline members failed during prediction.")
+        weights = np.asarray(weights, dtype=np.float64)
+        weights /= weights.sum()
+        final_prediction = np.average(np.stack(predictions), axis=0, weights=weights)
         if self.n_jobs is not None:
             torch.set_num_threads(old_n_threads)
+        return final_prediction
 
-        if len(output_type) == 1:
-            return final_results[output_type[0]]
-        return final_results
 
     # ==================================================================
     # Pickle deserialization

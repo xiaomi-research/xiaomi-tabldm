@@ -17,14 +17,17 @@ from __future__ import annotations
 import sys
 import random
 import itertools
+import hashlib
 from collections import OrderedDict
 from copy import deepcopy
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import List, Optional, Sequence
 
 import numpy as np
 from scipy.sparse import issparse
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer, make_column_selector
+from sklearn.decomposition import TruncatedSVD
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
@@ -34,6 +37,7 @@ from sklearn.preprocessing import (
     PowerTransformer,
     QuantileTransformer,
     RobustScaler,
+    OneHotEncoder,
 )
 from sklearn.utils.validation import check_is_fitted
 
@@ -1878,3 +1882,352 @@ class InteractionAugmentor(TransformerMixin, BaseEstimator):
         if not np.isfinite(X_aug).all():
             X_aug = np.nan_to_num(X_aug, nan=0.0, posinf=0.0, neginf=0.0)
         return X_aug
+
+
+@dataclass(frozen=True)
+class PipelineSpec:
+    """Immutable description of one LimiX-compatible preprocessing member."""
+
+    name: str
+    numeric_transform: Optional[str]
+    discrete_flag: bool
+    original_flag: bool
+    categorical_encoding: str
+    feature_shuffle: Optional[str]
+    fingerprint: bool = False
+    max_interactions: Optional[int] = None
+    svd_components: Optional[int] = None
+    seed_offset: int = 0
+    target_transform: Optional[str] = None
+
+
+# These entries are a literal translation of LimiX V2's no-retrieval JSON
+# defaults.  Keeping them local makes TabLDM independent from LimiX at runtime.
+_CLASSIFIER_PIPELINE_ROWS = (
+    ("quantile_norm_all_data", False, False, "ordinal_strict_feature_shuffled", "rotate", True, None, None),
+    ("quantile_uniform_10", False, True, "numeric", "shuffle", False, None, 64),
+    ("quantile_norm_5", True, False, "ordinal_shuffled", "shuffle", True, None, None),
+    ("kdi_uni", False, False, "onehot", "rotate", True, 10, None),
+    ("quantile_norm_5", False, False, "ordinal_shuffled", "shuffle", False, None, None),
+    ("robust", False, False, "ordinal_strict_feature_shuffled", "rotate", True, None, 32),
+    ("quantile_uniform_all_data", False, False, "onehot", "rotate", True, None, None),
+    ("quantile_norm_5", False, True, "numeric", "shuffle", False, 50, 128),
+    ("quantile_norm_all_data", False, False, "onehot", "rotate", False, None, None),
+    ("quantile_norm_all_data", False, False, "ordinal_strict_feature_shuffled", "shuffle", True, None, None),
+    ("kdi_uni", False, False, "ordinal_shuffled", "rotate", True, None, None),
+    ("quantile_norm_5", False, False, "ordinal_shuffled", "rotate", True, 10, None),
+    ("quantile_uniform_5", False, False, "none", "shuffle", False, 100, 128),
+    (None, False, False, "onehot", "rotate", False, None, None),
+    ("quantile_norm_all_data", True, False, "onehot", "rotate", True, None, 128),
+    ("quantile_norm_all_data", False, False, "ordinal_strict_feature_shuffled", "shuffle", True, None, None),
+    ("power", True, True, "ordinal_shuffled", "shuffle", True, 10, None),
+    ("quantile_norm_10", False, True, "numeric", "shuffle", True, None, 64),
+    ("quantile_uniform_all_data", False, False, "onehot", "rotate", True, None, None),
+    ("quantile_uniform_10", False, True, "ordinal_shuffled", "shuffle", False, None, 64),
+    ("quantile_norm_all_data", False, False, "onehot", "rotate", False, None, None),
+    ("power", False, False, "none", None, False, 50, None),
+    ("quantile_norm_5", False, False, "onehot", "rotate", True, None, None),
+    ("quantile_norm_all_data", False, False, "ordinal_strict_feature_shuffled", "shuffle", True, None, None),
+    ("kdi_uni", False, False, "ordinal_shuffled", "rotate", True, None, None),
+    ("quantile_norm_all_data", True, False, "onehot", "rotate", True, None, 128),
+    ("quantile_norm_5", False, False, "ordinal_shuffled", "rotate", True, 10, None),
+    ("quantile_norm_all_data", False, False, "ordinal_strict_feature_shuffled", "shuffle", True, None, None),
+    ("quantile_uniform_10", False, True, "ordinal_shuffled", "shuffle", False, None, 64),
+    ("robust", False, True, "ordinal", None, False, 100, 32),
+    ("quantile_norm_5", False, False, "ordinal_shuffled", "shuffle", False, None, None),
+    (None, False, False, "onehot", "rotate", False, None, None),
+)
+
+
+def _specs_from_rows(rows: Sequence[tuple], prefix: str) -> tuple[PipelineSpec, ...]:
+    return tuple(
+        PipelineSpec(
+            name=f"{prefix}_{index:02d}", numeric_transform=row[0],
+            discrete_flag=row[1], original_flag=row[2], categorical_encoding=row[3],
+            feature_shuffle=row[4], fingerprint=row[5], max_interactions=row[6],
+            svd_components=row[7], seed_offset=index,
+        )
+        for index, row in enumerate(rows)
+    )
+
+
+def default_classifier_pipeline_specs() -> tuple[PipelineSpec, ...]:
+    """Return the 32 LimiX V2 no-retrieval classification member specs."""
+    return _specs_from_rows(_CLASSIFIER_PIPELINE_ROWS, "cls")
+
+
+def default_regressor_pipeline_specs() -> tuple[PipelineSpec, ...]:
+    """Return the eight LimiX V2 no-retrieval regression member specs."""
+    rows = (
+        ("quantile_uniform_all_data", False, True, "ordinal_strict_feature_shuffled", "shuffle", False, None, None),
+    ) * 4 + (
+        ("power", False, False, "onehot", "shuffle", False, None, None),
+    ) * 4
+    specs = list(_specs_from_rows(rows, "reg"))
+    for index in range(4):
+        specs[index] = PipelineSpec(**{**specs[index].__dict__, "svd_components": -1})
+    return tuple(specs)
+
+
+class PipelineMember:
+    """A fitted, deterministic preprocessing view for a single ensemble member."""
+
+    def __init__(self, spec: PipelineSpec, *, categorical_indices=None, random_state=None, classification=False):
+        self.spec = spec
+        self.categorical_indices = list(categorical_indices or [])
+        self.random_state = 0 if random_state is None else int(random_state)
+        self.classification = classification
+
+    def _seed(self, offset=0):
+        return self.random_state + self.spec.seed_offset + offset
+
+    def _finite(self, X):
+        return np.nan_to_num(np.asarray(X, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _filtered_categories(self):
+        return [
+            position for position, original in enumerate(np.flatnonzero(self.unique_filter_.features_to_keep_))
+            if original in self.categorical_indices
+        ]
+
+    def _interaction_fit_transform(self, X):
+        if not self.spec.max_interactions or X.shape[1] == 0:
+            self.interaction_pairs_ = np.empty((0, 2), dtype=np.intp)
+            return X
+        count = min(self.spec.max_interactions, X.shape[1] * (X.shape[1] + 1) // 2)
+        rng = np.random.default_rng(self._seed(11))
+        pairs = [(i, j) for i in range(X.shape[1]) for j in range(i, X.shape[1])]
+        selected = rng.choice(len(pairs), size=count, replace=False)
+        self.interaction_pairs_ = np.asarray([pairs[i] for i in selected], dtype=np.intp)
+        return self._interaction_transform(X)
+
+    def _interaction_transform(self, X):
+        if self.interaction_pairs_.size == 0:
+            return X
+        base = self._finite(X)
+        interactions = base[:, self.interaction_pairs_[:, 0]] * base[:, self.interaction_pairs_[:, 1]]
+        return np.concatenate([base, interactions], axis=1)
+
+    def _make_numeric_transformer(self, n_samples):
+        tag = self.spec.numeric_transform
+        if tag is None:
+            return None
+        if tag == "power":
+            return PowerTransformer(method="yeo-johnson", standardize=True)
+        if tag == "robust":
+            return RobustScaler(unit_variance=True)
+        if tag in {"kdi_uni", "quantile_uniform_5", "quantile_uniform_10", "quantile_uniform_all_data"}:
+            divisor = 10 if tag.endswith("_10") else 5
+            return QuantileTransformer(
+                n_quantiles=max(2, min(n_samples, n_samples // divisor)), output_distribution="uniform",
+                random_state=self._seed(17), subsample=n_samples,
+            )
+        if tag.startswith("quantile_norm"):
+            divisor = 10 if tag.endswith("_10") else 5
+            return QuantileTransformer(
+                n_quantiles=max(2, min(n_samples, n_samples // divisor)), output_distribution="normal",
+                random_state=self._seed(17), subsample=n_samples,
+            )
+        raise ValueError(f"Unsupported LimiX numeric transform {tag!r}")
+
+    def _fit_numeric(self, X):
+        self.numeric_mask_ = np.ones(X.shape[1], dtype=bool)
+        self.numeric_mask_[self.categorical_indices_] = False
+        transform_mask = np.ones(X.shape[1], dtype=bool) if self.spec.discrete_flag else self.numeric_mask_
+        self.numeric_transform_mask_ = transform_mask
+        self.numeric_transformer_ = self._make_numeric_transformer(X.shape[0])
+        transformed = X.copy()
+        if self.numeric_transformer_ is not None and transform_mask.any():
+            transformed[:, transform_mask] = self.numeric_transformer_.fit_transform(self._finite(X[:, transform_mask]))
+        if self.spec.original_flag:
+            transformed = np.concatenate([X, transformed], axis=1)
+            self.rebalance_categorical_indices_ = list(self.categorical_indices)
+        elif self.spec.discrete_flag:
+            self.rebalance_categorical_indices_ = []
+        else:
+            cats = X[:, self.categorical_indices_] if self.categorical_indices_ else np.empty((X.shape[0], 0))
+            nums = transformed[:, transform_mask]
+            transformed = np.concatenate([cats, nums], axis=1)
+            self.rebalance_categorical_indices_ = list(range(cats.shape[1]))
+        return self._finite(transformed)
+
+    def _transform_numeric(self, X):
+        transformed = X.copy()
+        if self.numeric_transformer_ is not None and self.numeric_transform_mask_.any():
+            transformed[:, self.numeric_transform_mask_] = self.numeric_transformer_.transform(
+                self._finite(X[:, self.numeric_transform_mask_])
+            )
+        if self.spec.original_flag:
+            return self._finite(np.concatenate([X, transformed], axis=1))
+        if self.spec.discrete_flag:
+            return self._finite(transformed)
+        cats = X[:, self.categorical_indices_] if self.categorical_indices_ else np.empty((X.shape[0], 0))
+        return self._finite(np.concatenate([cats, transformed[:, self.numeric_transform_mask_]], axis=1))
+
+    def _fit_encode(self, X):
+        cats = list(self.rebalance_categorical_indices_)
+        strategy = self.spec.categorical_encoding
+        self.encoding_categorical_indices_ = cats
+        self.ordinal_permutations_ = {}
+        if strategy in {"numeric", "none"} or not cats:
+            self.encoder_ = None
+            return X
+        other = [i for i in range(X.shape[1]) if i not in cats]
+        if strategy.startswith("ordinal"):
+            if "feature_shuffled" in strategy:
+                cats = [i for i in cats if self._ordinal_column_allowed(X[:, i], strict="strict" in strategy)]
+                other = [i for i in range(X.shape[1]) if i not in cats]
+            self.encoding_categorical_indices_ = cats
+            if not cats:
+                self.encoder_ = None
+                return X
+            self.encoder_ = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=np.nan)
+            encoded = self.encoder_.fit_transform(X[:, cats])
+            if strategy.endswith("_shuffled"):
+                rng = np.random.default_rng(self._seed(23))
+                for i, categories in enumerate(getattr(self.encoder_, "categories_", self.encoder_.categories)):
+                    permutation = rng.permutation(len(categories))
+                    self.ordinal_permutations_[i] = permutation
+                    valid = np.isfinite(encoded[:, i])
+                    encoded[valid, i] = permutation[encoded[valid, i].astype(int)]
+            return self._finite(np.concatenate([encoded, X[:, other]], axis=1))
+        if strategy == "onehot":
+            self.encoder_ = OneHotEncoder(drop="if_binary", sparse_output=False, handle_unknown="ignore")
+            encoded = self.encoder_.fit_transform(X[:, cats])
+            return self._finite(np.concatenate([encoded, X[:, other]], axis=1))
+        raise ValueError(f"Unsupported categorical encoding {strategy!r}")
+
+    @staticmethod
+    def _ordinal_column_allowed(column, strict=False):
+        values, counts = np.unique(column, return_counts=True)
+        if counts.size == 0 or counts.min() < 10:
+            return False
+        return not strict or len(values) < len(column) // 10
+
+    def _transform_encode(self, X):
+        cats = self.encoding_categorical_indices_
+        strategy = self.spec.categorical_encoding
+        if self.encoder_ is None:
+            return X
+        other = [i for i in range(X.shape[1]) if i not in cats]
+        encoded = self.encoder_.transform(X[:, cats])
+        if strategy.startswith("ordinal"):
+            for i, permutation in self.ordinal_permutations_.items():
+                valid = np.isfinite(encoded[:, i])
+                positions = encoded[valid, i].astype(int)
+                encoded[valid, i] = permutation[positions]
+        return self._finite(np.concatenate([encoded, X[:, other]], axis=1))
+
+    def _append_fingerprint(self, X):
+        if not self.spec.fingerprint:
+            return X
+        fingerprints = np.empty(X.shape[0], dtype=np.float64)
+        for index, row in enumerate(X):
+            digest = hashlib.sha256((row + self.fingerprint_salt_).tobytes()).digest()
+            fingerprints[index] = int.from_bytes(digest[:8], "little") / 2**64
+        return np.column_stack([X, fingerprints])
+
+    def _fit_svd(self, X):
+        requested = self.spec.svd_components
+        if requested == -1:
+            requested = max(1, min(X.shape[0] // 10 + 1, X.shape[1] // 2))
+        if not requested or X.shape[1] < 2:
+            self.svd_ = None
+            return X
+        n_components = min(int(requested), X.shape[0] - 1, X.shape[1] - 1)
+        if n_components < 1:
+            self.svd_ = None
+            return X
+        self.svd_scaler_ = StandardScaler()
+        X_scaled = self.svd_scaler_.fit_transform(self._finite(X))
+        self.svd_ = TruncatedSVD(n_components=n_components, random_state=self._seed(31)).fit(X_scaled)
+        return np.concatenate([X, self.svd_.transform(X_scaled)], axis=1)
+
+    def _transform_svd(self, X):
+        if self.svd_ is None:
+            return X
+        return np.concatenate([X, self.svd_.transform(self.svd_scaler_.transform(self._finite(X)))], axis=1)
+
+    def fit(self, X, y=None):
+        X = self._finite(X)
+        X = self._interaction_fit_transform(X)
+        self.unique_filter_ = UniqueFeatureFilter().fit(X)
+        if self.unique_filter_.n_features_out_ == 0:
+            raise ValueError("Pipeline member has no non-constant features")
+        X = self.unique_filter_.transform(X)
+        self.categorical_indices_ = self._filtered_categories()
+        self.categorical_indices = self.categorical_indices_
+        X = self._fit_numeric(X)
+        X = self._fit_encode(X)
+        self.fingerprint_salt_ = int(np.random.default_rng(self._seed(29)).integers(0, 2**16))
+        X = self._append_fingerprint(X)
+        X = self._fit_svd(X)
+        if self.spec.feature_shuffle == "shuffle":
+            self.feature_permutation_ = np.random.default_rng(self._seed(37)).permutation(X.shape[1])
+        elif self.spec.feature_shuffle == "rotate":
+            self.feature_permutation_ = np.roll(np.arange(X.shape[1]), self.spec.seed_offset)
+        else:
+            self.feature_permutation_ = np.arange(X.shape[1])
+        self.X_train_ = self._finite(X[:, self.feature_permutation_]).astype(np.float32)
+        if self.classification:
+            n_classes = int(np.max(y)) + 1
+            self.class_permutation_ = np.random.default_rng(self._seed(41)).permutation(n_classes)
+            self.y_train_ = self.class_permutation_[np.asarray(y, dtype=int)]
+        else:
+            self.class_permutation_ = None
+            self.y_train_ = np.asarray(y, dtype=np.float32) if y is not None else None
+        return self
+
+    def transform(self, X):
+        X = self._finite(X)
+        X = self._interaction_transform(X)
+        X = self.unique_filter_.transform(X)
+        X = self._transform_numeric(X)
+        X = self._transform_encode(X)
+        X = self._append_fingerprint(X)
+        X = self._transform_svd(X)
+        return self._finite(X[:, self.feature_permutation_]).astype(np.float32)
+
+    def inverse_class_probabilities(self, probabilities):
+        if self.class_permutation_ is None:
+            return probabilities
+        return np.asarray(probabilities)[:, self.class_permutation_]
+
+
+class PipelineEnsemble:
+    """Ordered collection of independently fitted :class:`PipelineMember` objects."""
+
+    def __init__(self, *, classification, specs, categorical_indices=None, random_state=None):
+        self.classification = classification
+        self.specs = tuple(specs)
+        self.categorical_indices = list(categorical_indices or [])
+        self.random_state = random_state
+
+    @property
+    def member_names(self):
+        return [spec.name for spec in self.specs]
+
+    def fit(self, X, y, member_indices=None):
+        indices = range(len(self.specs)) if member_indices is None else member_indices
+        self.members_ = []
+        self.member_indices_ = []
+        self.failed_members_ = []
+        for index in indices:
+            spec = self.specs[index]
+            try:
+                member = PipelineMember(
+                    spec, categorical_indices=self.categorical_indices, random_state=self.random_state,
+                    classification=self.classification,
+                ).fit(X, y)
+            except Exception as exc:
+                self.failed_members_.append({"index": index, "name": spec.name, "reason": repr(exc)})
+                continue
+            self.members_.append(member)
+            self.member_indices_.append(index)
+        return self
+
+
+__all__ = [
+    "PipelineSpec", "PipelineMember", "PipelineEnsemble",
+    "default_classifier_pipeline_specs", "default_regressor_pipeline_specs",
+]
