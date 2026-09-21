@@ -59,13 +59,14 @@ from sklearn.model_selection import KFold, train_test_split
 from sklearn.preprocessing import OneHotEncoder, PowerTransformer, StandardScaler
 from sklearn.utils.validation import check_is_fitted
 
-from .base import TabLDMBaseEstimator
+from .base import TabLDMBaseEstimator, _clear_cuda_cache
 from .preprocessing import (
     EnsembleGenerator,
     TransformToNumerical,
     UniqueFeatureFilter,
     PipelineEnsemble,
     default_regressor_pipeline_specs,
+    large_regressor_pipeline_specs,
 )
 from .sklearn_utils import _moe_load_mismatch, _num_samples, validate_data
 
@@ -267,6 +268,8 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         fixed_candidate_weights: Optional[List[float] | Literal["equal"]] = None,
         pipeline_specs=None,
         validation_size: float = 0.2,
+        nnls_min_samples: int = 2000,
+        pipeline_chunk_rows: Optional[int] = None,
     ):
         # base
         self.n_estimators = n_estimators
@@ -304,6 +307,8 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         self.fixed_candidate_weights = fixed_candidate_weights
         self.pipeline_specs = pipeline_specs
         self.validation_size = validation_size
+        self.nnls_min_samples = nnls_min_samples
+        self.pipeline_chunk_rows = pipeline_chunk_rows
 
     # ==================================================================
     # Model loading (MoE architecture)
@@ -1335,15 +1340,40 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         """Fit LimiX V2 regression views and one holdout NNLS ensemble."""
         if not 0 < self.validation_size < 1:
             raise ValueError("validation_size must be in (0, 1)")
-        self.pipeline_specs_ = tuple(self.pipeline_specs or default_regressor_pipeline_specs())
-        categorical_indices = getattr(self.X_encoder_, "categorical_indices_", [])
-        self.pipeline_member_names_ = [spec.name for spec in self.pipeline_specs_]
+        default_specs = default_regressor_pipeline_specs()
+        if self.pipeline_specs is not None:
+            self.pipeline_specs_ = tuple(self.pipeline_specs)
+            self.pipeline_route_ = "user"
+        elif X.shape[0] > 50_000:
+            self.pipeline_specs_ = large_regressor_pipeline_specs()
+            self.pipeline_route_ = "large_dataset"
+        else:
+            self.pipeline_specs_ = default_specs
+            self.pipeline_route_ = "default"
+        self.pipeline_oom_audit_ = []
         self.pipeline_validation_audit_ = []
+        if self.pipeline_reduced_for_large_dataset_:
+            self.pipeline_validation_audit_.append({
+                "status": "large_dataset_pipeline_reduction",
+                "n_train": int(X.shape[0]),
+                "removed_members": list(self.pipeline_removed_member_names_),
+                "remaining_members": list(self.pipeline_member_names_),
+            })
         self.pipeline_failed_members_ = []
         valid_indices = list(range(len(self.pipeline_specs_)))
         weights = None
 
-        if self.validation:
+        # Avoid fitting a validation NNLS problem for small datasets; the
+        # ensemble average is more stable and avoids an unnecessary peak.
+        use_nnls = bool(self.validation and X.shape[0] >= self.nnls_min_samples)
+        if self.validation and not use_nnls:
+            self.pipeline_validation_audit_.append({
+                "status": "equal_weight_small_dataset",
+                "n_train": int(X.shape[0]),
+                "nnls_min_samples": int(self.nnls_min_samples),
+            })
+
+        if use_nnls:
             try:
                 X_tr, X_val, y_tr_scaled, _, _, y_val = train_test_split(
                     X, y_scaled, y, test_size=self.validation_size, shuffle=True,
@@ -1402,10 +1432,28 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         self.feat_sample_indices_ = None
 
     def _pipeline_member_predictions(self, member, X: np.ndarray) -> np.ndarray:
-        X_both = np.concatenate([member.X_train_, member.transform(X)], axis=0)[None, ...]
-        y_train = np.asarray(member.y_train_, dtype=np.float32)[None, ...]
-        output = self._batch_forward(X_both, y_train, output_type="mean")
-        return np.asarray(output)[0]
+        """Run one pipeline member in query chunks with a CUDA OOM retry."""
+        chunk = getattr(self, "pipeline_chunk_rows", None)
+        if chunk is None:
+            chunk = max(1, int(getattr(self, "n_samples_in_", X.shape[0])))
+        outputs = []
+        for start in range(0, X.shape[0], int(chunk)):
+            X_query = X[start:start + int(chunk)]
+            X_both = np.concatenate([member.X_train_, member.transform(X_query)], axis=0)[None, ...]
+            y_train = np.asarray(member.y_train_, dtype=np.float32)[None, ...]
+            try:
+                output = self._batch_forward(X_both, y_train, output_type="mean")
+            except torch.cuda.OutOfMemoryError as exc:
+                _clear_cuda_cache(self.device_)
+                self.pipeline_oom_audit_.append({"tier": 4, "action": "forward_oom_retry", "member": member.spec.name, "error": repr(exc)})
+                old_batch = self.batch_size_
+                self.batch_size_ = 1
+                try:
+                    output = self._batch_forward(X_both, y_train, output_type="mean")
+                finally:
+                    self.batch_size_ = old_batch
+            outputs.append(np.asarray(output)[0])
+        return np.concatenate(outputs, axis=0) if outputs else np.empty(0, dtype=np.float32)
 
 
     def fit(self, X: np.ndarray, y: np.ndarray, kv_cache: bool | str = False) -> "TabLDMRegressor":

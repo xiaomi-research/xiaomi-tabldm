@@ -52,7 +52,7 @@ from scipy.special import expit as _expit, erfinv as _erfinv
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import LocalEntryNotFoundError
 
-from .base import TabLDMBaseEstimator
+from .base import TabLDMBaseEstimator, _clear_cuda_cache
 from .preprocessing import (
     TransformToNumerical,
     EnsembleGenerator,
@@ -63,6 +63,7 @@ from .preprocessing import (
     InteractionAugmentor,
     PipelineEnsemble,
     default_classifier_pipeline_specs,
+    large_classifier_pipeline_specs,
 )
 from .sklearn_utils import _moe_load_mismatch, validate_data, _num_samples
 
@@ -306,6 +307,8 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         adaptive_enhancement: bool = True,
         pipeline_specs=None,
         validation_size: float = 0.2,
+        nnls_min_samples: int = 2000,
+        pipeline_chunk_rows: Optional[int] = None,
     ):
         # base
         self.n_estimators = n_estimators
@@ -353,6 +356,8 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.adaptive_enhancement = adaptive_enhancement
         self.pipeline_specs = pipeline_specs
         self.validation_size = validation_size
+        self.nnls_min_samples = nnls_min_samples
+        self.pipeline_chunk_rows = pipeline_chunk_rows
 
     # ==================================================================
     # Adaptive no-K-Fold enhancement routing
@@ -714,8 +719,39 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         return self
 
+    @staticmethod
+    def _safe_classifier_pipeline_spec(spec) -> bool:
+        """Return whether a pipeline spec is safe for high-cardinality data.
+
+        The conservative enhancement route keeps ordinal-only members and
+        avoids dense one-hot, SVD, interaction, and original-column expansion.
+        """
+        return (
+            isinstance(spec.categorical_encoding, str)
+            and spec.categorical_encoding.startswith("ordinal")
+            and not spec.discrete_flag
+            and spec.svd_components is None
+            and spec.max_interactions is None
+            and not spec.original_flag
+        )
+
+    @classmethod
+    def _select_safe_classifier_pipeline_specs(cls, specs):
+        """Filter classifier pipeline specs to the conservative member set."""
+        source_specs = tuple(specs)
+        selected_specs = tuple(
+            spec for spec in source_specs if cls._safe_classifier_pipeline_spec(spec)
+        )
+        if not selected_specs:
+            raise ValueError(
+                "No safe classifier pipeline members remain. The conservative "
+                "route requires ordinal encoding without discrete, SVD, "
+                "interaction, or original-feature expansion."
+            )
+        return source_specs, selected_specs
+
     def _fit_pipeline_enhancement(self, X: np.ndarray, y: np.ndarray) -> None:
-        """Fit LimiX V2 member views and learn one holdout NNLS ensemble."""
+        """Fit conservative LimiX member views and learn one holdout NNLS ensemble."""
         if not 0 < self.validation_size < 1:
             raise ValueError("validation_size must be in (0, 1)")
         if self.enable_calibration:
@@ -727,16 +763,59 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.calibration_params_ = None
         self._cal_P_ = None
         self._cal_y_ = None
-        self.pipeline_specs_ = tuple(self.pipeline_specs or default_classifier_pipeline_specs())
-        encoded_categories = list(getattr(self.X_encoder_, "categorical_indices_", []))
-        categorical_indices = encoded_categories or (self.categorical_indices or [])
+        default_specs = default_classifier_pipeline_specs()
+        if self.pipeline_specs is not None:
+            source_specs = tuple(self.pipeline_specs)
+            self.pipeline_route_ = "user"
+        elif X.shape[0] > 50_000:
+            source_specs = tuple(large_classifier_pipeline_specs())
+            self.pipeline_route_ = "large_dataset"
+        else:
+            source_specs = default_specs
+            self.pipeline_route_ = "default"
+        source_specs, selected_specs = self._select_safe_classifier_pipeline_specs(source_specs)
+        self.pipeline_specs_ = selected_specs
+        self.pipeline_reduced_for_large_dataset_ = self.pipeline_route_ == "large_dataset"
+        self.pipeline_default_member_names_ = [spec.name for spec in default_specs]
+        self.pipeline_source_member_names_ = [spec.name for spec in source_specs]
+        self.pipeline_removed_member_names_ = [
+            spec.name for spec in source_specs
+            if not self._safe_classifier_pipeline_spec(spec)
+        ]
         self.pipeline_member_names_ = [spec.name for spec in self.pipeline_specs_]
-        self.pipeline_validation_audit_ = []
+        self.pipeline_selected_member_names_ = list(self.pipeline_member_names_)
         self.pipeline_failed_members_ = []
         valid_indices = list(range(len(self.pipeline_specs_)))
+        self.pipeline_oom_audit_ = []
+        self.pipeline_validation_audit_ = [{
+            "status": "safe_pipeline_selection",
+            "route": self.pipeline_route_,
+            "source_members": list(self.pipeline_source_member_names_),
+            "selected_members": list(self.pipeline_member_names_),
+            "removed_members": list(self.pipeline_removed_member_names_),
+        }]
+        if self.pipeline_reduced_for_large_dataset_:
+            self.pipeline_validation_audit_.append({
+                "status": "large_dataset_pipeline_reduction",
+                "n_train": int(X.shape[0]),
+                "removed_members": list(self.pipeline_removed_member_names_),
+                "remaining_members": list(self.pipeline_member_names_),
+            })
+        encoded_categories = list(getattr(self.X_encoder_, "categorical_indices_", []))
+        categorical_indices = encoded_categories or (self.categorical_indices or [])
         weights = None
 
-        if self.validation:
+        # Small datasets use the stable equal-weight ensemble.  NNLS is only
+        # useful once the validation set is large enough to identify weights.
+        use_nnls = bool(self.validation and X.shape[0] >= self.nnls_min_samples)
+        if self.validation and not use_nnls:
+            self.pipeline_validation_audit_.append({
+                "status": "equal_weight_small_dataset",
+                "n_train": int(X.shape[0]),
+                "nnls_min_samples": int(self.nnls_min_samples),
+            })
+
+        if use_nnls:
             counts = np.bincount(y.astype(int), minlength=self.n_classes_)
             if counts.size == 0 or (counts[counts > 0].size and counts[counts > 0].min() < 2):
                 self.pipeline_validation_audit_.append({"status": "skipped", "reason": "smallest class has fewer than two samples"})
@@ -780,8 +859,15 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                             self.pipeline_validation_audit_.append({"status": "equal_weight_fallback", "reason": repr(exc)})
                         self.pipeline_validation_audit_.append({"status": "nnls", "n_validation": len(y_val), "valid_member_indices": successful})
                     else:
-                        valid_indices = []
-                        self.pipeline_validation_audit_.append({"status": "no_valid_members", "reason": "all holdout members failed"})
+                        # A failed holdout should not turn full fitting into an
+                        # empty member selection. Refit the safe candidates and
+                        # use equal weights if validation produced no usable row.
+                        valid_indices = list(range(len(self.pipeline_specs_)))
+                        self.pipeline_validation_audit_.append({
+                            "status": "validation_fallback",
+                            "reason": "all holdout members failed; refitting selected members",
+                            "selected_member_indices": list(valid_indices),
+                        })
                 except Exception as exc:
                     self.pipeline_validation_audit_.append({"status": "split_failed", "reason": repr(exc)})
 
@@ -803,14 +889,31 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.ensemble_generator_ = None
 
     def _pipeline_member_probabilities(self, member, X: np.ndarray) -> np.ndarray:
-        X_both = np.concatenate([member.X_train_, member.transform(X)], axis=0)[None, ...]
-        y_train = np.asarray(member.y_train_, dtype=np.float32)[None, ...]
-        raw = self._batch_forward(X_both, y_train, feature_shuffles=None)[0]
-        if not self.average_logits:
-            probabilities = raw
-        else:
-            probabilities = self.softmax(raw, axis=-1, temperature=self.softmax_temperature)
-        return member.inverse_class_probabilities(probabilities)
+        """Run one pipeline member with bounded query chunks and CUDA retry."""
+        chunk = getattr(self, "pipeline_chunk_rows", None)
+        if chunk is None:
+            chunk = max(1, int(getattr(self, "n_samples_in_", X.shape[0])))
+        outputs = []
+        for start in range(0, X.shape[0], int(chunk)):
+            X_query = X[start:start + int(chunk)]
+            X_view = member.transform(X_query)
+            X_both = np.concatenate([member.X_train_, X_view], axis=0)[None, ...]
+            y_train = np.asarray(member.y_train_, dtype=np.float32)[None, ...]
+            try:
+                raw = self._batch_forward(X_both, y_train, feature_shuffles=None)[0]
+            except torch.cuda.OutOfMemoryError as exc:
+                _clear_cuda_cache(self.device_)
+                self.pipeline_oom_audit_.append({"tier": 4, "action": "forward_oom_retry", "member": member.spec.name, "error": repr(exc)})
+                old_batch = self.batch_size_
+                self.batch_size_ = 1
+                try:
+                    raw = self._batch_forward(X_both, y_train, feature_shuffles=None)[0]
+                finally:
+                    self.batch_size_ = old_batch
+            if self.average_logits:
+                raw = self.softmax(raw, axis=-1, temperature=self.softmax_temperature)
+            outputs.append(member.inverse_class_probabilities(raw))
+        return np.concatenate(outputs, axis=0) if outputs else np.empty((0, self.n_classes_))
 
         """Pre-compute KV caches for training data across all ensemble batches."""
         train_data = self.ensemble_generator_.transform(X=None, mode="train")

@@ -2227,7 +2227,30 @@ class PipelineEnsemble:
         return self
 
 
+def large_classifier_pipeline_specs() -> tuple[PipelineSpec, ...]:
+    """Return a deterministic low-cost subset for very large training sets.
+
+    The default LimiX member table is intentionally unchanged.  This route
+    removes interaction, SVD, original-column expansion, and dense one-hot
+    members before fitting, while retaining several distinct numeric and
+    ordinal views.
+    """
+    default = default_classifier_pipeline_specs()
+    # Keep diverse, non-expanding members in their original stable order.
+    keep = (0, 2, 4, 5, 9, 10, 17, 21)
+    return tuple(default[index] for index in keep)
+
+
+def large_regressor_pipeline_specs() -> tuple[PipelineSpec, ...]:
+    """Return the non-SVD regression members for very large training sets."""
+    default = default_regressor_pipeline_specs()
+    # The first four default members use adaptive SVD; the latter four are
+    # the cheaper power/one-hot views and retain the original member identity.
+    return tuple(default[index] for index in range(4, len(default)))
+
+
 __all__ = [
     "PipelineSpec", "PipelineMember", "PipelineEnsemble",
     "default_classifier_pipeline_specs", "default_regressor_pipeline_specs",
+    "large_classifier_pipeline_specs", "large_regressor_pipeline_specs",
 ]

@@ -272,6 +272,38 @@ def test_limiX_default_pipeline_specs_match_v2_members():
     assert all(spec.categorical_encoding == "onehot" for spec in regressor_specs[4:])
 
 
+def test_classifier_safe_pipeline_specs_exclude_expanding_members():
+    """The conservative classifier route avoids high-cardinality expansion."""
+    from tabldm._sklearn.classifier import TabLDMClassifier
+    from tabldm._sklearn.preprocessing import default_classifier_pipeline_specs
+
+    source, selected = TabLDMClassifier._select_safe_classifier_pipeline_specs(
+        default_classifier_pipeline_specs()
+    )
+    assert len(source) == 32
+    assert [spec.name for spec in selected] == [
+        "cls_00", "cls_04", "cls_09", "cls_10", "cls_15",
+        "cls_23", "cls_24", "cls_27", "cls_30",
+    ]
+    assert all(TabLDMClassifier._safe_classifier_pipeline_spec(spec) for spec in selected)
+    assert all(spec.categorical_encoding.startswith("ordinal") for spec in selected)
+    assert all(not spec.discrete_flag for spec in selected)
+    assert all(spec.svd_components is None for spec in selected)
+    assert all(spec.max_interactions is None for spec in selected)
+    assert all(not spec.original_flag for spec in selected)
+
+
+def test_classifier_safe_pipeline_specs_reject_all_unsafe_members():
+    """An all-risky custom list fails clearly before fitting any member."""
+    import pytest
+    from tabldm._sklearn.classifier import TabLDMClassifier
+    from tabldm._sklearn.preprocessing import default_classifier_pipeline_specs
+
+    unsafe = (default_classifier_pipeline_specs()[3],)
+    with pytest.raises(ValueError, match="No safe classifier pipeline members"):
+        TabLDMClassifier._select_safe_classifier_pipeline_specs(unsafe)
+
+
 def test_limiX_pipeline_member_is_deterministic_and_handles_unknown_categories():
     """Fitted member state fixes output width, SVD, fingerprints, and shuffling."""
     from tabldm._sklearn.preprocessing import PipelineMember, default_classifier_pipeline_specs
