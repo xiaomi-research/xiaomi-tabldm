@@ -15,39 +15,32 @@
 """TabLDM Classifier with inference enhancement methods.
 
 This module provides ``TabLDMClassifier``, the public sklearn-style
-estimator for TabLDM in-context tabular classification, with multi-group
-candidate ensembling, NNLS weight learning, probability calibration, and
-other inference-time enhancements ported from the MiTabEnhancedClassifier
-reference implementation.
+estimator for TabLDM in-context tabular classification. When
+``enhance_candidates=True``, it fits a conservative LimiX pipeline
+ensemble and learns holdout NNLS weights (see
+``_fit_pipeline_enhancement``).
 
 All log messages use the ``[TabLDM:...]`` prefix for consistency with the
 Xiaomi-TabLDM project conventions.
 """
 from __future__ import annotations
 
-import math
-import itertools
-import re
 import warnings
-from pathlib import Path
 import multiprocessing as mp
 from collections import OrderedDict
-from typing import Optional, List, Dict, Any
+from pathlib import Path
+from typing import Optional, List, Dict
 
 import numpy as np
 import torch
 
 from sklearn.base import ClassifierMixin
-from sklearn.compose import ColumnTransformer
-from sklearn.decomposition import TruncatedSVD, PCA
-from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.validation import check_is_fitted
 from sklearn.utils.multiclass import check_classification_targets
-from sklearn.preprocessing import LabelEncoder
 
-from scipy.optimize import nnls as _scipy_nnls, minimize as _scipy_minimize
-from scipy.special import expit as _expit, erfinv as _erfinv
+from scipy.optimize import nnls as _scipy_nnls
 
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import LocalEntryNotFoundError
@@ -56,11 +49,6 @@ from .base import TabLDMBaseEstimator, _clear_cuda_cache
 from .preprocessing import (
     TransformToNumerical,
     EnsembleGenerator,
-    UniqueFeatureFilter,
-    GaussianRankNormalizer,
-    GaussianRankGenerator,
-    PCADecorrelator,
-    InteractionAugmentor,
     PipelineEnsemble,
     default_classifier_pipeline_specs,
     large_classifier_pipeline_specs,
@@ -74,58 +62,16 @@ from tabldm._model.kv_cache import TabLDMCache
 
 
 # ---------------------------------------------------------------------------
-# Adaptive inference config routing (ported from MiTab reference).
-# ---------------------------------------------------------------------------
-
-_ADAPTIVE_DEFAULT_NORMS = ["none", "power"]
-_ADAPTIVE_ENS4_NORMS = ["none", "power", "quantile", "robust"]
-
-
-def _get_adaptive_inference_config(n_features, n_num, enable_augmentations=False):
-    """Dataset-size routing for adaptive_plus candidate group."""
-    if n_features <= 10 and n_num >= 2:
-        cfg = {"use_svd": True, "svd_n_components": 10, "n_estimators": 16,
-               "norm_methods": list(_ADAPTIVE_ENS4_NORMS)}
-    elif n_features <= 10 and n_num < 2:
-        cfg = {"use_svd": False, "n_estimators": 16, "norm_methods": list(_ADAPTIVE_ENS4_NORMS)}
-    elif n_features <= 50:
-        cfg = {"use_svd": False, "n_estimators": 32, "norm_methods": list(_ADAPTIVE_DEFAULT_NORMS)}
-    else:
-        cfg = {"use_svd": True, "svd_n_components": 10, "n_estimators": 16,
-               "norm_methods": list(_ADAPTIVE_ENS4_NORMS)}
-
-    if enable_augmentations:
-        cfg["use_pca_decorr"] = n_num >= 15 and n_features >= 20
-        cfg["use_interactions"] = n_features <= 5 and n_num >= 2
-    return cfg
-
-
-def _multiclass_conservative_weights(weights: dict[str, float]) -> dict[str, float]:
-    """Increase default weight by .10 and scale other active groups down."""
-    result = dict(weights)
-    non_default = sum(value for name, value in result.items() if name != "default")
-    if non_default <= 0:
-        return result
-    increase = min(0.10, non_default)
-    result["default"] = result.get("default", 0.0) + increase
-    scale = (non_default - increase) / non_default
-    for name in result:
-        if name != "default":
-            result[name] *= scale
-    return result
-
-
-# ---------------------------------------------------------------------------
 # Enhanced Classifier
 # ---------------------------------------------------------------------------
 
 class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
     """TabLDM Classifier with inference enhancement.
 
-    Supports multi-group candidate ensembling, NNLS weight learning,
-    probability calibration, and other inference-time enhancements. When
-    ``enhance_candidates=False`` (default), these enhancements are skipped
-    and the estimator runs the plain single-group inference path.
+    When ``enhance_candidates=True``, fits a conservative LimiX pipeline
+    ensemble and learns holdout NNLS weights. When
+    ``enhance_candidates=False``, runs the plain single-group inference
+    path with no ensembling enhancements.
 
     Parameters
     ----------
@@ -139,8 +85,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         Feature permutation strategy.
 
     class_shuffle_method : str, default='shift'
-        Class label permutation strategy (main group only; enhanced groups
-        always use ``"none"``).
+        Class label permutation strategy for the plain ensemble group.
 
     outlier_threshold : float, default=4.0
         Z-score threshold for outlier detection.
@@ -204,59 +149,30 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
     cat_random_encode : bool, default=False
         Randomly permute categorical codes per ensemble member.
 
-    enhance_candidates : bool, default=False
-        Master switch for inference enhancement. When False, runs the plain
-        single-group inference path with no ensembling enhancements.
-
-    n_quantile_estimators : int, default=16
-        Number of quantile_safe candidates.
-
-    use_cross_feature : bool, default=True
-        Append SVD + cross features to odd-indexed main candidates.
+    enhance_candidates : bool, default=True
+        Master switch for inference enhancement. When True, fits a
+        conservative LimiX pipeline ensemble and learns holdout NNLS
+        weights. When False, runs the plain single-group inference path
+        with no ensembling enhancements.
 
     validation : bool, default=True
-        Enable NNLS weight learning via validation.
+        Enable NNLS weight learning via a single holdout split.
 
-    k_fold : bool, default=True
-        Use StratifiedKFold OOF for NNLS.
+    pipeline_specs : tuple or None, default=None
+        Explicit LimiX pipeline member specs. When None, the default (or
+        large-dataset) classifier spec set is used and then filtered to the
+        conservative safe subset.
 
-    n_splits : int, default=5
-        Number of OOF folds.
+    validation_size : float, default=0.2
+        Holdout fraction used for NNLS weight learning.
 
-    use_svd_ens : bool, default=True
-        Enable SVD feature ensemble group.
+    nnls_min_samples : int, default=2000
+        Minimum training rows required before NNLS is attempted; smaller
+        datasets fall back to equal member weights.
 
-    n_svd_ens_estimators : int, default=16
-        Number of SVD ensemble candidates.
-
-    svd_ens_norm_methods : list[str] or None, default=None
-        Normalizations for SVD ensemble group.
-
-    svd_ens_n_components : int, default=10
-        Number of SVD components.
-
-    use_adaptive_plus_candidate : bool, default=True
-        Enable adaptive_plus candidate group.
-
-    adaptive_plus_enable_augmentations : bool, default=True
-        Enable PCA decorrelation and interaction augmentation in adaptive_plus.
-
-    enable_calibration : bool, default=True
-        Enable probability calibration.
-
-    calibration_lambda : float, default=1e-2
-        Regularization for calibration.
-
-    use_gaussian_rank_ens : bool, default=True
-        Enable Gaussian rank normalization ensemble.
-
-    n_gaussian_rank_estimators : int, default=16
-        Number of Gaussian rank candidates.
-
-    adaptive_enhancement : bool, default=True
-        When ``enhance_candidates=True``, select the documented no-K-Fold,
-        fixed-weight enhancement plan from post-filter feature composition.
-        Set to False to preserve manually supplied enhancement settings.
+    pipeline_chunk_rows : int or None, default=None
+        Query rows per forward chunk for each pipeline member. None keeps
+        the whole query set in one chunk.
     """
 
     def __init__(
@@ -266,7 +182,6 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         norm_methods: Optional[str | List[str]] = None,
         feat_shuffle_method: str = "random",
         class_shuffle_method: str = "shift",
-        max_num_features: Optional[int] = 300,
         outlier_threshold: float = 4.0,
         softmax_temperature: float = 0.9,
         average_logits: bool = True,
@@ -289,22 +204,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         cat_random_encode: bool = False,
         # -- enhancement parameters --
         enhance_candidates: bool = True,
-        n_quantile_estimators: int = 0,
-        use_cross_feature: bool = True,
         validation: bool = True,
-        k_fold: bool = True,
-        n_splits: int = 5,
-        use_svd_ens: bool = False,
-        n_svd_ens_estimators: int = 16,
-        svd_ens_norm_methods: Optional[List[str]] = ["none", "power", "quantile", "robust"],
-        svd_ens_n_components: int = 10,
-        use_adaptive_plus_candidate: bool = True,
-        adaptive_plus_enable_augmentations: bool = True,
-        enable_calibration: bool = True,
-        calibration_lambda: float = 1e-2,
-        use_gaussian_rank_ens: bool = True,
-        n_gaussian_rank_estimators: int = 16,
-        adaptive_enhancement: bool = True,
         pipeline_specs=None,
         validation_size: float = 0.2,
         nnls_min_samples: int = 2000,
@@ -315,7 +215,6 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.norm_methods = norm_methods
         self.feat_shuffle_method = feat_shuffle_method
         self.class_shuffle_method = class_shuffle_method
-        self.max_num_features = max_num_features
         self.outlier_threshold = outlier_threshold
         self.softmax_temperature = softmax_temperature
         self.average_logits = average_logits
@@ -338,167 +237,11 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.cat_random_encode = cat_random_encode
         # enhancement
         self.enhance_candidates = enhance_candidates
-        self.n_quantile_estimators = n_quantile_estimators
-        self.use_cross_feature = use_cross_feature
         self.validation = validation
-        self.k_fold = k_fold
-        self.n_splits = n_splits
-        self.use_svd_ens = use_svd_ens
-        self.n_svd_ens_estimators = n_svd_ens_estimators
-        self.svd_ens_norm_methods = svd_ens_norm_methods or ["none", "power", "quantile", "robust"]
-        self.svd_ens_n_components = svd_ens_n_components
-        self.use_adaptive_plus_candidate = use_adaptive_plus_candidate
-        self.adaptive_plus_enable_augmentations = adaptive_plus_enable_augmentations
-        self.enable_calibration = enable_calibration
-        self.calibration_lambda = calibration_lambda
-        self.use_gaussian_rank_ens = use_gaussian_rank_ens
-        self.n_gaussian_rank_estimators = n_gaussian_rank_estimators
-        self.adaptive_enhancement = adaptive_enhancement
         self.pipeline_specs = pipeline_specs
         self.validation_size = validation_size
         self.nnls_min_samples = nnls_min_samples
         self.pipeline_chunk_rows = pipeline_chunk_rows
-
-    # ==================================================================
-    # Adaptive no-K-Fold enhancement routing
-    # ==================================================================
-
-    @staticmethod
-    def _adaptive_enhancement_config(
-        n_train: int, n_features: int, n_num: int, n_cat: int, n_classes: int
-    ) -> dict[str, Any]:
-        """Return the documented fixed-weight classification enhancement plan."""
-        cat_ratio = n_cat / max(n_features, 1)
-        dim_ratio = n_features / max(n_train, 1)
-
-        def _plan(branch, groups):
-            return {
-                "branch": branch,
-                "n_train": n_train,
-                "n_features": n_features,
-                "n_num": n_num,
-                "n_cat": n_cat,
-                "n_classes": n_classes,
-                "cat_ratio": cat_ratio,
-                "dim_ratio": dim_ratio,
-                "groups": groups,
-                "validation": False,
-                "k_fold": False,
-                "enable_calibration": False,
-                "use_cross_feature": False,
-            }
-
-        if cat_ratio >= 0.80:
-            if cat_ratio >= 0.95:
-                groups = {"default": (8, 0.80), "quantile_safe": (4, 0.20)}
-            else:
-                groups = {"default": (8, 0.70), "quantile_safe": (8, 0.30)}
-            return _plan("P-CAT", groups)
-        if cat_ratio >= 0.70 and n_features >= 20:
-            return _plan("P-MIX", {
-                "default": (8, 0.55),
-                "quantile_safe": (8, 0.20),
-                "gaussian_rank": (8, 0.15),
-                "adaptive_plus": (8, 0.10),
-            })
-        if n_train < 1_200 or dim_ratio > 0.10:
-            weights = (0.80, 0.10, 0.10) if dim_ratio > 0.20 else (0.70, 0.15, 0.15)
-            return _plan("P0", {
-                "default": (8, weights[0]),
-                "quantile_safe": (4, weights[1]),
-                "gaussian_rank": (4, weights[2]),
-            })
-        if n_train < 2_000:
-            return _plan("P1", {
-                "default": (8, 0.60),
-                "quantile_safe": (8, 0.20),
-                "gaussian_rank": (8, 0.20),
-            })
-        if n_train < 15_000 and n_features <= 50:
-            groups = {
-                "default": (8, 0.45),
-                "quantile_safe": (8, 0.20),
-                "adaptive_plus": (16, 0.25),
-                "gaussian_rank": (8, 0.10),
-            }
-            if n_classes >= 5:
-                groups = {
-                    "default": (8, 0.55),
-                    "quantile_safe": (4, 0.15),
-                    "adaptive_plus": (8, 0.20),
-                    "gaussian_rank": (4, 0.10),
-                }
-            return _plan("P2", groups)
-        if n_train < 15_000:
-            if dim_ratio > 0.10:
-                groups = {
-                    "default": (8, 0.60),
-                    "quantile_safe": (4, 0.15),
-                    "svd_ens": (4, 0.15),
-                    "gaussian_rank": (4, 0.10),
-                }
-            else:
-                groups = {
-                    "default": (8, 0.45),
-                    "quantile_safe": (8, 0.15),
-                    "svd_ens": (8, 0.20),
-                    "adaptive_plus": (8, 0.10),
-                    "gaussian_rank": (8, 0.10),
-                }
-            if n_classes >= 5:
-                weights = _multiclass_conservative_weights(
-                    {name: weight for name, (_, weight) in groups.items()}
-                )
-                groups = {name: (count, weights[name]) for name, (count, _) in groups.items()}
-            return _plan("P3", groups)
-        groups = {
-            "default": (8, 0.35),
-            "quantile_safe": (16, 0.20),
-            "svd_ens": (16, 0.20),
-            "adaptive_plus": (16, 0.15),
-            "gaussian_rank": (16, 0.10),
-        }
-        if n_classes >= 5:
-            weights = _multiclass_conservative_weights(
-                {name: weight for name, (_, weight) in groups.items()}
-            )
-            groups = {name: (count, weights[name]) for name, (count, _) in groups.items()}
-        return _plan("P4", groups)
-
-    def _configure_adaptive_enhancement(
-        self, n_train: int, n_features: int, n_num: int, n_cat: int
-    ) -> None:
-        """Apply a fixed classification plan and record the routing decision."""
-        config = self._adaptive_enhancement_config(
-            n_train, n_features, n_num, n_cat, self.n_classes_
-        )
-        groups = dict(config["groups"])
-        if n_num == 0:
-            groups.pop("quantile_safe", None)
-            groups.pop("gaussian_rank", None)
-        if n_num == 0 or config["branch"] in {"P-CAT", "P-MIX"}:
-            groups.pop("svd_ens", None)
-        if config["branch"] in {"P-CAT", "P-MIX"}:
-            groups.pop("adaptive_plus", None)
-
-        self.n_estimators = groups.get("default", (0, 0.0))[0]
-        self.n_quantile_estimators = groups.get("quantile_safe", (0, 0.0))[0]
-        self.use_svd_ens = "svd_ens" in groups
-        self.n_svd_ens_estimators = groups.get("svd_ens", (0, 0.0))[0]
-        self.use_adaptive_plus_candidate = "adaptive_plus" in groups
-        self.use_gaussian_rank_ens = "gaussian_rank" in groups
-        self.n_gaussian_rank_estimators = groups.get("gaussian_rank", (0, 0.0))[0]
-        self.validation = config["validation"]
-        self.k_fold = config["k_fold"]
-        self.enable_calibration = config["enable_calibration"]
-        self.use_cross_feature = config["use_cross_feature"]
-        self.adaptive_group_weights_ = {name: weight for name, (_, weight) in groups.items()}
-        self.adaptive_enhancement_config_ = {**config, "enabled_groups": groups}
-        print(
-            f"[TabLDM:enhance] adaptive routing: branch={config['branch']}, "
-            f"n_train={n_train}, n_features={n_features}, n_num={n_num}, n_cat={n_cat}, "
-            f"groups={groups}"
-        )
 
     # ==================================================================
     # Model loading (MoE architecture)
@@ -630,8 +373,9 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
     def fit(self, X: np.ndarray, y: np.ndarray) -> "TabLDMClassifier":
         """Fit the classifier to training data.
 
-        When ``enhance_candidates=True``, fits multiple candidate generators
-        and optionally learns NNLS ensemble weights via validation/OOF.
+        When ``enhance_candidates=True``, fits a conservative LimiX pipeline
+        ensemble and learns holdout NNLS weights. When False, fits the plain
+        single-group ensemble generator.
         """
         if y is None:
             raise ValueError("This classifier requires y to be passed, but the target y is None.")
@@ -684,15 +428,12 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         # Initialize enhancement state
         self.nnls_weights_ = None
-        self.nnls_valid_candidate_mask_ = None
-        self.calibration_params_ = None
 
         if self.enhance_candidates:
             self._fit_pipeline_enhancement(X, y)
             self.n_features_in_ = X.shape[1]
         else:
             # Original single-generator path
-            self.feat_sample_indices_ = None
             self.ensemble_generator_ = EnsembleGenerator(
                 classification=True,
                 n_estimators=self.n_estimators,
@@ -754,15 +495,6 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         """Fit conservative LimiX member views and learn one holdout NNLS ensemble."""
         if not 0 < self.validation_size < 1:
             raise ValueError("validation_size must be in (0, 1)")
-        if self.enable_calibration:
-            warnings.warn(
-                "enable_calibration is not supported by the LimiX pipeline ensemble; ignoring it.",
-                UserWarning,
-                stacklevel=2,
-            )
-        self.calibration_params_ = None
-        self._cal_P_ = None
-        self._cal_y_ = None
         default_specs = default_classifier_pipeline_specs()
         if self.pipeline_specs is not None:
             source_specs = tuple(self.pipeline_specs)
@@ -883,9 +615,6 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         if weights is None or len(weights) != len(self.pipeline_members_):
             weights = np.full(len(self.pipeline_members_), 1 / len(self.pipeline_members_), dtype=np.float64)
         self.nnls_weights_ = weights
-        self.nnls_valid_candidate_mask_ = np.array(
-            [index in self.nnls_valid_member_indices_ for index in range(len(self.pipeline_specs_))], dtype=bool,
-        )
         self.ensemble_generator_ = None
 
     def _pipeline_member_probabilities(self, member, X: np.ndarray) -> np.ndarray:
@@ -915,6 +644,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             outputs.append(member.inverse_class_probabilities(raw))
         return np.concatenate(outputs, axis=0) if outputs else np.empty((0, self.n_classes_))
 
+    def _build_kv_cache(self) -> None:
         """Pre-compute KV caches for training data across all ensemble batches."""
         train_data = self.ensemble_generator_.transform(X=None, mode="train")
         self.model_kv_cache_ = OrderedDict()
@@ -944,382 +674,15 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             self.model_kv_cache_[norm_method] = TabLDMCache.concat(caches)
 
     # ==================================================================
-    # Adaptive-plus structure freeze (Group 7)
-    # ==================================================================
-
-    def _freeze_adaptive_plus_structure(self, X: np.ndarray) -> None:
-        """Freeze adaptive_plus routing config using full X (no y, no leakage)."""
-        n_features = X.shape[1]
-        try:
-            n_num = int(np.sum([
-                not np.issubdtype(X[:, c].dtype, np.integer) and
-                len(np.unique(X[:, c])) > 10
-                for c in range(n_features)
-            ]))
-        except Exception:
-            n_num = n_features
-
-        cfg = _get_adaptive_inference_config(
-            n_features, n_num,
-            enable_augmentations=self.adaptive_plus_enable_augmentations,
-        )
-
-        use_pca = cfg.get("use_pca_decorr", False)
-        pca_active = False
-        if use_pca:
-            probe = PCADecorrelator()
-            probe.fit(X)
-            pca_active = bool(probe.active_)
-
-        use_ia = cfg.get("use_interactions", False)
-        ia_active = False
-        if use_ia:
-            ia_probe = InteractionAugmentor()
-            ia_probe.fit(X)
-            ia_active = bool(ia_probe.active_)
-
-        self.adaptive_plus_structure_ = {
-            "n_estimators": int(cfg["n_estimators"]),
-            "norm_methods": list(cfg["norm_methods"]),
-            "use_svd": bool(cfg.get("use_svd", False)),
-            "svd_n_components": cfg.get("svd_n_components", None),
-            "use_pca_decorr": use_pca,
-            "pca_active": pca_active,
-            "use_interactions": use_ia,
-            "ia_active": ia_active,
-        }
-        print(
-            f"[TabLDM:adaptive_plus] frozen structure: "
-            f"n_estimators={self.adaptive_plus_structure_['n_estimators']}, "
-            f"norm_methods={self.adaptive_plus_structure_['norm_methods']}, "
-            f"use_svd={self.adaptive_plus_structure_['use_svd']}, "
-            f"pca_active={pca_active}, ia_active={ia_active}"
-        )
-
-    # ==================================================================
-    # Enhanced X-side candidate generation
-    # ==================================================================
-
-    def _fit_enhanced_generators(self, X: np.ndarray, y: np.ndarray) -> None:
-        """Fit main + optional SVD/cross + quantile_safe + svd_ens + adaptive_plus + gaussian_rank generators."""
-        norm_methods = self.norm_methods or ["none", "power"]
-
-        # ---- main group (default candidates) ----
-        self.ensemble_generator_ = EnsembleGenerator(
-            classification=True,
-            n_estimators=self.n_estimators,
-            norm_methods=norm_methods,
-            feat_shuffle_method=self.feat_shuffle_method,
-            class_shuffle_method=self.class_shuffle_method,
-            outlier_threshold=self.outlier_threshold,
-            random_state=self.random_state,
-            cat_random_encode=self.cat_random_encode,
-            categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
-        )
-        self.ensemble_generator_.fit(X, y)
-
-        # ---- SVD + feature-crossing augmentation ----
-        self.svd_ = None
-        if self.n_estimators == 32 and sorted(norm_methods) == ["none", "power"]:
-            self._fit_svd_cross(self.ensemble_generator_.X_)
-
-        # ---- quantile_safe group ----
-        self.quantile_ensemble_generator_ = None
-        if self.n_quantile_estimators and self.n_quantile_estimators > 0:
-            self.quantile_ensemble_generator_ = EnsembleGenerator(
-                classification=True,
-                n_estimators=self.n_quantile_estimators,
-                norm_methods=["quantile"],
-                feat_shuffle_method=self.feat_shuffle_method,
-                class_shuffle_method=self.class_shuffle_method,
-                outlier_threshold=self.outlier_threshold,
-                random_state=self.random_state,
-                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
-            )
-            self.quantile_ensemble_generator_.fit(X, y)
-
-        # ---- Group 6: SVD feature ensemble ("svd+") ----
-        self.svd_ens_generator_ = None
-        if self.use_svd_ens and self.n_svd_ens_estimators and self.n_svd_ens_estimators > 0:
-            self.svd_ens_generator_ = EnsembleGenerator(
-                classification=True,
-                n_estimators=self.n_svd_ens_estimators,
-                norm_methods=self.svd_ens_norm_methods,
-                feat_shuffle_method=self.feat_shuffle_method,
-                class_shuffle_method=self.class_shuffle_method,
-                outlier_threshold=self.outlier_threshold,
-                random_state=self.random_state,
-                use_svd=True,
-                svd_n_components=self.svd_ens_n_components,
-            )
-            self.svd_ens_generator_.fit(X, y)
-
-        # ---- Group 7: adaptive_plus candidate ----
-        self.adaptive_plus_generator_ = None
-        self.adaptive_plus_pca_decorr_ = None
-        self.adaptive_plus_interaction_ = None
-        if self.use_adaptive_plus_candidate:
-            s = self.adaptive_plus_structure_
-            X_ap = X.copy()
-            if s["use_pca_decorr"]:
-                pca_d = PCADecorrelator()
-                pca_d.fit(X_ap)
-                if s["pca_active"] and pca_d.active_:
-                    X_ap = pca_d.transform(X_ap)
-                    self.adaptive_plus_pca_decorr_ = pca_d
-                elif s["pca_active"] and not pca_d.active_:
-                    self.adaptive_plus_pca_decorr_ = pca_d
-            if s["use_interactions"]:
-                ia = InteractionAugmentor()
-                ia.fit(X_ap)
-                if s["ia_active"] and ia.active_:
-                    X_ap = ia.transform(X_ap)
-                    self.adaptive_plus_interaction_ = ia
-                elif s["ia_active"] and not ia.active_:
-                    self.adaptive_plus_interaction_ = ia
-            gen_kwargs = dict(
-                classification=True,
-                n_estimators=s["n_estimators"],
-                norm_methods=s["norm_methods"],
-                feat_shuffle_method=self.feat_shuffle_method,
-                class_shuffle_method=self.class_shuffle_method,
-                outlier_threshold=self.outlier_threshold,
-                random_state=self.random_state,
-                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
-            )
-            if s["use_svd"]:
-                gen_kwargs["use_svd"] = True
-                if s["svd_n_components"] is not None:
-                    gen_kwargs["svd_n_components"] = s["svd_n_components"]
-            self.adaptive_plus_generator_ = EnsembleGenerator(**gen_kwargs)
-            self.adaptive_plus_generator_.fit(X_ap, y)
-
-        # ---- Group 8: Gaussian rank normalization ensemble ----
-        self.gaussian_rank_generator_ = None
-        if self.use_gaussian_rank_ens and self.n_gaussian_rank_estimators and self.n_gaussian_rank_estimators > 0:
-            self.gaussian_rank_generator_ = GaussianRankGenerator(
-                n_estimators=self.n_gaussian_rank_estimators,
-                feat_shuffle_method="random",
-                random_state=self.random_state,
-                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
-            )
-            self.gaussian_rank_generator_.fit(X, y)
-
-        # ---- Freeze effective view counts ----
-        def _count_views(gen):
-            if gen is None:
-                return 0
-            return sum(len(v) for v in gen.ensemble_configs_.values())
-
-        self._frozen_main_views_ = _count_views(self.ensemble_generator_)
-        self._frozen_q_views_ = _count_views(getattr(self, "quantile_ensemble_generator_", None))
-        self._frozen_svd_ens_views_ = _count_views(getattr(self, "svd_ens_generator_", None))
-        self._frozen_ap_views_ = _count_views(getattr(self, "adaptive_plus_generator_", None))
-        self._frozen_gr_views_ = _count_views(getattr(self, "gaussian_rank_generator_", None))
-
-        _use_augment = getattr(self, "svd_", None) is not None and self.n_estimators == 32
-        if _use_augment:
-            self._frozen_plain_views_ = self._frozen_main_views_ // 2
-            self._frozen_cross_svd_views_ = self._frozen_main_views_ - self._frozen_plain_views_
-        else:
-            self._frozen_plain_views_ = self._frozen_main_views_
-            self._frozen_cross_svd_views_ = 0
-
-        print(
-            f"[TabLDM:enhance] generators fitted: "
-            f"requested_n_estimators=(main={self.n_estimators}, "
-            f"q={self.n_quantile_estimators or 0}, "
-            f"ap={self.adaptive_plus_structure_['n_estimators'] if self.use_adaptive_plus_candidate else 0}, "
-            f"gr={self.n_gaussian_rank_estimators or 0}), "
-            f"frozen_effective_n=(main={self._frozen_main_views_}, "
-            f"plain={self._frozen_plain_views_}, cross_svd={self._frozen_cross_svd_views_}, "
-            f"quantile_safe={self._frozen_q_views_}, svd_ens(group6)={self._frozen_svd_ens_views_}, "
-            f"adaptive_plus(group7)={self._frozen_ap_views_}, gaussian_rank(group8)={self._frozen_gr_views_}), "
-            f"svd/cross={'on' if getattr(self, 'svd_', None) is not None else 'off'}, "
-            f"use_cross_feature={self.use_cross_feature}"
-        )
-
-    # ==================================================================
-    # SVD + cross feature fitting
-    # ==================================================================
-
-    def _fit_svd_cross(self, X_raw: np.ndarray) -> None:
-        """Fit SVD pipeline and build crossing pool on unique-filtered raw training features."""
-        rng = np.random.default_rng(self.random_state)
-        n_train, n_orig = X_raw.shape
-
-        is_cat = np.array(
-            [np.issubdtype(X_raw[:, c].dtype, np.integer) or len(np.unique(X_raw[:, c])) <= 10
-             for c in range(n_orig)],
-            dtype=bool,
-        )
-        num_idx = np.where(~is_cat)[0]
-        cat_idx = np.where(is_cat)[0]
-
-        k = max(1, int(math.sqrt(n_orig)))
-        self._k_ = k
-
-        # ---- Crossing pool (numerical cols only) ----
-        if not self.use_cross_feature:
-            self._cross_pool_ = []
-            self._cross_scaler_ = None
-            self._cross_pool_train_ = np.empty((n_train, 0), dtype=np.float32)
-        elif len(num_idx) >= 2:
-            all_pairs = list(itertools.combinations(num_idx.tolist(), 2))
-            cross_pool_size = min(16 * k, len(all_pairs))
-            pool_sel = rng.choice(len(all_pairs), size=cross_pool_size, replace=False)
-            self._cross_pool_ = [all_pairs[i] for i in pool_sel]
-            cross_mat = np.stack(
-                [X_raw[:, i].astype(float) * X_raw[:, j].astype(float) for i, j in self._cross_pool_],
-                axis=1,
-            )
-            self._cross_scaler_ = StandardScaler()
-            self._cross_pool_train_ = self._cross_scaler_.fit_transform(cross_mat).clip(-100, 100)
-        else:
-            self._cross_pool_ = []
-            self._cross_scaler_ = None
-            self._cross_pool_train_ = np.empty((n_train, 0), dtype=np.float32)
-
-        self._cross_selections_ = []
-        for _ in range(16):
-            n_sel = min(k, len(self._cross_pool_))
-            if n_sel > 0:
-                sel = rng.choice(len(self._cross_pool_), size=n_sel, replace=False).tolist()
-            else:
-                sel = []
-            self._cross_selections_.append(sel)
-
-        # ---- SVD pool ----
-        if len(cat_idx) > 0 and len(num_idx) > 0:
-            svd_pre = ColumnTransformer(
-                [("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_idx.tolist()),
-                 ("num", StandardScaler(), num_idx.tolist())],
-                remainder="drop",
-            )
-        elif len(cat_idx) > 0:
-            svd_pre = ColumnTransformer(
-                [("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_idx.tolist())],
-                remainder="drop",
-            )
-        else:
-            svd_pre = ColumnTransformer(
-                [("num", StandardScaler(), num_idx.tolist())],
-                remainder="drop",
-            )
-
-        X_pre = svd_pre.fit_transform(X_raw)
-        n_preprocessed = X_pre.shape[1]
-        svd_pool_size = min(16 * k, min(n_train, n_preprocessed) - 1)
-
-        if svd_pool_size < 1:
-            self.svd_ = None
-            self._svd_pre_ = None
-            self._X_train_svd_ = np.empty((n_train, 0), dtype=np.float32)
-            self._svd_selections_ = [[] for _ in range(16)]
-            return
-
-        svd = TruncatedSVD(n_components=svd_pool_size, random_state=self.random_state)
-        self._svd_pre_ = svd_pre
-        self.svd_ = svd
-        self._X_train_svd_ = svd.fit_transform(X_pre).clip(-100, 100).astype(np.float32)
-
-        self._svd_selections_ = []
-        for _ in range(16):
-            n_sel = min(k, svd_pool_size)
-            sel = rng.choice(svd_pool_size, size=n_sel, replace=False).tolist()
-            self._svd_selections_.append(sel)
-
-    def _augment_estimator(self, X_preprocessed, raw_X, odd_local, is_train):
-        """Append selected cross and SVD features to preprocessed features."""
-        parts = [X_preprocessed]
-
-        cross_sel = self._cross_selections_[odd_local]
-        if cross_sel:
-            if is_train:
-                cross_feats = self._cross_pool_train_[:, cross_sel].astype(np.float32)
-            else:
-                all_cross_mat = np.stack(
-                    [raw_X[:, i].astype(float) * raw_X[:, j].astype(float)
-                     for i, j in self._cross_pool_],
-                    axis=1,
-                )
-                all_cross_scaled = self._cross_scaler_.transform(all_cross_mat).clip(-100, 100)
-                cross_feats = all_cross_scaled[:, cross_sel].astype(np.float32)
-            parts.append(cross_feats)
-
-        svd_sel = self._svd_selections_[odd_local]
-        if svd_sel and getattr(self, "svd_", None) is not None:
-            if is_train:
-                svd_feats = self._X_train_svd_[:, svd_sel]
-            else:
-                svd_feats = self.svd_.transform(self._svd_pre_.transform(raw_X))[:, svd_sel].clip(-100, 100).astype(np.float32)
-            parts.append(svd_feats)
-
-        return np.concatenate(parts, axis=1) if len(parts) > 1 else X_preprocessed
-
-    # ==================================================================
     # Forward helpers
     # ==================================================================
-
-    def _forward_candidates(
-        self, Xs: np.ndarray, ys: np.ndarray, feat_indices: Optional[List[np.ndarray]] = None
-    ) -> np.ndarray:
-        """Forward a batch of ensemble members and return per-estimator probabilities."""
-        n_bad_xs = int(np.sum(~np.isfinite(Xs)))
-        if n_bad_xs > 0:
-            print(
-                f"[TabLDM:forward_candidates] WARNING: transformed input Xs has "
-                f"{n_bad_xs}/{Xs.size} non-finite values (shape={Xs.shape})"
-            )
-
-        if feat_indices is not None:
-            Xs = np.stack(
-                [Xs[i][:, feat_indices[i]] for i in range(Xs.shape[0])], axis=0
-            )
-
-        batch_size = self.batch_size_ or Xs.shape[0]
-        n_batches = int(np.ceil(Xs.shape[0] / batch_size))
-        Xs_split = np.array_split(Xs, n_batches)
-        ys_split = np.array_split(ys, n_batches)
-
-        outputs = []
-        for X_batch, y_batch in zip(Xs_split, ys_split):
-            X_batch = torch.from_numpy(X_batch).float().to(self.device_)
-            y_batch = torch.from_numpy(y_batch).float().to(self.device_)
-            with torch.no_grad():
-                out = self.model_(
-                    X=X_batch,
-                    y_train=y_batch,
-                    feature_shuffles=None,
-                    return_logits=True,
-                    softmax_temperature=self.softmax_temperature,
-                    inference_config=self.inference_config_,
-                )
-            raw = out.float().cpu().numpy()
-            n_bad_logits = int(np.sum(~np.isfinite(raw)))
-            if n_bad_logits > 0:
-                print(
-                    f"[TabLDM:forward_candidates] WARNING: raw model output has "
-                    f"{n_bad_logits}/{raw.size} non-finite values (batch_shape={raw.shape})"
-                )
-            outputs.append(raw)
-
-        logits = np.concatenate(outputs, axis=0)
-        probs = self.softmax(logits, axis=-1, temperature=self.softmax_temperature)
-        n_bad_probs = int(np.sum(~np.isfinite(probs)))
-        if n_bad_probs > 0:
-            print(
-                f"[TabLDM:forward_candidates] WARNING: final probs has "
-                f"{n_bad_probs}/{probs.size} non-finite values after softmax (shape={probs.shape})"
-            )
-        return probs
 
     def _batch_forward(
         self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """Process model forward passes in batches."""
         batch_size = self.batch_size_ or Xs.shape[0]
-        n_batches = np.ceil(Xs.shape[0] / batch_size)
+        n_batches = int(np.ceil(Xs.shape[0] / batch_size))
         Xs = np.array_split(Xs, n_batches)
         ys = np.array_split(ys, n_batches)
         if feature_shuffles is None:
@@ -1370,809 +733,6 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             outputs.append(out.float().cpu().numpy())
         return np.concatenate(outputs, axis=0)
 
-    # ==================================================================
-    # Candidate probability collection
-    # ==================================================================
-
-    def _collect_candidate_probs(
-        self,
-        X: np.ndarray,
-        main_gen: EnsembleGenerator,
-        q_gen: Optional[EnsembleGenerator],
-        svd_ens_gen: Optional[EnsembleGenerator] = None,
-        adaptive_plus_gen: Optional[EnsembleGenerator] = None,
-        adaptive_plus_pca: Optional[PCADecorrelator] = None,
-        adaptive_plus_ia: Optional[InteractionAugmentor] = None,
-        gaussian_rank_gen=None,
-        tag: str = "predict",
-    ) -> tuple:
-        """Collect per-estimator probabilities in canonical candidate order."""
-        all_probs = []
-        _fold_label = getattr(self, "_current_fold_label_", "")
-
-        def _check_and_log_finite(group_probs, mode_name, est_offset):
-            n_est = group_probs.shape[0]
-            valid = np.ones(n_est, dtype=bool)
-            for i in range(n_est):
-                p = group_probs[i]
-                if np.all(np.isfinite(p)):
-                    continue
-                valid[i] = False
-                bad_mask = ~np.isfinite(p)
-                n_bad = int(bad_mask.sum())
-                bad_rows, bad_cols = np.where(bad_mask)
-                print(
-                    f"[TabLDM:finite_check{_fold_label}] DISCARD "
-                    f"mode={mode_name} estimator={est_offset + i} "
-                    f"prob_shape={p.shape} n_nonfinite={n_bad}"
-                )
-            return valid
-
-        fsi = getattr(self, "feat_sample_indices_", None)
-
-        # ---- main group ----
-        data = main_gen.transform(X, mode="both")
-        use_augment = getattr(self, "svd_", None) is not None and self.n_estimators == 32
-        if use_augment:
-            X_raw_test = main_gen.unique_filter_.transform(X)
-            X_raw_train = main_gen.X_
-            global_est_idx = 0
-            odd_local = 0
-            for norm_method, (Xs_both, ys) in data.items():
-                n_est_this_method = Xs_both.shape[0]
-                n_train_rows = ys.shape[1]
-
-                even_idxs, odd_idxs, odd_locals = [], [], []
-                even_global, odd_global = [], []
-                for local in range(n_est_this_method):
-                    if global_est_idx % 2 == 0:
-                        even_idxs.append(local)
-                        even_global.append(global_est_idx)
-                    else:
-                        odd_idxs.append(local)
-                        odd_locals.append(odd_local)
-                        odd_global.append(global_est_idx)
-                        odd_local += 1
-                    global_est_idx += 1
-
-                per_est_probs = {}
-                if even_idxs:
-                    fi = [fsi[g] for g in even_global] if fsi is not None else None
-                    _p = self._forward_candidates(Xs_both[even_idxs], ys[even_idxs], feat_indices=fi)
-                    for i, li in enumerate(even_idxs):
-                        per_est_probs[li] = _p[i]
-                if odd_idxs:
-                    Xs_odd_list = []
-                    for li, ol in zip(odd_idxs, odd_locals):
-                        x_both_i = Xs_both[li]
-                        x_tr = self._augment_estimator(
-                            x_both_i[:n_train_rows], X_raw_train, ol, is_train=True)
-                        x_te = self._augment_estimator(
-                            x_both_i[n_train_rows:], X_raw_test, ol, is_train=False)
-                        Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
-                    Xs_odd = np.stack(Xs_odd_list, axis=0)
-                    fi = [fsi[g] for g in odd_global] if fsi is not None else None
-                    _p = self._forward_candidates(Xs_odd, ys[odd_idxs], feat_indices=fi)
-                    for i, li in enumerate(odd_idxs):
-                        per_est_probs[li] = _p[i]
-
-                stacked = np.stack(
-                    [per_est_probs[li] for li in range(n_est_this_method)], axis=0
-                )
-                if hasattr(main_gen, "class_shuffles_") and norm_method in main_gen.class_shuffles_:
-                    shuffles = main_gen.class_shuffles_[norm_method]
-                    for _si in range(n_est_this_method):
-                        stacked[_si] = stacked[_si][:, shuffles[_si]]
-                all_probs.append(stacked)
-        else:
-            _grp_offset = 0
-            for norm_method, (Xs, ys) in data.items():
-                n_est = Xs.shape[0]
-                fi = [fsi[_grp_offset + i] for i in range(n_est)] if fsi is not None else None
-                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi)
-                if hasattr(main_gen, "class_shuffles_") and norm_method in main_gen.class_shuffles_:
-                    shuffles = main_gen.class_shuffles_[norm_method]
-                    for _si in range(n_est):
-                        probs_arr[_si] = probs_arr[_si][:, shuffles[_si]]
-                all_probs.append(probs_arr)
-                _grp_offset += n_est
-
-        n_main = sum(p.shape[0] for p in all_probs)
-        rep_shape = all_probs[0].shape[1:] if all_probs else (0, 0)
-        print(
-            f"[TabLDM:enhance:{tag}] mode=default n_estimators={n_main} "
-            f"per_estimator_prob_shape=(n_test={rep_shape[0]}, n_classes={rep_shape[1]})"
-        )
-
-        # ---- quantile_safe group ----
-        n_q = 0
-        if q_gen is not None:
-            q_probs = []
-            q_data = q_gen.transform(X, mode="both")
-            _q_offset = n_main
-            for norm_method, (Xs, ys) in q_data.items():
-                n_est = Xs.shape[0]
-                fi = [fsi[_q_offset + i] for i in range(n_est)] if fsi is not None else None
-                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi)
-                if hasattr(q_gen, "class_shuffles_") and norm_method in q_gen.class_shuffles_:
-                    shuffles = q_gen.class_shuffles_[norm_method]
-                    for _si in range(n_est):
-                        probs_arr[_si] = probs_arr[_si][:, shuffles[_si]]
-                q_probs.append(probs_arr)
-                _q_offset += n_est
-            all_probs.extend(q_probs)
-            n_q = sum(p.shape[0] for p in q_probs)
-            print(f"[TabLDM:enhance:{tag}] mode=quantile_safe n_estimators={n_q}")
-
-        # ---- group 6: svd+ ensemble ----
-        n_svd_ens = 0
-        if svd_ens_gen is not None:
-            s_probs = []
-            s_data = svd_ens_gen.transform(X, mode="both")
-            _s_offset = n_main + n_q
-            for norm_method, (Xs, ys) in s_data.items():
-                n_est = Xs.shape[0]
-                fi = [fsi[_s_offset + i] for i in range(n_est)] if fsi is not None else None
-                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi)
-                if hasattr(svd_ens_gen, "class_shuffles_") and norm_method in svd_ens_gen.class_shuffles_:
-                    shuffles = svd_ens_gen.class_shuffles_[norm_method]
-                    for _si in range(n_est):
-                        probs_arr[_si] = probs_arr[_si][:, shuffles[_si]]
-                s_probs.append(probs_arr)
-                _s_offset += n_est
-            all_probs.extend(s_probs)
-            n_svd_ens = sum(p.shape[0] for p in s_probs)
-            print(f"[TabLDM:enhance:{tag}] mode=svd_ens(group6) n_estimators={n_svd_ens}")
-
-        # ---- group 7: adaptive_plus ----
-        n_adaptive = 0
-        if adaptive_plus_gen is not None:
-            X_ap = X
-            if adaptive_plus_pca is not None and getattr(adaptive_plus_pca, "active_", False):
-                X_ap = adaptive_plus_pca.transform(X_ap)
-            if adaptive_plus_ia is not None and getattr(adaptive_plus_ia, "active_", False):
-                X_ap = adaptive_plus_ia.transform(X_ap)
-            ap_probs = []
-            ap_data = adaptive_plus_gen.transform(X_ap, mode="both")
-            _ap_offset = n_main + n_q + n_svd_ens
-            for norm_method, (Xs, ys) in ap_data.items():
-                n_est = Xs.shape[0]
-                fi = [fsi[_ap_offset + i] for i in range(n_est)] if fsi is not None else None
-                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi)
-                if hasattr(adaptive_plus_gen, "class_shuffles_") and norm_method in adaptive_plus_gen.class_shuffles_:
-                    shuffles = adaptive_plus_gen.class_shuffles_[norm_method]
-                    for _si in range(n_est):
-                        probs_arr[_si] = probs_arr[_si][:, shuffles[_si]]
-                ap_probs.append(probs_arr)
-                _ap_offset += n_est
-            all_probs.extend(ap_probs)
-            n_adaptive = sum(p.shape[0] for p in ap_probs)
-            print(f"[TabLDM:enhance:{tag}] mode=adaptive_plus(group7) n_estimators={n_adaptive}")
-
-        # ---- group 8: Gaussian rank ----
-        n_gaussian_rank = 0
-        if gaussian_rank_gen is not None:
-            gr_probs = []
-            gr_data = gaussian_rank_gen.transform(X, mode="both")
-            _gr_offset = n_main + n_q + n_svd_ens + n_adaptive
-            for norm_method, (Xs, ys) in gr_data.items():
-                n_est = Xs.shape[0]
-                fi = [fsi[_gr_offset + i] for i in range(n_est)] if fsi is not None else None
-                gr_probs.append(self._forward_candidates(Xs, ys, feat_indices=fi))
-                _gr_offset += n_est
-            all_probs.extend(gr_probs)
-            n_gaussian_rank = sum(p.shape[0] for p in gr_probs)
-            print(f"[TabLDM:enhance:{tag}] mode=gaussian_rank(group8) n_estimators={n_gaussian_rank}")
-
-        # ---- Per-estimator finite check ----
-        all_probs_concat = np.concatenate(all_probs, axis=0)
-        E_total = all_probs_concat.shape[0]
-
-        _offsets = [0, n_main, n_main + n_q, n_main + n_q + n_svd_ens, n_main + n_q + n_svd_ens + n_adaptive]
-        _group_names = ["default", "quantile_safe", "svd_ens(group6)", "adaptive_plus(group7)", "gaussian_rank(group8)"]
-        _group_sizes = [n_main, n_q, n_svd_ens, n_adaptive, n_gaussian_rank]
-
-        valid_mask = np.ones(E_total, dtype=bool)
-        for _gname, _gstart, _gsize in zip(_group_names, _offsets, _group_sizes):
-            if _gsize == 0:
-                continue
-            _gprobs = all_probs_concat[_gstart: _gstart + _gsize]
-            _gvalid = _check_and_log_finite(_gprobs, _gname, _gstart)
-            valid_mask[_gstart: _gstart + _gsize] = _gvalid
-
-        n_valid = int(valid_mask.sum())
-        n_dropped = E_total - n_valid
-        if n_dropped > 0:
-            print(
-                f"[TabLDM:finite_check{_fold_label}] dropped {n_dropped}/{E_total} "
-                f"non-finite candidates; {n_valid} remaining."
-            )
-        if n_valid == 0:
-            raise RuntimeError(
-                f"[TabLDM:finite_check{_fold_label}] ALL {E_total} candidates produced "
-                "non-finite probabilities; cannot continue."
-            )
-
-        probs = all_probs_concat[valid_mask]
-        return probs, valid_mask, n_main, n_q, n_svd_ens, n_adaptive, n_gaussian_rank
-
-    # ==================================================================
-    # NNLS weight learning
-    # ==================================================================
-
-    @staticmethod
-    def _route_validation(validation, k_fold, n_train, n_val):
-        """Decide which validation path fit() takes."""
-        if not validation:
-            return "default"
-        if not k_fold:
-            return "single_validation" if n_train >= 1000 else "default"
-        return "single_validation" if n_val > 2000 else "kfold"
-
-    def _fit_nnls_weights(self, X: np.ndarray, y: np.ndarray) -> None:
-        """Learn ensemble weights via validation/OOF NNLS."""
-        if not self.validation:
-            print("[TabLDM:nnls] validation disabled -> equal-weight ensemble")
-            return
-
-        n_full = X.shape[0]
-        n_val = math.ceil(0.2 * n_full)
-        route = self._route_validation(self.validation, self.k_fold, n_full, n_val)
-        print(f"[TabLDM:nnls] routing: k_fold={self.k_fold}, n_train={n_full}, n_val={n_val}, path={route}")
-        if route == "default":
-            print("[TabLDM:nnls] routed to default -> equal-weight ensemble")
-            return
-
-        class_counts = np.bincount(y.astype(int), minlength=self.n_classes_)
-        present = class_counts[class_counts > 0]
-        min_class = int(present.min()) if present.size else 0
-        if min_class < 2:
-            print(f"[TabLDM:nnls] smallest class has {min_class} sample(s) (<2); cannot stratify -> equal-weight ensemble")
-            return
-
-        self._current_fold_label_ = ""
-
-        try:
-            if route == "kfold":
-                probs, y_target, valid_mask = self._kfold_oof_probs(X, y, min_class)
-            else:
-                probs, y_target, valid_mask = self._single_val_probs(X, y)
-        except Exception as e:
-            print(f"[TabLDM:nnls] validation collection failed ({e!r}) -> equal-weight ensemble")
-            return
-
-        if probs is None:
-            return
-
-        self.nnls_valid_candidate_mask_ = valid_mask
-
-        weights = self._solve_nnls_classification(probs, y_target)
-        if weights is None:
-            print("[TabLDM:nnls] NNLS could not solve stably -> equal-weight ensemble")
-            return
-
-        self.nnls_weights_ = weights
-        print(
-            f"[TabLDM:nnls] learned ensemble weights: E={weights.shape[0]} "
-            f"(over {int(valid_mask.sum())}/{valid_mask.shape[0]} valid candidates), "
-            f"sum={weights.sum():.6f}"
-        )
-
-        if self.enable_calibration:
-            P_cal = np.einsum("e,enc->nc", weights, probs)
-            row_sums = P_cal.sum(axis=1, keepdims=True)
-            row_sums = np.where(row_sums > 0, row_sums, 1.0)
-            P_cal = P_cal / row_sums
-            self._cal_P_ = P_cal
-            self._cal_y_ = np.asarray(y_target, dtype=np.int64)
-
-    def _kfold_oof_probs(self, X, y, min_class):
-        """StratifiedKFold out-of-fold probability collection."""
-        n_splits = self.n_splits
-        if min_class < n_splits:
-            n_splits = min_class
-            print(f"[TabLDM:nnls] smallest class has {min_class} < requested n_splits={self.n_splits}; reducing to {n_splits}")
-
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
-        print(f"[TabLDM:nnls] StratifiedKFold OOF: n_splits={n_splits}, n_train={X.shape[0]}")
-
-        oof_probs_full = None
-        fold_valid_masks = []
-        coverage = np.zeros(X.shape[0], dtype=np.int64)
-
-        for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
-            X_tr, X_val = X[tr_idx], X[val_idx]
-            y_tr = y[tr_idx]
-            print(f"[TabLDM:nnls] fold {fold_idx + 1}/{n_splits}: n_fold_train={len(tr_idx)}, n_fold_val={len(val_idx)}")
-            self._current_fold_label_ = f" fold={fold_idx + 1}/{n_splits}"
-            gen_info = self._make_and_fit_enhanced_generators(X_tr, y_tr)
-            fold_probs, fold_mask = self._collect_val_probs(X_val, gen_info)
-
-            if oof_probs_full is None:
-                E_total = fold_mask.shape[0]
-                oof_probs_full = np.full((E_total, X.shape[0], self.n_classes_), np.nan, dtype=np.float64)
-
-            valid_indices = np.where(fold_mask)[0]
-            for slot, global_idx in enumerate(valid_indices):
-                oof_probs_full[global_idx, val_idx, :] = fold_probs[slot]
-            fold_valid_masks.append(fold_mask)
-            coverage[val_idx] += 1
-
-        self._current_fold_label_ = ""
-
-        if not np.all(coverage == 1):
-            print("[TabLDM:nnls] OOF coverage error -> equal-weight ensemble")
-            return None, None, None
-
-        oof_valid_mask = np.ones(oof_probs_full.shape[0], dtype=bool)
-        for fm in fold_valid_masks:
-            oof_valid_mask &= fm
-
-        n_valid = int(oof_valid_mask.sum())
-        n_total = int(oof_valid_mask.shape[0])
-        if n_valid < n_total:
-            print(f"[TabLDM:nnls] OOF filtering: {n_total - n_valid} invalid; {n_valid}/{n_total} remain.")
-        if n_valid == 0:
-            print("[TabLDM:nnls] ALL candidates invalid after OOF -> equal-weight ensemble")
-            return None, None, None
-
-        oof_probs = oof_probs_full[oof_valid_mask]
-        print(f"[TabLDM:nnls] OOF probability matrix shape={oof_probs.shape}; valid_candidates={n_valid}/{n_total}.")
-        return oof_probs, y, oof_valid_mask
-
-    def _single_val_probs(self, X, y):
-        """Single stratified holdout probability collection."""
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X, y, test_size=0.2, shuffle=True, random_state=self.random_state, stratify=y,
-        )
-        print(f"[TabLDM:nnls] stratified validation split: n_train={X_tr.shape[0]}, n_val={X_val.shape[0]}")
-        gen_info = self._make_and_fit_enhanced_generators(X_tr, y_tr)
-        val_probs, valid_mask = self._collect_val_probs(X_val, gen_info)
-        print(f"[TabLDM:nnls] validation probability matrix shape={val_probs.shape}")
-        return val_probs, y_val, valid_mask
-
-    def _make_and_fit_enhanced_generators(self, X_tr, y_tr):
-        """Fit main + optional generators on a train split for OOF/validation."""
-        norm_methods = self.norm_methods or ["none", "power"]
-
-        main_frozen_filter = getattr(self.ensemble_generator_, "unique_filter_", None)
-        main_gen = EnsembleGenerator(
-            classification=True,
-            n_estimators=self.n_estimators,
-            norm_methods=norm_methods,
-            feat_shuffle_method=self.feat_shuffle_method,
-            class_shuffle_method=self.class_shuffle_method,
-            outlier_threshold=self.outlier_threshold,
-            random_state=self.random_state,
-            cat_random_encode=self.cat_random_encode,
-            categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
-        )
-        main_gen.fit(X_tr, y_tr, frozen_unique_filter=main_frozen_filter)
-
-        # Save and wire SVD/cross state
-        svd_attrs = [
-            "svd_", "_svd_pre_", "_X_train_svd_", "_svd_selections_",
-            "_cross_pool_", "_cross_scaler_", "_cross_pool_train_",
-            "_cross_selections_", "_k_",
-        ]
-        saved_svd = {a: getattr(self, a, None) for a in svd_attrs}
-
-        if self.n_estimators == 32 and sorted(norm_methods) == ["none", "power"]:
-            self._fit_svd_cross(main_gen.X_)
-        else:
-            self.svd_ = None
-
-        q_gen = None
-        if self.n_quantile_estimators and self.n_quantile_estimators > 0:
-            q_frozen_filter = getattr(getattr(self, "quantile_ensemble_generator_", None), "unique_filter_", None)
-            q_gen = EnsembleGenerator(
-                classification=True,
-                n_estimators=self.n_quantile_estimators,
-                norm_methods=["quantile"],
-                feat_shuffle_method=self.feat_shuffle_method,
-                class_shuffle_method=self.class_shuffle_method,
-                outlier_threshold=self.outlier_threshold,
-                random_state=self.random_state,
-                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
-            )
-            q_gen.fit(X_tr, y_tr, frozen_unique_filter=q_frozen_filter)
-
-        svd_ens_gen = None
-        if self.use_svd_ens and self.n_svd_ens_estimators and self.n_svd_ens_estimators > 0:
-            svd_ens_frozen_filter = getattr(getattr(self, "svd_ens_generator_", None), "unique_filter_", None)
-            svd_ens_gen = EnsembleGenerator(
-                classification=True,
-                n_estimators=self.n_svd_ens_estimators,
-                norm_methods=self.svd_ens_norm_methods,
-                feat_shuffle_method=self.feat_shuffle_method,
-                class_shuffle_method=self.class_shuffle_method,
-                outlier_threshold=self.outlier_threshold,
-                random_state=self.random_state,
-                use_svd=True,
-                svd_n_components=self.svd_ens_n_components,
-            )
-            svd_ens_gen.fit(X_tr, y_tr, frozen_unique_filter=svd_ens_frozen_filter)
-
-        adaptive_plus_gen = None
-        adaptive_plus_pca = None
-        adaptive_plus_ia = None
-        if self.use_adaptive_plus_candidate:
-            s = self.adaptive_plus_structure_
-            ap_frozen_filter = getattr(getattr(self, "adaptive_plus_generator_", None), "unique_filter_", None)
-            X_ap = X_tr.copy()
-            if s["use_pca_decorr"]:
-                pca_d = PCADecorrelator()
-                pca_d.fit(X_ap)
-                if s["pca_active"]:
-                    X_ap = pca_d.transform(X_ap)
-                adaptive_plus_pca = pca_d
-            if s["use_interactions"]:
-                ia = InteractionAugmentor()
-                ia.fit(X_ap)
-                if s["ia_active"]:
-                    X_ap = ia.transform(X_ap)
-                adaptive_plus_ia = ia
-            gen_kwargs = dict(
-                classification=True,
-                n_estimators=s["n_estimators"],
-                norm_methods=s["norm_methods"],
-                feat_shuffle_method=self.feat_shuffle_method,
-                class_shuffle_method=self.class_shuffle_method,
-                outlier_threshold=self.outlier_threshold,
-                random_state=self.random_state,
-                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
-            )
-            if s["use_svd"]:
-                gen_kwargs["use_svd"] = True
-                if s["svd_n_components"] is not None:
-                    gen_kwargs["svd_n_components"] = s["svd_n_components"]
-            adaptive_plus_gen = EnsembleGenerator(**gen_kwargs)
-            adaptive_plus_gen.fit(X_ap, y_tr, frozen_unique_filter=ap_frozen_filter)
-
-        gaussian_rank_gen = None
-        if self.use_gaussian_rank_ens and self.n_gaussian_rank_estimators and self.n_gaussian_rank_estimators > 0:
-            gr_frozen_filter = getattr(getattr(self, "gaussian_rank_generator_", None), "unique_filter_", None)
-            gaussian_rank_gen = GaussianRankGenerator(
-                n_estimators=self.n_gaussian_rank_estimators,
-                feat_shuffle_method="random",
-                random_state=self.random_state,
-                categorical_indices=getattr(self, "_encoded_categorical_indices_", self.categorical_indices),
-            )
-            gaussian_rank_gen.fit(X_tr, y_tr, frozen_unique_filter=gr_frozen_filter)
-
-        return {
-            "main_gen": main_gen,
-            "q_gen": q_gen,
-            "svd_ens_gen": svd_ens_gen,
-            "adaptive_plus_gen": adaptive_plus_gen,
-            "adaptive_plus_pca": adaptive_plus_pca,
-            "adaptive_plus_ia": adaptive_plus_ia,
-            "gaussian_rank_gen": gaussian_rank_gen,
-            "saved_svd": saved_svd,
-        }
-
-    def _collect_val_probs(self, X_val, gen_info):
-        """Collect validation probabilities for a fold."""
-        try:
-            probs, valid_mask, _, _, _, _, _ = self._collect_candidate_probs(
-                X_val,
-                gen_info["main_gen"],
-                gen_info["q_gen"],
-                gen_info.get("svd_ens_gen"),
-                adaptive_plus_gen=gen_info.get("adaptive_plus_gen"),
-                adaptive_plus_pca=gen_info.get("adaptive_plus_pca"),
-                adaptive_plus_ia=gen_info.get("adaptive_plus_ia"),
-                gaussian_rank_gen=gen_info.get("gaussian_rank_gen"),
-                tag="val",
-            )
-        finally:
-            for attr, val in gen_info["saved_svd"].items():
-                if val is None and hasattr(self, attr):
-                    delattr(self, attr)
-                elif val is not None:
-                    setattr(self, attr, val)
-        return probs, valid_mask
-
-    def _solve_nnls_classification(self, probs, y_val):
-        """Solve non-negative least squares for classification ensemble weights."""
-        E, n_val, n_classes = probs.shape
-
-        if not np.all(np.isfinite(probs)):
-            print("[TabLDM:nnls] WARNING: validation probabilities have non-finite values.")
-            return None
-        if not np.all(probs >= 0):
-            print("[TabLDM:nnls] WARNING: validation probabilities contain negative values.")
-            return None
-
-        A = probs.reshape(E, n_val * n_classes).T
-        onehot = np.zeros((n_val, n_classes), dtype=np.float64)
-        onehot[np.arange(n_val), y_val.astype(int)] = 1.0
-        b = onehot.reshape(n_val * n_classes)
-
-        try:
-            raw_weights, _ = _scipy_nnls(A, b)
-        except Exception as e:
-            print(f"[TabLDM:nnls] scipy nnls solver failed: {e!r}")
-            return None
-
-        w_sum = float(raw_weights.sum())
-        n_nonzero = int((raw_weights > 0).sum())
-        if not np.isfinite(w_sum) or w_sum <= 0:
-            print(f"[TabLDM:nnls] degenerate NNLS solution (sum={w_sum}); not usable.")
-            return None
-
-        nnls_weight = raw_weights / w_sum
-        uniform_weight = np.ones(E, dtype=np.float64) / E
-        final_weight = 0.75 * nnls_weight + 0.25 * uniform_weight
-        final_weight = final_weight / final_weight.sum()
-
-        assert np.all(final_weight >= 0), "[TabLDM:nnls] final weights contain negatives."
-        assert abs(float(final_weight.sum()) - 1.0) < 1e-6, "[TabLDM:nnls] final weights do not sum to 1."
-
-        print(
-            f"[TabLDM:nnls] solved: n_nonzero={n_nonzero}/{E}, raw_sum={w_sum:.4f}, "
-            f"final_weight_sum={float(final_weight.sum()):.6f}"
-        )
-        return final_weight
-
-    # ==================================================================
-    # Probability calibration
-    # ==================================================================
-
-    @staticmethod
-    def _log_loss_safe(P, y):
-        eps = 1e-15
-        n = len(y)
-        return -float(np.sum(np.log(np.clip(P[np.arange(n), y], eps, 1.0))) / n)
-
-    def _fit_calibration(self) -> None:
-        """Fit Platt (binary) or vector scaling (multiclass) on stored OOF probs."""
-        P_cal = getattr(self, "_cal_P_", None)
-        y_cal = getattr(self, "_cal_y_", None)
-        if P_cal is None or y_cal is None:
-            if self.verbose:
-                print("[TabLDM:calibration] no OOF probabilities available; skipping.")
-            return
-
-        n_cal, n_classes = P_cal.shape
-        present_classes = np.unique(y_cal)
-        if len(present_classes) < n_classes:
-            print(f"[TabLDM:calibration] WARNING: OOF covers {len(present_classes)}/{n_classes} classes; skipping.")
-            return
-
-        eps = 1e-15
-        lam = float(self.calibration_lambda)
-
-        if self.verbose:
-            method_name = "platt_scaling" if n_classes == 2 else "vector_scaling"
-            print(f"[TabLDM:calibration] method={method_name}, n_cal={n_cal}, n_classes={n_classes}, lambda={lam}")
-
-        try:
-            if n_classes == 2:
-                z = np.log((P_cal[:, 1] + eps) / (P_cal[:, 0] + eps))
-
-                def _platt_nll(params):
-                    A, B = params
-                    p1 = _expit(A * z + B)
-                    p1 = np.clip(p1, eps, 1.0 - eps)
-                    nll = -np.mean(y_cal * np.log(p1) + (1 - y_cal) * np.log(1.0 - p1))
-                    reg = lam * ((A - 1.0) ** 2 + B ** 2)
-                    return nll + reg
-
-                result = _scipy_minimize(
-                    _platt_nll, x0=[1.0, 0.0], method="L-BFGS-B",
-                    bounds=[(0.8, 1.2), (-1.0, 1.0)],
-                )
-                if not result.success:
-                    print(f"[TabLDM:calibration] WARNING: Platt optimizer did not converge ({result.message}); skipping.")
-                    return
-                A, B = float(result.x[0]), float(result.x[1])
-                if not (np.isfinite(A) and np.isfinite(B)):
-                    print("[TabLDM:calibration] WARNING: Platt params non-finite; skipping.")
-                    return
-                params = {"type": "platt", "A": A, "B": B}
-            else:
-                log_P = np.log(np.clip(P_cal, eps, 1.0))
-
-                def _vs_nll(params):
-                    scale = params[:n_classes]
-                    bias = params[n_classes:]
-                    logits = log_P * scale + bias
-                    logits_c = logits - logits.max(axis=1, keepdims=True)
-                    exp_l = np.exp(logits_c)
-                    P_new = exp_l / exp_l.sum(axis=1, keepdims=True)
-                    P_new = np.clip(P_new, eps, 1.0)
-                    nll = -np.mean(np.log(P_new[np.arange(n_cal), y_cal]))
-                    reg = lam * (np.sum((scale - 1.0) ** 2) + np.sum(bias ** 2))
-                    return nll + reg
-
-                x0 = np.ones(2 * n_classes)
-                x0[n_classes:] = 0.0
-                bounds = [(0.8, 1.2)] * n_classes + [(-1.0, 1.0)] * n_classes
-                result = _scipy_minimize(_vs_nll, x0=x0, method="L-BFGS-B", bounds=bounds)
-                if not result.success:
-                    print(f"[TabLDM:calibration] WARNING: vector scaling optimizer did not converge ({result.message}); skipping.")
-                    return
-                scale = result.x[:n_classes]
-                bias = result.x[n_classes:]
-                if not (np.all(np.isfinite(scale)) and np.all(np.isfinite(bias))):
-                    print("[TabLDM:calibration] WARNING: vector scaling params non-finite; skipping.")
-                    return
-                params = {"type": "vector", "scale": scale.copy(), "bias": bias.copy()}
-
-        except Exception as exc:
-            print(f"[TabLDM:calibration] WARNING: calibration fitting failed ({exc!r}); skipping.")
-            return
-
-        self.calibration_params_ = params
-
-    def _apply_calibration(self, P: np.ndarray) -> np.ndarray:
-        """Apply fitted calibration to aggregated probabilities."""
-        params = getattr(self, "calibration_params_", None)
-        if params is None:
-            return P
-
-        eps = 1e-15
-        try:
-            if params["type"] == "platt":
-                A, B = float(params["A"]), float(params["B"])
-                z = np.log((P[:, 1] + eps) / (P[:, 0] + eps))
-                p1 = _expit(A * z + B)
-                P_new = np.column_stack([1.0 - p1, p1])
-            else:
-                scale = params["scale"]
-                bias = params["bias"]
-                log_P = np.log(np.clip(P, eps, 1.0))
-                logits = log_P * scale + bias
-                logits_c = logits - logits.max(axis=1, keepdims=True)
-                exp_l = np.exp(logits_c)
-                P_new = exp_l / exp_l.sum(axis=1, keepdims=True)
-
-            if not np.all(np.isfinite(P_new)) or np.any(P_new < 0):
-                print("[TabLDM:calibration] WARNING: calibrated probabilities invalid; reverting.")
-                return P
-
-            row_sums = P_new.sum(axis=1, keepdims=True)
-            row_sums = np.where(row_sums > 0, row_sums, 1.0)
-            return P_new / row_sums
-
-        except Exception as exc:
-            print(f"[TabLDM:calibration] WARNING: applying calibration failed ({exc!r}); using uncalibrated.")
-            return P
-
-    @staticmethod
-    def _fixed_group_average(
-        probs: np.ndarray, candidate_indices: np.ndarray, group_sizes: dict[str, int], group_weights: dict[str, float]
-    ) -> tuple[np.ndarray, dict[str, float]]:
-        """Average valid candidates within groups, then apply fixed group weights."""
-        starts = {}
-        offset = 0
-        for name, size in group_sizes.items():
-            starts[name] = (offset, offset + size)
-            offset += size
-        enabled = {}
-        group_probs = {}
-        for name, weight in group_weights.items():
-            start, end = starts.get(name, (0, 0))
-            local = (candidate_indices >= start) & (candidate_indices < end)
-            if np.any(local):
-                group_probs[name] = probs[local].mean(axis=0)
-                enabled[name] = weight
-        total_weight = sum(enabled.values())
-        if total_weight <= 0:
-            raise RuntimeError("[TabLDM:enhance] no fixed-weight candidate groups remain.")
-        averaged = sum(
-            (weight / total_weight) * group_probs[name]
-            for name, weight in enabled.items()
-        )
-        return averaged, {name: weight / total_weight for name, weight in enabled.items()}
-
-    # ==================================================================
-    # Enhanced probability prediction
-    # ==================================================================
-
-    def _predict_proba_enhanced(self, X: np.ndarray) -> np.ndarray:
-        """Enhanced probability prediction over all candidate groups."""
-        self._current_fold_label_ = ""
-
-        probs_all, predict_mask, n_main, n_q, n_svd_ens, n_adaptive, n_gaussian_rank = (
-            self._collect_candidate_probs(
-                X,
-                self.ensemble_generator_,
-                getattr(self, "quantile_ensemble_generator_", None),
-                getattr(self, "svd_ens_generator_", None),
-                adaptive_plus_gen=getattr(self, "adaptive_plus_generator_", None),
-                adaptive_plus_pca=getattr(self, "adaptive_plus_pca_decorr_", None),
-                adaptive_plus_ia=getattr(self, "adaptive_plus_interaction_", None),
-                gaussian_rank_gen=getattr(self, "gaussian_rank_generator_", None),
-                tag="predict",
-            )
-        )
-
-        # Apply OOF-derived valid candidate mask
-        oof_mask = getattr(self, "nnls_valid_candidate_mask_", None)
-        if oof_mask is not None:
-            E_total = oof_mask.shape[0]
-            if predict_mask.shape[0] != E_total:
-                print(f"[TabLDM:enhance] WARNING: predict_mask length {predict_mask.shape[0]} != oof_mask length {E_total}; ignoring OOF mask.")
-                effective_mask = predict_mask
-            else:
-                effective_mask = predict_mask & oof_mask
-                n_oof_extra_dropped = int(predict_mask.sum()) - int(effective_mask.sum())
-                if n_oof_extra_dropped > 0:
-                    print(f"[TabLDM:enhance] OOF mask drops {n_oof_extra_dropped} additional candidate(s); {int(effective_mask.sum())} remain.")
-            predict_valid_indices = np.where(predict_mask)[0]
-            effective_local = effective_mask[predict_valid_indices]
-            probs = probs_all[effective_local]
-        else:
-            effective_mask = predict_mask
-            probs = probs_all
-
-        n_estimators = probs.shape[0]
-        if n_estimators == 0:
-            raise RuntimeError("[TabLDM:enhance] ALL candidates are invalid; cannot produce predictions.")
-
-        print(
-            f"[TabLDM:enhance:predict] effective_valid_candidates={n_estimators} "
-            f"(total_generated={effective_mask.shape[0]}, "
-            f"main={n_main}, quantile={n_q}, svd_ens={n_svd_ens}, adaptive_plus={n_adaptive})"
-        )
-
-        # Combine candidates: NNLS weights or equal-weight average
-        nnls_weights = getattr(self, "nnls_weights_", None)
-        weights = None
-        weight_mode = "uniform"
-        if nnls_weights is not None and oof_mask is not None:
-            oof_valid_indices = np.where(oof_mask)[0]
-            if nnls_weights.shape[0] == oof_valid_indices.shape[0]:
-                effective_indices = np.where(effective_mask)[0]
-                oof_pos_map = {gi: li for li, gi in enumerate(oof_valid_indices)}
-                w_slice = np.array(
-                    [oof_pos_map[gi] for gi in effective_indices if gi in oof_pos_map],
-                    dtype=np.intp,
-                )
-                if w_slice.shape[0] == n_estimators:
-                    raw_w = nnls_weights[w_slice]
-                    w_sum = float(raw_w.sum())
-                    if w_sum > 0 and np.all(np.isfinite(raw_w)) and np.all(raw_w >= 0):
-                        weights = raw_w / w_sum
-                        weight_mode = "nnls_blend"
-
-        adaptive_weights = getattr(self, "adaptive_group_weights_", None)
-        if adaptive_weights is not None:
-            candidate_indices = np.where(effective_mask)[0]
-            avg, normalized_group_weights = self._fixed_group_average(
-                probs,
-                candidate_indices,
-                {
-                    "default": n_main,
-                    "quantile_safe": n_q,
-                    "svd_ens": n_svd_ens,
-                    "adaptive_plus": n_adaptive,
-                    "gaussian_rank": n_gaussian_rank,
-                },
-                adaptive_weights,
-            )
-            weight_mode = "fixed_group"
-            print(
-                f"[TabLDM:enhance] fixed group weights={normalized_group_weights}"
-            )
-        elif weights is not None:
-            avg = np.einsum("e,enc->nc", weights, probs)
-        else:
-            avg = probs.mean(axis=0)
-
-        row_sums = avg.sum(axis=1, keepdims=True)
-        row_sums = np.where(row_sums > 0, row_sums, 1.0)
-        proba = avg / row_sums
-
-        print(f"[TabLDM:enhance] weight_mode={weight_mode} valid_candidates={n_estimators} final_proba_shape={proba.shape}")
-
-        # Probability calibration
-        proba = self._apply_calibration(proba)
-
-        return proba
-
     def _predict_proba_pipeline(self, X: np.ndarray) -> np.ndarray:
         """Predict with the retained LimiX pipeline members and NNLS weights."""
         probabilities, weights = [], []
@@ -2197,7 +757,6 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         if np.any(row_sums <= 0) or not np.isfinite(proba).all():
             raise RuntimeError("LimiX pipeline ensemble produced invalid probabilities.")
         return proba / row_sums
-
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Predict class probabilities for test samples."""
