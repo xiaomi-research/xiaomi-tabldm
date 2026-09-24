@@ -25,12 +25,6 @@ from collections import OrderedDict
 import numpy as np
 import torch
 
-
-def _clear_cuda_cache(device):
-    """Release cached CUDA blocks after a recoverable OOM."""
-    if device is not None and getattr(device, "type", device) == "cuda" and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
 import sklearn
 from sklearn.base import BaseEstimator
 from sklearn.utils.validation import check_is_fitted

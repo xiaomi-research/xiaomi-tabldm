@@ -17,17 +17,14 @@ from __future__ import annotations
 import sys
 import random
 import itertools
-import hashlib
 from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Optional
 
 import numpy as np
 from scipy.sparse import issparse
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer, make_column_selector
-from sklearn.decomposition import TruncatedSVD
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
@@ -37,7 +34,6 @@ from sklearn.preprocessing import (
     PowerTransformer,
     QuantileTransformer,
     RobustScaler,
-    OneHotEncoder,
 )
 from sklearn.utils.validation import check_is_fitted
 
@@ -167,21 +163,6 @@ class TransformToNumerical(TransformerMixin, BaseEstimator):
             )
 
         self.tfm_.fit(X)
-
-        if hasattr(self.tfm_, "transformers_"):
-            numeric_positions = []
-            categorical_positions = []
-            for name, _, positions in self.tfm_.transformers_:
-                if name == "continuous":
-                    numeric_positions.extend(list(positions))
-                elif name == "categorical":
-                    categorical_positions.extend(list(positions))
-            # ColumnTransformer emits continuous values before categorical ones.
-            self.categorical_indices_ = list(
-                range(len(numeric_positions), len(numeric_positions) + len(categorical_positions))
-            )
-        else:
-            self.categorical_indices_ = []
 
         if self.verbose and hasattr(self.tfm_, "transformers_"):
             selected_cols = []
@@ -708,16 +689,11 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
     """
 
     def __init__(
-        self,
-        normalization_method: str = "power",
-        outlier_threshold: float = 4.0,
-        random_state: Optional[int] = None,
-        categorical_indices: Optional[List[int]] = None,
+        self, normalization_method: str = "power", outlier_threshold: float = 4.0, random_state: Optional[int] = None
     ):
         self.normalization_method = normalization_method
         self.outlier_threshold = outlier_threshold
         self.random_state = random_state
-        self.categorical_indices = categorical_indices
 
     def fit(self, X, y=None):
         """Fit the preprocessing pipeline.
@@ -736,26 +712,12 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
             Returns self.
         """
         X = validate_data(self, X)
-        categorical_indices = np.asarray(self.categorical_indices or [], dtype=np.intp)
-        categorical_indices = categorical_indices[
-            (categorical_indices >= 0) & (categorical_indices < X.shape[1])
-        ]
-        numeric_mask = np.ones(X.shape[1], dtype=bool)
-        numeric_mask[categorical_indices] = False
 
-        self.numeric_mask_ = numeric_mask
-
-        # 1. Apply standard scaling to real numerical columns only.
+        # 1. Apply standard scaling
         self.standard_scaler_ = CustomStandardScaler()
-        if numeric_mask.any():
-            self.standard_scaler_.fit(X[:, numeric_mask])
-            X_scaled = np.array(X, copy=True, dtype=np.float64)
-            X_scaled[:, numeric_mask] = self.standard_scaler_.transform(X[:, numeric_mask])
-        else:
-            self.standard_scaler_ = None
-            X_scaled = np.array(X, copy=True, dtype=np.float64)
+        X_scaled = self.standard_scaler_.fit_transform(X)
 
-        # 2. Apply normalization to real numerical columns only.
+        # 2. Apply normalization
         if self.normalization_method != "none":
             if self.normalization_method == "power":
                 self.normalizer_ = PowerTransformer(method="yeo-johnson", standardize=True)
@@ -776,15 +738,9 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
             else:
                 raise ValueError(f"Unknown normalization method: {self.normalization_method}")
 
-            X_normalized = np.array(X_scaled, copy=True)
-            if numeric_mask.any():
-                self.X_min_ = np.min(X_scaled[:, numeric_mask], axis=0, keepdims=True)
-                self.X_max_ = np.max(X_scaled[:, numeric_mask], axis=0, keepdims=True)
-                X_normalized[:, numeric_mask] = self.normalizer_.fit_transform(X_scaled[:, numeric_mask])
-            else:
-                self.X_min_ = np.empty((1, 0), dtype=X_scaled.dtype)
-                self.X_max_ = np.empty((1, 0), dtype=X_scaled.dtype)
-                self.normalizer_ = None
+            self.X_min_ = np.min(X_scaled, axis=0, keepdims=True)
+            self.X_max_ = np.max(X_scaled, axis=0, keepdims=True)
+            X_normalized = self.normalizer_.fit_transform(X_scaled)
         else:
             self.normalizer_ = None
             X_normalized = X_scaled
@@ -810,22 +766,21 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
         """
         check_is_fitted(self)
         X = validate_data(self, X, reset=False, copy=True)
-        # Standard scaling and normalization apply only to real numerical columns.
-        numeric_mask = self.numeric_mask_
-        X_out = np.array(X, copy=True, dtype=np.float64)
-        if numeric_mask.any():
-            X_scaled = self.standard_scaler_.transform(X[:, numeric_mask])
-            if self.normalizer_ is not None:
-                try:
-                    X_scaled = self.normalizer_.transform(X_scaled)
-                except ValueError:
-                    X_scaled = np.clip(X_scaled, self.X_min_, self.X_max_)
-                    X_scaled = self.normalizer_.transform(X_scaled)
-            X_out[:, numeric_mask] = X_scaled
-        # Outlier removal remains a final safeguard for all columns.
-        X_out = self.outlier_remover_.transform(X_out)
+        # Standard scaling
+        X = self.standard_scaler_.transform(X)
+        # Normalization
+        if self.normalizer_ is not None:
+            try:
+                # this can fail in rare cases if there is an outlier in X that was not present in fit()
+                X = self.normalizer_.transform(X)
+            except ValueError:
+                # clip values to train min/max
+                X = np.clip(X, self.X_min_, self.X_max_)
+                X = self.normalizer_.transform(X)
+        # Outlier removal
+        X = self.outlier_remover_.transform(X)
 
-        return X_out
+        return X
 
 
 class Shuffler:
@@ -1170,10 +1125,7 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
             if n_comp is None:
                 n_comp = max(1, int(X.shape[1] * self.svd_ratio))
                 n_comp = min(n_comp, min(X.shape[0], X.shape[1]))
-            self.svd_augmentor_ = SVDFeatureAugmentor(
-                n_components=n_comp,
-                categorical_indices=self.category_columns_,
-            )
+            self.svd_augmentor_ = SVDFeatureAugmentor(n_components=n_comp)
             self.svd_augmentor_.fit(X)
             X = self.svd_augmentor_.transform(X)
             if not np.isfinite(X).all():
@@ -1209,7 +1161,6 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
                 normalization_method=norm_method,
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
-                categorical_indices=self.category_columns_,
             )
             preprocessor.fit(X)
             self.preprocessors_[norm_method] = preprocessor
@@ -1221,7 +1172,6 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
                         normalization_method=norm_method,
                         outlier_threshold=self.outlier_threshold,
                         random_state=self.random_state,
-                        categorical_indices=self.category_columns_,
                     )
                     member_preprocessor.fit(self._apply_category_code_mapping(X, mapping))
                     member_preprocessors.append(member_preprocessor)
@@ -1502,40 +1452,24 @@ class SVDFeatureAugmentor(TransformerMixin, BaseEstimator):
         Number of SVD components to keep.
     """
 
-    def __init__(
-        self, n_components: int = 10, categorical_indices: Optional[List[int]] = None
-    ):
+    def __init__(self, n_components: int = 10):
         self.n_components = n_components
-        self.categorical_indices = categorical_indices
 
     def fit(self, X, y=None):
         X = np.asarray(X, dtype=np.float64)
-        categorical = np.asarray(self.categorical_indices or [], dtype=np.intp)
-        numeric_mask = np.ones(X.shape[1], dtype=bool)
-        numeric_mask[categorical[(categorical >= 0) & (categorical < X.shape[1])]] = False
-        if not numeric_mask.any():
-            self.components_ = np.empty((0, 0), dtype=np.float64)
-            self.mean_ = np.empty(0, dtype=np.float64)
-            self.std_ = np.empty(0, dtype=np.float64)
-            self.numeric_mask_ = numeric_mask
-            self.n_features_in_ = X.shape[1]
-            self.n_components_ = 0
-            self.n_features_out_ = X.shape[1]
-            return self
-        X_num = X[:, numeric_mask]
-        col_means = np.nanmean(X_num, axis=0)
-        nan_mask = np.isnan(X_num)
+        col_means = np.nanmean(X, axis=0)
+        nan_mask = np.isnan(X)
         if nan_mask.any():
-            X_num = X_num.copy()
-            X_num[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
+            X = X.copy()
+            X[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
 
-        self.mean_ = np.mean(X_num, axis=0)
-        self.std_ = np.std(X_num, axis=0)
+        self.mean_ = np.mean(X, axis=0)
+        self.std_ = np.std(X, axis=0)
         self.std_[self.std_ < 1e-10] = 1.0
-        X_scaled = (X_num - self.mean_) / self.std_
+        X_scaled = (X - self.mean_) / self.std_
         X_scaled = np.clip(X_scaled, -10, 10)
 
-        n_comp = min(self.n_components, min(X_num.shape[0], X_num.shape[1]))
+        n_comp = min(self.n_components, min(X.shape[0], X.shape[1]))
         try:
             from sklearn.utils.extmath import randomized_svd
             _, _, Vt = randomized_svd(X_scaled, n_components=n_comp, random_state=42)
@@ -1544,7 +1478,6 @@ class SVDFeatureAugmentor(TransformerMixin, BaseEstimator):
             Vt = Vt[:n_comp]
 
         self.components_ = Vt
-        self.numeric_mask_ = numeric_mask
         self.n_features_in_ = X.shape[1]
         self.n_components_ = n_comp
         self.n_features_out_ = X.shape[1] + n_comp
@@ -1553,20 +1486,17 @@ class SVDFeatureAugmentor(TransformerMixin, BaseEstimator):
     def transform(self, X):
         check_is_fitted(self, ["components_", "mean_", "std_"])
         X = np.asarray(X, dtype=np.float64)
-        if self.n_components_ == 0:
-            return X
-        X_num = X[:, self.numeric_mask_]
-        nan_mask = np.isnan(X_num)
+        nan_mask = np.isnan(X)
         if nan_mask.any():
-            X_num = X_num.copy()
+            X = X.copy()
             import warnings
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
-                col_means = np.nanmean(X_num, axis=0)
+                col_means = np.nanmean(X, axis=0)
             col_means = np.where(np.isnan(col_means), self.mean_, col_means)
-            X_num[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
+            X[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
 
-        X_scaled = (X_num - self.mean_) / self.std_
+        X_scaled = (X - self.mean_) / self.std_
         X_scaled = np.clip(X_scaled, -10, 10)
         X_svd = X_scaled @ self.components_.T
 
@@ -1596,32 +1526,20 @@ class GaussianRankNormalizer(TransformerMixin, BaseEstimator):
         Seed for the noise generator.
     """
 
-    def __init__(self, random_state=None, numeric_mask=None):
+    def __init__(self, random_state=None):
         self.random_state = random_state
-        self.numeric_mask = numeric_mask
 
     def fit(self, X, y=None):
         X = np.asarray(X, dtype=np.float64)
         n_samples, n_features = X.shape
         rng = np.random.default_rng(self.random_state)
 
-        if self.numeric_mask is None:
-            numeric_mask = np.ones(n_features, dtype=bool)
-        else:
-            numeric_mask = np.asarray(self.numeric_mask, dtype=bool)
-            if numeric_mask.shape != (n_features,):
-                raise ValueError("numeric_mask must match the number of features")
-        self.numeric_mask_ = numeric_mask
+        self.n_features_ = n_features
         self.references_ = []
         self.noise_scales_ = []
         self.noise_per_col_ = []
 
         for col in range(n_features):
-            if not numeric_mask[col]:
-                self.references_.append(np.array([], dtype=np.float64))
-                self.noise_scales_.append(0.0)
-                self.noise_per_col_.append(np.zeros(n_samples, dtype=np.float64))
-                continue
             observed = X[:, col]
             mask = ~np.isnan(observed)
             vals = observed[mask]
@@ -1695,17 +1613,10 @@ class GaussianRankGenerator:
         Base seed for reproducibility.
     """
 
-    def __init__(
-        self,
-        n_estimators,
-        feat_shuffle_method="random",
-        random_state=None,
-        categorical_indices: Optional[List[int]] = None,
-    ):
+    def __init__(self, n_estimators, feat_shuffle_method="random", random_state=None):
         self.n_estimators = n_estimators
         self.feat_shuffle_method = feat_shuffle_method
         self.random_state = random_state
-        self.categorical_indices = categorical_indices
 
     def fit(self, X, y, frozen_unique_filter=None):
         if frozen_unique_filter is not None:
@@ -1718,39 +1629,19 @@ class GaussianRankGenerator:
         self.X_ = X.copy()
         self.y_ = y.copy()
         n_train, n_features = X.shape
-        if self.categorical_indices is not None:
-            original_indices = set(self.categorical_indices)
-            categorical_indices = [
-                filtered_index
-                for filtered_index, original_index in enumerate(
-                    np.flatnonzero(self.unique_filter_.features_to_keep_)
-                )
-                if original_index in original_indices
-            ]
-        else:
-            categorical_indices = None
         n_estimators = self.n_estimators
 
-        # Detect real numerical columns. Explicit categorical metadata takes
-        # precedence over the historical unique-count heuristic.
-        if categorical_indices is None:
-            is_numeric = np.array(
-                [len(np.unique(X[~np.isnan(X[:, c]), c])) > 10 for c in range(n_features)],
-                dtype=bool,
-            )
-        else:
-            categorical = np.asarray(categorical_indices, dtype=np.intp)
-            is_numeric = np.ones(n_features, dtype=bool)
-            is_numeric[categorical[(categorical >= 0) & (categorical < n_features)]] = False
+        # Detect numeric columns (unique values > 10) vs categorical.
+        is_numeric = np.array(
+            [len(np.unique(X[~np.isnan(X[:, c]), c])) > 10 for c in range(n_features)],
+            dtype=bool,
+        )
         self.is_numeric_ = is_numeric
 
         # Fit one GaussianRankNormalizer per estimator (different noise).
         self.normalizers_ = []
         for i in range(n_estimators):
-            norm = GaussianRankNormalizer(
-                random_state=self.random_state + i,
-                numeric_mask=is_numeric,
-            )
+            norm = GaussianRankNormalizer(random_state=self.random_state + i)
             norm.fit(X)
             self.normalizers_.append(norm)
 
@@ -1882,375 +1773,3 @@ class InteractionAugmentor(TransformerMixin, BaseEstimator):
         if not np.isfinite(X_aug).all():
             X_aug = np.nan_to_num(X_aug, nan=0.0, posinf=0.0, neginf=0.0)
         return X_aug
-
-
-@dataclass(frozen=True)
-class PipelineSpec:
-    """Immutable description of one LimiX-compatible preprocessing member."""
-
-    name: str
-    numeric_transform: Optional[str]
-    discrete_flag: bool
-    original_flag: bool
-    categorical_encoding: str
-    feature_shuffle: Optional[str]
-    fingerprint: bool = False
-    max_interactions: Optional[int] = None
-    svd_components: Optional[int] = None
-    seed_offset: int = 0
-    target_transform: Optional[str] = None
-
-
-# These entries are a literal translation of LimiX V2's no-retrieval JSON
-# defaults.  Keeping them local makes TabLDM independent from LimiX at runtime.
-_CLASSIFIER_PIPELINE_ROWS = (
-    ("quantile_norm_all_data", False, False, "ordinal_strict_feature_shuffled", "rotate", True, None, None),
-    ("quantile_uniform_10", False, True, "numeric", "shuffle", False, None, 64),
-    ("quantile_norm_5", True, False, "ordinal_shuffled", "shuffle", True, None, None),
-    ("kdi_uni", False, False, "onehot", "rotate", True, 10, None),
-    ("quantile_norm_5", False, False, "ordinal_shuffled", "shuffle", False, None, None),
-    ("robust", False, False, "ordinal_strict_feature_shuffled", "rotate", True, None, 32),
-    ("quantile_uniform_all_data", False, False, "onehot", "rotate", True, None, None),
-    ("quantile_norm_5", False, True, "numeric", "shuffle", False, 50, 128),
-    ("quantile_norm_all_data", False, False, "onehot", "rotate", False, None, None),
-    ("quantile_norm_all_data", False, False, "ordinal_strict_feature_shuffled", "shuffle", True, None, None),
-    ("kdi_uni", False, False, "ordinal_shuffled", "rotate", True, None, None),
-    ("quantile_norm_5", False, False, "ordinal_shuffled", "rotate", True, 10, None),
-    ("quantile_uniform_5", False, False, "none", "shuffle", False, 100, 128),
-    (None, False, False, "onehot", "rotate", False, None, None),
-    ("quantile_norm_all_data", True, False, "onehot", "rotate", True, None, 128),
-    ("quantile_norm_all_data", False, False, "ordinal_strict_feature_shuffled", "shuffle", True, None, None),
-    ("power", True, True, "ordinal_shuffled", "shuffle", True, 10, None),
-    ("quantile_norm_10", False, True, "numeric", "shuffle", True, None, 64),
-    ("quantile_uniform_all_data", False, False, "onehot", "rotate", True, None, None),
-    ("quantile_uniform_10", False, True, "ordinal_shuffled", "shuffle", False, None, 64),
-    ("quantile_norm_all_data", False, False, "onehot", "rotate", False, None, None),
-    ("power", False, False, "none", None, False, 50, None),
-    ("quantile_norm_5", False, False, "onehot", "rotate", True, None, None),
-    ("quantile_norm_all_data", False, False, "ordinal_strict_feature_shuffled", "shuffle", True, None, None),
-    ("kdi_uni", False, False, "ordinal_shuffled", "rotate", True, None, None),
-    ("quantile_norm_all_data", True, False, "onehot", "rotate", True, None, 128),
-    ("quantile_norm_5", False, False, "ordinal_shuffled", "rotate", True, 10, None),
-    ("quantile_norm_all_data", False, False, "ordinal_strict_feature_shuffled", "shuffle", True, None, None),
-    ("quantile_uniform_10", False, True, "ordinal_shuffled", "shuffle", False, None, 64),
-    ("robust", False, True, "ordinal", None, False, 100, 32),
-    ("quantile_norm_5", False, False, "ordinal_shuffled", "shuffle", False, None, None),
-    (None, False, False, "onehot", "rotate", False, None, None),
-)
-
-
-def _specs_from_rows(rows: Sequence[tuple], prefix: str) -> tuple[PipelineSpec, ...]:
-    return tuple(
-        PipelineSpec(
-            name=f"{prefix}_{index:02d}", numeric_transform=row[0],
-            discrete_flag=row[1], original_flag=row[2], categorical_encoding=row[3],
-            feature_shuffle=row[4], fingerprint=row[5], max_interactions=row[6],
-            svd_components=row[7], seed_offset=index,
-        )
-        for index, row in enumerate(rows)
-    )
-
-
-def default_classifier_pipeline_specs() -> tuple[PipelineSpec, ...]:
-    """Return the 32 LimiX V2 no-retrieval classification member specs."""
-    return _specs_from_rows(_CLASSIFIER_PIPELINE_ROWS, "cls")
-
-
-def default_regressor_pipeline_specs() -> tuple[PipelineSpec, ...]:
-    """Return the eight LimiX V2 no-retrieval regression member specs."""
-    rows = (
-        ("quantile_uniform_all_data", False, True, "ordinal_strict_feature_shuffled", "shuffle", False, None, None),
-    ) * 4 + (
-        ("power", False, False, "onehot", "shuffle", False, None, None),
-    ) * 4
-    specs = list(_specs_from_rows(rows, "reg"))
-    for index in range(4):
-        specs[index] = PipelineSpec(**{**specs[index].__dict__, "svd_components": -1})
-    return tuple(specs)
-
-
-class PipelineMember:
-    """A fitted, deterministic preprocessing view for a single ensemble member."""
-
-    def __init__(self, spec: PipelineSpec, *, categorical_indices=None, random_state=None, classification=False):
-        self.spec = spec
-        self.categorical_indices = list(categorical_indices or [])
-        self.random_state = 0 if random_state is None else int(random_state)
-        self.classification = classification
-
-    def _seed(self, offset=0):
-        return self.random_state + self.spec.seed_offset + offset
-
-    def _finite(self, X):
-        return np.nan_to_num(np.asarray(X, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _filtered_categories(self):
-        return [
-            position for position, original in enumerate(np.flatnonzero(self.unique_filter_.features_to_keep_))
-            if original in self.categorical_indices
-        ]
-
-    def _interaction_fit_transform(self, X):
-        if not self.spec.max_interactions or X.shape[1] == 0:
-            self.interaction_pairs_ = np.empty((0, 2), dtype=np.intp)
-            return X
-        count = min(self.spec.max_interactions, X.shape[1] * (X.shape[1] + 1) // 2)
-        rng = np.random.default_rng(self._seed(11))
-        pairs = [(i, j) for i in range(X.shape[1]) for j in range(i, X.shape[1])]
-        selected = rng.choice(len(pairs), size=count, replace=False)
-        self.interaction_pairs_ = np.asarray([pairs[i] for i in selected], dtype=np.intp)
-        return self._interaction_transform(X)
-
-    def _interaction_transform(self, X):
-        if self.interaction_pairs_.size == 0:
-            return X
-        base = self._finite(X)
-        interactions = base[:, self.interaction_pairs_[:, 0]] * base[:, self.interaction_pairs_[:, 1]]
-        return np.concatenate([base, interactions], axis=1)
-
-    def _make_numeric_transformer(self, n_samples):
-        tag = self.spec.numeric_transform
-        if tag is None:
-            return None
-        if tag == "power":
-            return PowerTransformer(method="yeo-johnson", standardize=True)
-        if tag == "robust":
-            return RobustScaler(unit_variance=True)
-        if tag in {"kdi_uni", "quantile_uniform_5", "quantile_uniform_10", "quantile_uniform_all_data"}:
-            divisor = 10 if tag.endswith("_10") else 5
-            return QuantileTransformer(
-                n_quantiles=max(2, min(n_samples, n_samples // divisor)), output_distribution="uniform",
-                random_state=self._seed(17), subsample=n_samples,
-            )
-        if tag.startswith("quantile_norm"):
-            divisor = 10 if tag.endswith("_10") else 5
-            return QuantileTransformer(
-                n_quantiles=max(2, min(n_samples, n_samples // divisor)), output_distribution="normal",
-                random_state=self._seed(17), subsample=n_samples,
-            )
-        raise ValueError(f"Unsupported LimiX numeric transform {tag!r}")
-
-    def _fit_numeric(self, X):
-        self.numeric_mask_ = np.ones(X.shape[1], dtype=bool)
-        self.numeric_mask_[self.categorical_indices_] = False
-        transform_mask = np.ones(X.shape[1], dtype=bool) if self.spec.discrete_flag else self.numeric_mask_
-        self.numeric_transform_mask_ = transform_mask
-        self.numeric_transformer_ = self._make_numeric_transformer(X.shape[0])
-        transformed = X.copy()
-        if self.numeric_transformer_ is not None and transform_mask.any():
-            transformed[:, transform_mask] = self.numeric_transformer_.fit_transform(self._finite(X[:, transform_mask]))
-        if self.spec.original_flag:
-            transformed = np.concatenate([X, transformed], axis=1)
-            self.rebalance_categorical_indices_ = list(self.categorical_indices)
-        elif self.spec.discrete_flag:
-            self.rebalance_categorical_indices_ = []
-        else:
-            cats = X[:, self.categorical_indices_] if self.categorical_indices_ else np.empty((X.shape[0], 0))
-            nums = transformed[:, transform_mask]
-            transformed = np.concatenate([cats, nums], axis=1)
-            self.rebalance_categorical_indices_ = list(range(cats.shape[1]))
-        return self._finite(transformed)
-
-    def _transform_numeric(self, X):
-        transformed = X.copy()
-        if self.numeric_transformer_ is not None and self.numeric_transform_mask_.any():
-            transformed[:, self.numeric_transform_mask_] = self.numeric_transformer_.transform(
-                self._finite(X[:, self.numeric_transform_mask_])
-            )
-        if self.spec.original_flag:
-            return self._finite(np.concatenate([X, transformed], axis=1))
-        if self.spec.discrete_flag:
-            return self._finite(transformed)
-        cats = X[:, self.categorical_indices_] if self.categorical_indices_ else np.empty((X.shape[0], 0))
-        return self._finite(np.concatenate([cats, transformed[:, self.numeric_transform_mask_]], axis=1))
-
-    def _fit_encode(self, X):
-        cats = list(self.rebalance_categorical_indices_)
-        strategy = self.spec.categorical_encoding
-        self.encoding_categorical_indices_ = cats
-        self.ordinal_permutations_ = {}
-        if strategy in {"numeric", "none"} or not cats:
-            self.encoder_ = None
-            return X
-        other = [i for i in range(X.shape[1]) if i not in cats]
-        if strategy.startswith("ordinal"):
-            if "feature_shuffled" in strategy:
-                cats = [i for i in cats if self._ordinal_column_allowed(X[:, i], strict="strict" in strategy)]
-                other = [i for i in range(X.shape[1]) if i not in cats]
-            self.encoding_categorical_indices_ = cats
-            if not cats:
-                self.encoder_ = None
-                return X
-            self.encoder_ = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=np.nan)
-            encoded = self.encoder_.fit_transform(X[:, cats])
-            if strategy.endswith("_shuffled"):
-                rng = np.random.default_rng(self._seed(23))
-                for i, categories in enumerate(getattr(self.encoder_, "categories_", self.encoder_.categories)):
-                    permutation = rng.permutation(len(categories))
-                    self.ordinal_permutations_[i] = permutation
-                    valid = np.isfinite(encoded[:, i])
-                    encoded[valid, i] = permutation[encoded[valid, i].astype(int)]
-            return self._finite(np.concatenate([encoded, X[:, other]], axis=1))
-        if strategy == "onehot":
-            self.encoder_ = OneHotEncoder(drop="if_binary", sparse_output=False, handle_unknown="ignore")
-            encoded = self.encoder_.fit_transform(X[:, cats])
-            return self._finite(np.concatenate([encoded, X[:, other]], axis=1))
-        raise ValueError(f"Unsupported categorical encoding {strategy!r}")
-
-    @staticmethod
-    def _ordinal_column_allowed(column, strict=False):
-        values, counts = np.unique(column, return_counts=True)
-        if counts.size == 0 or counts.min() < 10:
-            return False
-        return not strict or len(values) < len(column) // 10
-
-    def _transform_encode(self, X):
-        cats = self.encoding_categorical_indices_
-        strategy = self.spec.categorical_encoding
-        if self.encoder_ is None:
-            return X
-        other = [i for i in range(X.shape[1]) if i not in cats]
-        encoded = self.encoder_.transform(X[:, cats])
-        if strategy.startswith("ordinal"):
-            for i, permutation in self.ordinal_permutations_.items():
-                valid = np.isfinite(encoded[:, i])
-                positions = encoded[valid, i].astype(int)
-                encoded[valid, i] = permutation[positions]
-        return self._finite(np.concatenate([encoded, X[:, other]], axis=1))
-
-    def _append_fingerprint(self, X):
-        if not self.spec.fingerprint:
-            return X
-        fingerprints = np.empty(X.shape[0], dtype=np.float64)
-        for index, row in enumerate(X):
-            digest = hashlib.sha256((row + self.fingerprint_salt_).tobytes()).digest()
-            fingerprints[index] = int.from_bytes(digest[:8], "little") / 2**64
-        return np.column_stack([X, fingerprints])
-
-    def _fit_svd(self, X):
-        requested = self.spec.svd_components
-        if requested == -1:
-            requested = max(1, min(X.shape[0] // 10 + 1, X.shape[1] // 2))
-        if not requested or X.shape[1] < 2:
-            self.svd_ = None
-            return X
-        n_components = min(int(requested), X.shape[0] - 1, X.shape[1] - 1)
-        if n_components < 1:
-            self.svd_ = None
-            return X
-        self.svd_scaler_ = StandardScaler()
-        X_scaled = self.svd_scaler_.fit_transform(self._finite(X))
-        self.svd_ = TruncatedSVD(n_components=n_components, random_state=self._seed(31)).fit(X_scaled)
-        return np.concatenate([X, self.svd_.transform(X_scaled)], axis=1)
-
-    def _transform_svd(self, X):
-        if self.svd_ is None:
-            return X
-        return np.concatenate([X, self.svd_.transform(self.svd_scaler_.transform(self._finite(X)))], axis=1)
-
-    def fit(self, X, y=None):
-        X = self._finite(X)
-        X = self._interaction_fit_transform(X)
-        self.unique_filter_ = UniqueFeatureFilter().fit(X)
-        if self.unique_filter_.n_features_out_ == 0:
-            raise ValueError("Pipeline member has no non-constant features")
-        X = self.unique_filter_.transform(X)
-        self.categorical_indices_ = self._filtered_categories()
-        self.categorical_indices = self.categorical_indices_
-        X = self._fit_numeric(X)
-        X = self._fit_encode(X)
-        self.fingerprint_salt_ = int(np.random.default_rng(self._seed(29)).integers(0, 2**16))
-        X = self._append_fingerprint(X)
-        X = self._fit_svd(X)
-        if self.spec.feature_shuffle == "shuffle":
-            self.feature_permutation_ = np.random.default_rng(self._seed(37)).permutation(X.shape[1])
-        elif self.spec.feature_shuffle == "rotate":
-            self.feature_permutation_ = np.roll(np.arange(X.shape[1]), self.spec.seed_offset)
-        else:
-            self.feature_permutation_ = np.arange(X.shape[1])
-        self.X_train_ = self._finite(X[:, self.feature_permutation_]).astype(np.float32)
-        if self.classification:
-            n_classes = int(np.max(y)) + 1
-            self.class_permutation_ = np.random.default_rng(self._seed(41)).permutation(n_classes)
-            self.y_train_ = self.class_permutation_[np.asarray(y, dtype=int)]
-        else:
-            self.class_permutation_ = None
-            self.y_train_ = np.asarray(y, dtype=np.float32) if y is not None else None
-        return self
-
-    def transform(self, X):
-        X = self._finite(X)
-        X = self._interaction_transform(X)
-        X = self.unique_filter_.transform(X)
-        X = self._transform_numeric(X)
-        X = self._transform_encode(X)
-        X = self._append_fingerprint(X)
-        X = self._transform_svd(X)
-        return self._finite(X[:, self.feature_permutation_]).astype(np.float32)
-
-    def inverse_class_probabilities(self, probabilities):
-        if self.class_permutation_ is None:
-            return probabilities
-        return np.asarray(probabilities)[:, self.class_permutation_]
-
-
-class PipelineEnsemble:
-    """Ordered collection of independently fitted :class:`PipelineMember` objects."""
-
-    def __init__(self, *, classification, specs, categorical_indices=None, random_state=None):
-        self.classification = classification
-        self.specs = tuple(specs)
-        self.categorical_indices = list(categorical_indices or [])
-        self.random_state = random_state
-
-    @property
-    def member_names(self):
-        return [spec.name for spec in self.specs]
-
-    def fit(self, X, y, member_indices=None):
-        indices = range(len(self.specs)) if member_indices is None else member_indices
-        self.members_ = []
-        self.member_indices_ = []
-        self.failed_members_ = []
-        for index in indices:
-            spec = self.specs[index]
-            try:
-                member = PipelineMember(
-                    spec, categorical_indices=self.categorical_indices, random_state=self.random_state,
-                    classification=self.classification,
-                ).fit(X, y)
-            except Exception as exc:
-                self.failed_members_.append({"index": index, "name": spec.name, "reason": repr(exc)})
-                continue
-            self.members_.append(member)
-            self.member_indices_.append(index)
-        return self
-
-
-def large_classifier_pipeline_specs() -> tuple[PipelineSpec, ...]:
-    """Return a deterministic low-cost subset for very large training sets.
-
-    The default LimiX member table is intentionally unchanged.  This route
-    removes interaction, SVD, original-column expansion, and dense one-hot
-    members before fitting, while retaining several distinct numeric and
-    ordinal views.
-    """
-    default = default_classifier_pipeline_specs()
-    # Keep diverse, non-expanding members in their original stable order.
-    keep = (0, 2, 4, 5, 9, 10, 17, 21)
-    return tuple(default[index] for index in keep)
-
-
-def large_regressor_pipeline_specs() -> tuple[PipelineSpec, ...]:
-    """Return the non-SVD regression members for very large training sets."""
-    default = default_regressor_pipeline_specs()
-    # The first four default members use adaptive SVD; the latter four are
-    # the cheaper power/one-hot views and retain the original member identity.
-    return tuple(default[index] for index in range(4, len(default)))
-
-
-__all__ = [
-    "PipelineSpec", "PipelineMember", "PipelineEnsemble",
-    "default_classifier_pipeline_specs", "default_regressor_pipeline_specs",
-    "large_classifier_pipeline_specs", "large_regressor_pipeline_specs",
-]
