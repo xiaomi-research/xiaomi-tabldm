@@ -28,15 +28,20 @@ Inference enhancement follows the **v2 no-K-Fold rules**
   fusion shrinkage target).  Candidates are never filtered by name or slot
   index — the NNLS support drifts across seeds (v2 §2.3).
 * Weight learning is kept, but only on a **single stratified holdout**.
-  K-Fold is completely disabled (v2 §3.2).  Fusion shrinks the holdout NNLS
-  towards the group prior (v2 §3.5)::
+  K-Fold is completely disabled (v2 §3.2).  Fusion shrinks the holdout term
+  towards the group prior (v2 §3.5), with a two-level holdout split that
+  mirrors ``TabLDMRegressor`` v3.1::
 
-      p = (1 - lambda) * mix(pi_0) + lambda * p_nnls_holdout
+      holdout_pred = (1 - rho) * mix(pi_hold) + rho * slot_nnls_pred
+      p            = (1 - lambda) * mix(pi_0) + lambda * holdout_pred
 
   where ``lambda`` is tiered by ``val_per_weight = n_val / E``
-  (0 / 0.25 / 0.50 / 0.75 at 5 / 10 / 20).  Per v2 §4.2 the legacy
-  ``0.75*nnls + 0.25*uniform`` foundation is replaced by this group prior —
-  the foundation rate is ``1 - lambda`` and is never 0 at the rule tiers.
+  (0 / 0.25 / 0.50 / 0.75 at 5 / 10 / 20), ``pi_hold`` is the *group mass*
+  of the slot-level NNLS (the stable signal), and ``rho = slot_blend_rate``
+  caps the sparse slot support (the noisy part, v2 §2.3) at 0.3 of the
+  holdout budget.  Per v2 §4.2 the legacy ``0.75*nnls + 0.25*uniform``
+  foundation is replaced by this group prior — the foundation rate is
+  ``1 - lambda`` and is never 0 at the rule tiers.
 * Routing statistics come from the training matrix actually received (v2
   §3.3), never from upstream dataset metadata (v2 §1.3).  Small-sample
   equal-weight fallbacks are gone: every fusion fallback is the group prior
@@ -110,6 +115,26 @@ if TYPE_CHECKING:
 
 _ADAPTIVE_DEFAULT_NORMS = ["none", "power"]
 _ADAPTIVE_ENS4_NORMS = ["none", "power", "quantile", "robust"]
+
+# ---------------------------------------------------------------------------
+# Heavy-dataset enhancement budget (tabarena test6 bag-fold timeout fix).
+# ---------------------------------------------------------------------------
+# AutoGluon's bagging guard drops a whole bagged model as soon as one fold looks
+# too slow to fit ``time_limit / num_bag_folds`` (3600/8 = 450s in that setup),
+# so a merely-slow fold costs the entire dataset, not just that fold.  Measured
+# fold costs track the number of candidate forwards and roughly the *square* of
+# the per-candidate feature width — which is what put APSFailure / Bioresponse /
+# hiva_agnostic / kddcup09_appetency at 450-830s per fold (E=32-72, width up to
+# 300) while every other classification fold stayed under ~200s.  Those four are
+# also the only classification datasets above ~2M train cells (3.1M-7.5M; the
+# largest that fit comfortably was 2.0M), so ``_HEAVY_N_CELLS`` selects exactly
+# them.  On those the pool is cut to the main group at ``_HEAVY_N_ESTIMATORS``
+# candidates and feature sampling (where it was already on) narrows to
+# ``_HEAVY_MAX_NUM_FEATURES`` columns — together worth ~2-5x on the fold, enough
+# to clear the 450s guard with margin.  See ``_apply_enhancement_budget``.
+_HEAVY_N_CELLS = 2_500_000
+_HEAVY_N_ESTIMATORS = 16
+_HEAVY_MAX_NUM_FEATURES = 192
 
 
 def _get_adaptive_inference_config(n_features, n_num, enable_augmentations=False):
@@ -281,13 +306,26 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         Deprecated. No longer used (K-Fold is disabled).
 
     shrink_lambda : float or None, default=None
-        Fusion weight of the holdout NNLS term (v2 §3.5):
-        ``p = (1 - lambda) * mix(pi_0) + lambda * p_nnls_holdout``.
+        Fusion weight of the holdout term (v2 §3.5):
+        ``p = (1 - lambda) * mix(pi_0) + lambda * holdout_pred``.
         ``None`` (default) picks the tiered rule value from
         ``val_per_weight = n_val / E`` (0/0.25/0.50/0.75 at 5/10/20, and
         always 0 for ``n_train < 1000``). An explicit float in ``[0, 1]``
         overrides the tiers (``0`` = pure group prior). Ignored when
         ``validation=False``.
+
+    slot_blend_rate : float, default=0.3
+        Split of the *holdout* budget between the stable group-mass target
+        and the full slot-level NNLS prediction
+        (``holdout_pred = (1 - rho) * mix(pi_hold) + rho * slot_nnls``,
+        ``rho = slot_blend_rate``), mirroring ``TabLDMRegressor`` v3.1.
+        ``pi_hold`` is the group mass of the slot-level NNLS (2-5 numbers)
+        and ``mix(pi_hold)`` the group-equal mixture it induces. The sparse
+        slot support is the noisy part (v2 §2.3: it drifts across seeds), so
+        it is capped at ``rho`` of the holdout budget — ``0`` = group masses
+        only, ``1`` = pure sparse NNLS. This is what keeps a cornered holdout
+        solution (e.g. 5/36 nonzero, all on one group) from dominating the
+        final prediction at ``lambda=0.75``.
 
     group_prior : Optional[dict[str, float]], default=None
         Explicit group mixing ratios ``pi_0``, e.g. ``{'main': 1.0}`` for a
@@ -336,6 +374,19 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
     n_gaussian_rank_estimators : int, default=16
         Number of Gaussian rank candidates (v2 §3.4 rule size).
+
+    heavy_enhancement_budget : bool, default=True
+        Cap the enhancement pool on datasets whose folds would blow a bagging
+        time budget (``n_train * n_features >= 2.5e6`` — the four datasets that
+        timed out in the tabarena test6 run). On those the main group is capped
+        at 16 candidates, the extra groups (adaptive_plus / gaussian_rank /
+        svd_ens / quantile) are switched off, and feature sampling narrows to
+        192 columns. Routing and the group prior are computed *before* the cap,
+        so the v2 §3.4 rules are unchanged and the off-groups' prior mass folds
+        into ``main`` as usual (§3.6); the cap does override explicitly passed
+        group sizes (printed as ``[TabLDM:route] heavy dataset budget``). Set to
+        False to keep the full pool everywhere (the fold then risks the
+        bagging guard on those datasets).
     """
 
     def __init__(
@@ -374,6 +425,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         k_fold: bool = False,
         n_splits: int = 1,
         shrink_lambda: float | None = None,
+        slot_blend_rate: float = 0.3,
         group_prior: dict[str, float] | None = None,
         use_svd_ens: bool | None = None,
         n_svd_ens_estimators: int | None = None,
@@ -385,6 +437,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         calibration_lambda: float = 1e-2,
         use_gaussian_rank_ens: bool | None = None,
         n_gaussian_rank_estimators: int = 16,
+        heavy_enhancement_budget: bool = True,
     ):
         # base
         if svd_ens_norm_methods is None:
@@ -422,6 +475,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.k_fold = k_fold
         self.n_splits = n_splits
         self.shrink_lambda = shrink_lambda
+        self.slot_blend_rate = slot_blend_rate
         self.group_prior = group_prior
         self.use_svd_ens = use_svd_ens
         self.n_svd_ens_estimators = n_svd_ens_estimators
@@ -433,6 +487,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.calibration_lambda = calibration_lambda
         self.use_gaussian_rank_ens = use_gaussian_rank_ens
         self.n_gaussian_rank_estimators = n_gaussian_rank_estimators
+        self.heavy_enhancement_budget = heavy_enhancement_budget
 
     # ==================================================================
     # Model loading (MoE architecture)
@@ -614,6 +669,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.nnls_weight_map_ = None
         self.nnls_valid_candidate_mask_ = None
         self.calibration_params_ = None
+        self.group_prior_holdout_ = None
         self._cal_P_ = None
         self._cal_y_ = None
         self.shrink_lambda_ = 0.0
@@ -629,10 +685,13 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 )
             if self.shrink_lambda is not None and not (0.0 <= self.shrink_lambda <= 1.0):
                 raise ValueError(f"shrink_lambda must be in [0, 1] or None (auto), got {self.shrink_lambda}")
+            if not (0.0 <= self.slot_blend_rate <= 1.0):
+                raise ValueError(f"slot_blend_rate must be in [0, 1], got {self.slot_blend_rate}")
 
             # ---- v2 §3.3 / §3.4 / §3.6 routing (before any generator is fitted) ----
             self.route_stats_ = self._compute_route_stats(X)
             self.group_config_ = self._route_candidate_pool(self.route_stats_)
+            self._apply_enhancement_budget(X)
             self.group_prior_ = self._resolve_group_prior(self.route_stats_, self.group_config_)
             self._log_routing()
 
@@ -667,18 +726,17 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             )
             self.feat_sample_indices_ = None
             if self.max_num_features is not None and n_features > self.max_num_features:
+                sample_width = self._feat_sample_width_
                 seed_base = self.random_state if self.random_state is not None else 0
                 self.feat_sample_indices_ = [
                     np.sort(
-                        np.random.default_rng(seed_base + est_idx).choice(
-                            n_features, size=self.max_num_features, replace=False
-                        )
+                        np.random.default_rng(seed_base + est_idx).choice(n_features, size=sample_width, replace=False)
                     )
                     for est_idx in range(n_total_estimators)
                 ]
                 print(
                     f"[TabLDM] feature sampling triggered: "
-                    f"n_features={n_features} -> max_num_features={self.max_num_features}, "
+                    f"n_features={n_features} -> max_num_features={sample_width}, "
                     f"n_estimators={n_total_estimators}"
                 )
             else:
@@ -951,7 +1009,21 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         # gaussian_rank gate shared by R2-R5 (§3.4 note), with the R1 /
         # low-cardinality-R2 override from the analysis script's _v2_route.
-        gr_ok = (2000 <= n_train <= 30000 and 11 <= n_features <= 100) or mean_cat_card >= 8
+        #
+        # Boundary recalibration (tabldm_cls_0924_1312_vs_0923_1110): the v2
+        # draft's `2k <= n_train <= 30k and 11 <= n_features <= 100` window
+        # excluded datasets *by one unit* where gr's measured marginal was the
+        # strongest — E-CommereShippingData (10 features, marginal +0.0070,
+        # the largest in the whole ablation) and GiveMeSomeCredit (10
+        # features) lost to the `11 <=` floor, bank-marketing (n_train=30140)
+        # to the `<=30k` cap.  Per-dataset medians: turning gr off where its
+        # marginal is positive -0.31% err (the only negative-median group),
+        # where non-positive +0.04%.  The feature ceiling alone already
+        # protects the measured negatives (kddcup09 210f / APSFailure 169f /
+        # MIC 111f), and the `n_train >= 2000` floor stays: the <2k band is
+        # where dropping gr produced the wins (blood +0.93%, Is-this +0.62%,
+        # hazelnut +2.95%, anneal +89.96%).
+        gr_ok = (n_train >= 2000 and n_features <= 100) or mean_cat_card >= 8
         if stats["high_dim"] or (stats["cat_dominant"] and mean_cat_card < 8):
             gr_ok = False
 
@@ -1072,6 +1144,47 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         if val_per_weight >= 5:
             return 0.25
         return 0.0
+
+    def _apply_enhancement_budget(self, X: np.ndarray) -> None:
+        """Cap the inference-enhancement pool on heavy datasets (bag-fold budget).
+
+        Called after the v2 §3.4 pool decision and before the group prior is
+        resolved, so routing itself is untouched and the disabled groups' prior
+        mass folds into ``main`` through the regular §3.6 path. Feature sampling
+        keeps its original ``max_num_features`` *trigger* (only the sampled width
+        shrinks), so ``feat_sampled`` / ``high_dim`` — and therefore the rule and
+        the prior — stay consistent with what routing predicted.
+
+        ``self.n_estimators`` is narrowed in place because every downstream use
+        (generator sizes, the ``== 32`` cross-feature gate, the candidate-index
+        layout, ``predict``) has to see the same pool the fit built.
+        """
+        self._feat_sample_width_ = self.max_num_features
+        if not self.heavy_enhancement_budget:
+            return
+        n_cells = int(X.shape[0]) * int(X.shape[1])
+        if n_cells < _HEAVY_N_CELLS:
+            return
+
+        n_est_og, feat_og = self.n_estimators, self._feat_sample_width_
+        self.n_estimators = min(self.n_estimators, _HEAVY_N_ESTIMATORS)
+        if self._feat_sample_width_ is not None:
+            self._feat_sample_width_ = min(self._feat_sample_width_, _HEAVY_MAX_NUM_FEATURES)
+
+        cfg = self.group_config_
+        cfg["use_ap"] = False
+        cfg["use_gr"] = False
+        cfg["use_svd_ens"] = False
+        cfg["n_gr"] = 0
+        cfg["n_svd_ens"] = 0
+        cfg["n_quantile"] = 0
+
+        print(
+            f"[TabLDM:route] heavy dataset budget (n_cells={n_cells} >= {_HEAVY_N_CELLS}): "
+            f"n_estimators {n_est_og}->{self.n_estimators}, "
+            f"sample_width {feat_og}->{self._feat_sample_width_}, "
+            f"extra groups off (ap/gr/svd_ens/quantile)"
+        )
 
     def _log_routing(self) -> None:
         """One-shot log of the routing inputs and decisions (v2 §4.5)."""
@@ -1758,13 +1871,15 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
     def _fit_nnls_weights(self, X: np.ndarray, y: np.ndarray) -> None:
         """v2 §3.5 fusion: single-holdout NNLS shrunk towards the group prior.
 
-        Learns ``p = (1 - lambda) * mix(pi_0) + lambda * p_nnls_holdout``. Every
+        Learns ``p = (1 - lambda) * mix(pi_0) + lambda * holdout_pred`` with
+        ``holdout_pred = (1 - rho) * mix(pi_hold) + rho * slot_nnls``. Every
         failure path falls back to the group prior — never to all-candidate
         equal weighting (v2 §3.5 / §4.1).
         """
         self.nnls_weights_ = None
         self.nnls_weight_map_ = None
         self.nnls_valid_candidate_mask_ = None
+        self.group_prior_holdout_ = None
 
         n_full = X.shape[0]
         n_val = math.ceil(0.2 * n_full)
@@ -1819,10 +1934,22 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         else:
             self.nnls_weights_ = weights
             self.nnls_weight_map_ = {nm: float(w) for nm, w in zip(names_valid, weights, strict=False) if w > 0}
+            # pi_hold: the *group masses* of the slot solution — the stable
+            # holdout target of the two-level shrinkage (_combine_probs).
+            pi_hold = self._slot_group_mass(weights, names_valid) or dict(self.group_prior_)
+            self.group_prior_holdout_ = dict(pi_hold)
+            rho = float(self.slot_blend_rate)
             print(
                 f"[TabLDM:nnls] learned ensemble weights: E={weights.shape[0]} "
                 f"(over {int(valid_mask.sum())}/{valid_mask.shape[0]} valid candidates), "
                 f"sum={weights.sum():.6f}"
+            )
+            print(
+                f"[TabLDM:nnls] holdout shrinkage: lambda={lam:.2f}, rho={rho:.2f}, "
+                f"blend={1.0 - lam:.2f}*mix(pi_0) + {lam * (1.0 - rho):.2f}*mix(pi_hold) "
+                f"+ {lam * rho:.2f}*slot_nnls, "
+                f"pi_hold=({pi_hold.get('main', 0.0):.4f}, ap={pi_hold.get('ap', 0.0):.4f}, "
+                f"gr={pi_hold.get('gr', 0.0):.4f}, svd={pi_hold.get('svd', 0.0):.4f})"
             )
 
         if self.enable_calibration:
@@ -2043,21 +2170,57 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             return None
         return np.tensordot(w / w_sum, probs, axes=(0, 0))
 
-    def _combine_probs(self, probs: np.ndarray, names: list[str]) -> np.ndarray:
-        """v2 §3.5 fusion: ``p = (1 - lambda) * mix(pi_0) + lambda * p_nnls_holdout``.
+    def _slot_group_mass(self, weights: np.ndarray, names: list[str]) -> dict[str, float]:
+        """Aggregate a slot-level NNLS weight vector to group masses (pi_hold).
 
-        Per v2 §4.2 the legacy ``0.75*nnls + 0.25*uniform`` foundation is
-        replaced by the group prior: ``mix(pi_0)`` is the foundation term and
-        ``1 - lambda`` the foundation rate (1.0 / 0.75 / 0.50 / 0.25 at the
-        §3.5 tiers — never 0). Row-stochastic output.
+        This is the smooth, non-cornering holdout target: the stable signal is
+        the *group mass* of the slot-level solution (2-5 numbers), not the
+        sparse slot support, which drifts across seeds (v2 §2.3).
+        """
+        totals = dict.fromkeys(self._GROUP_KEYS, 0.0)
+        for nm, w in zip(names, weights, strict=False):
+            totals[self._candidate_group(nm)] += float(w)
+        total = float(sum(totals.values()))
+        if not np.isfinite(total) or total <= 0:
+            return {}
+        return {k: v / total for k, v in totals.items() if v > 0}
+
+    def _combine_probs(self, probs: np.ndarray, names: list[str]) -> np.ndarray:
+        """Two-level holdout shrinkage (mirrors TabLDMRegressor v3.1)::
+
+            holdout_pred = (1 - rho) * mix(pi_hold) + rho * slot_nnls_pred
+            p            = (1 - lambda) * mix(pi_0) + lambda * holdout_pred
+
+        ``mix(pi_hold)`` carries the stable group-mass correction and the
+        slot-level NNLS only restores within-group reweighting, capped to
+        ``rho = slot_blend_rate`` of the holdout budget (the sparse support is
+        the noisy part — v2 §2.3). Per v2 §4.2 the legacy
+        ``0.75*nnls + 0.25*uniform`` foundation is gone: ``mix(pi_0)`` is the
+        foundation and ``1 - lambda`` the foundation rate (1.0 / 0.75 / 0.50 /
+        0.25 at the §3.5 tiers — never 0). Row-stochastic output.
         """
         p_prior = self._group_prior_prediction(probs, names)
         lam = float(getattr(self, "shrink_lambda_", 0.0) or 0.0)
         if lam <= 0.0:
             out = p_prior
         else:
-            p_nnls = self._nnls_prediction(probs, names)
-            out = p_prior if p_nnls is None else (1.0 - lam) * p_prior + lam * p_nnls
+            rho = float(self.slot_blend_rate)
+            pi_hold = getattr(self, "group_prior_holdout_", None)
+            parts: list[np.ndarray] = []
+            weights: list[float] = []
+            if pi_hold:
+                parts.append(self._group_prior_prediction(probs, names, pi=pi_hold))
+                weights.append(1.0 - rho)
+            p_slot = self._nnls_prediction(probs, names)
+            if p_slot is not None:
+                parts.append(p_slot)
+                weights.append(rho if pi_hold else 1.0)
+            if not parts:
+                out = p_prior
+            else:
+                w_total = float(sum(weights))
+                p_holdout = sum(w * p for w, p in zip(weights, parts, strict=False)) / w_total
+                out = (1.0 - lam) * p_prior + lam * p_holdout
 
         row_sums = out.sum(axis=1, keepdims=True)
         row_sums = np.where(row_sums > 0, row_sums, 1.0)
@@ -2305,12 +2468,12 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             f"gaussian_rank={group_counts['gr']})"
         )
 
-        # v2 §3.5 fusion: shrinkage of the holdout NNLS towards the group
-        # prior. Never an unweighted candidate mean (v2 §4.1).
+        # v2 §3.5 fusion: two-level shrinkage of the holdout term towards the
+        # group prior. Never an unweighted candidate mean (v2 §4.1).
         proba = self._combine_probs(probs, names_valid)
 
-        nnls_map = getattr(self, "nnls_weight_map_", None)
-        weight_mode = f"group_prior+nnls(lambda={self.shrink_lambda_:.2f})" if nnls_map else "group_prior"
+        lam = float(getattr(self, "shrink_lambda_", 0.0) or 0.0)
+        weight_mode = f"prior+holdout(lam={lam:.2f},rho={self.slot_blend_rate:.2f})" if lam > 0.0 else "group_prior"
         print(
             f"[TabLDM:enhance] weight_mode={weight_mode} valid_candidates={n_estimators} final_proba_shape={proba.shape}"
         )
