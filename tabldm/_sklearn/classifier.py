@@ -1048,30 +1048,72 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
     def _batch_forward(
         self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: Optional[np.ndarray] = None
     ) -> np.ndarray:
-        """Process model forward passes in batches."""
-        batch_size = self.batch_size_ or Xs.shape[0]
-        n_batches = np.ceil(Xs.shape[0] / batch_size)
-        Xs = np.array_split(Xs, n_batches)
-        ys = np.array_split(ys, n_batches)
-        if feature_shuffles is None:
-            feature_shuffles = [None] * n_batches
-        else:
-            feature_shuffles = np.array_split(feature_shuffles, n_batches)
+        """Process model forward passes in batches, optionally across GPUs."""
+        devices = getattr(self, "devices_", [self.device_])
 
+        if len(devices) <= 1:
+            return self._forward_on_device(
+                self.model_, self.device_, Xs, ys, feature_shuffles
+            )
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        chunks = np.array_split(np.arange(Xs.shape[0]), len(devices))
+
+        def run_on_device(device: torch.device, indices: np.ndarray):
+            shuffled = None if feature_shuffles is None else feature_shuffles[indices]
+            return self._forward_on_device(
+                self._model_for_device(device), device, Xs[indices], ys[indices], shuffled
+            )
+
+        with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+            futures = [
+                executor.submit(run_on_device, device, indices)
+                if indices.size > 0 else None
+                for device, indices in zip(devices, chunks)
+            ]
+            results = [None if future is None else future.result() for future in futures]
+
+        return np.concatenate([result for result in results if result is not None], axis=0)
+
+    def _forward_on_device(
+        self,
+        model,
+        device: torch.device,
+        Xs: np.ndarray,
+        ys: np.ndarray,
+        feature_shuffles: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Run the classifier forward pass on one device and return CPU logits/probs."""
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+
+        batch_size = self.batch_size_ or Xs.shape[0]
+        n_batches = int(np.ceil(Xs.shape[0] / batch_size))
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        if feature_shuffles is None:
+            shuffles_split = [None] * len(Xs_split)
+        else:
+            shuffles_split = np.array_split(feature_shuffles, n_batches)
+
+        inference_config = self._inference_config_for_device(device)
         outputs = []
-        for X_batch, y_batch, shuffle_batch in zip(Xs, ys, feature_shuffles):
-            X_batch = torch.from_numpy(X_batch).float().to(self.device_)
-            y_batch = torch.from_numpy(y_batch).float().to(self.device_)
+        for X_batch, y_batch, shuffle_batch in zip(Xs_split, ys_split, shuffles_split):
+            if X_batch.shape[0] == 0:
+                continue
+            X_batch = torch.from_numpy(X_batch).float().to(device)
+            y_batch = torch.from_numpy(y_batch).float().to(device)
             if shuffle_batch is not None:
                 shuffle_batch = shuffle_batch.tolist()
             with torch.no_grad():
-                out = self.model_(
+                out = model(
                     X=X_batch,
                     y_train=y_batch,
                     feature_shuffles=shuffle_batch,
                     return_logits=True if self.average_logits else False,
                     softmax_temperature=self.softmax_temperature,
-                    inference_config=self.inference_config_,
+                    inference_config=inference_config,
                 )
             outputs.append(out.float().cpu().numpy())
         return np.concatenate(outputs, axis=0)

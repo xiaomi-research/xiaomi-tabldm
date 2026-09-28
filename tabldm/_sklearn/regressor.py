@@ -829,11 +829,13 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         alphas: Optional[List[float]] = None,
         feat_indices: Optional[List[np.ndarray]] = None,
     ) -> np.ndarray | dict[str, np.ndarray]:
-        """Process model forward passes in batches to manage memory efficiently.
+        """Process model forward passes in batches, optionally across GPUs.
 
         ``feat_indices`` holds one column subset per row of ``Xs``, expressed in
         the column space of ``Xs`` itself (see ``_feat_sample``). A ``None``
-        entry means "keep every column" for that row.
+        entry means "keep every column" for that row.  When ``self.devices_``
+        contains more than one device, estimator rows are partitioned across
+        devices and evaluated concurrently, then concatenated in original order.
         """
         if feat_indices is not None:
             Xs = np.stack(
@@ -844,25 +846,84 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 axis=0,
             )
 
+        output_type = [output_type] if isinstance(output_type, str) else list(output_type)
+        devices = getattr(self, "devices_", [self.device_])
+
+        if len(devices) <= 1:
+            return self._forward_on_device(
+                self.model_, self.device_, Xs, ys, output_type, alphas
+            )
+
+        # Partition estimator rows contiguously across devices.  Contiguous
+        # chunks keep global row order stable when results are concatenated.
+        from concurrent.futures import ThreadPoolExecutor
+
+        chunks = np.array_split(np.arange(Xs.shape[0]), len(devices))
+
+        def run_on_device(device: torch.device, indices: np.ndarray):
+            return self._forward_on_device(
+                self._model_for_device(device),
+                device,
+                Xs[indices],
+                ys[indices],
+                output_type,
+                alphas,
+            )
+
+        with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+            futures = [
+                executor.submit(run_on_device, device, indices)
+                if indices.size > 0 else None
+                for device, indices in zip(devices, chunks)
+            ]
+            results = [None if future is None else future.result() for future in futures]
+
+        if len(output_type) == 1:
+            key = output_type[0]
+            parts = [result for result in results if result is not None]
+            return np.concatenate(parts, axis=0)
+
+        merged = {key: [] for key in output_type}
+        for result in results:
+            if result is None:
+                continue
+            for key in output_type:
+                merged[key].append(result[key])
+        return {key: np.concatenate(merged[key], axis=0) for key in output_type}
+
+    def _forward_on_device(
+        self,
+        model,
+        device: torch.device,
+        Xs: np.ndarray,
+        ys: np.ndarray,
+        output_type: list[str],
+        alphas: Optional[List[float]],
+    ) -> np.ndarray | dict[str, np.ndarray]:
+        """Run ``predict_stats`` on one device and return CPU NumPy output."""
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+
         batch_size = self.batch_size_ or Xs.shape[0]
-        n_batches = np.ceil(Xs.shape[0] / batch_size)
-        Xs = np.array_split(Xs, n_batches)
-        ys = np.array_split(ys, n_batches)
+        n_batches = int(np.ceil(Xs.shape[0] / batch_size))
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        inference_config = self._inference_config_for_device(device)
 
-        output_type = [output_type] if isinstance(output_type, str) else output_type
         results = {key: [] for key in output_type}
-
-        for X_batch, y_batch in zip(Xs, ys):
-            X_batch = torch.from_numpy(X_batch).float().to(self.device_)
-            y_batch = torch.from_numpy(y_batch).float().to(self.device_)
+        for X_batch, y_batch in zip(Xs_split, ys_split):
+            if X_batch.shape[0] == 0:
+                continue
+            X_batch = torch.from_numpy(X_batch).float().to(device)
+            y_batch = torch.from_numpy(y_batch).float().to(device)
 
             with torch.no_grad():
-                out = self.model_.predict_stats(
+                out = model.predict_stats(
                     X_batch,
                     y_batch,
                     output_type=output_type,
                     alphas=alphas,
-                    inference_config=self.inference_config_,
+                    inference_config=inference_config,
                 )
                 if isinstance(out, dict):
                     for key in output_type:
