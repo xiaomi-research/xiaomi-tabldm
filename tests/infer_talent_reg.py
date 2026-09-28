@@ -179,6 +179,7 @@ def run_dataset(ds_dir, ckpt, n_estimators, batch_size, device, verbose, seed_nu
     for seed in range(seed_num):
         set_seeds(seed)
         reg = TabLDMRegressor(
+            enhance_candidates=True,
             n_estimators=n_estimators,
             norm_methods=["none", "power"],
             model_path=ckpt, allow_auto_download=False,

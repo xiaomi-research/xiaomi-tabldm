@@ -115,19 +115,19 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
     Parameters
     ----------
-    n_estimators : int, default=8
+    n_estimators : int, default=32
         Number of estimators for the main ensemble group.
 
     norm_methods : str or list[str] or None, default=None
         Normalization methods for the main group.
 
-    feat_shuffle_method : str, default='latin'
+    feat_shuffle_method : str, default='random'
         Feature permutation strategy.
 
     outlier_threshold : float, default=4.0
         Z-score threshold for outlier detection.
 
-    batch_size : int, "auto", or None, default=4
+    batch_size : int, "auto", or None, default=8
         Batch size for inference. ``"auto"`` picks a value based on
         ``n_samples_in_ * n_features_in_`` to reduce CUDA memory pressure on
         large datasets (<=1M cells -> 8, <=2M -> 4, <=5M -> 2, else 1).
@@ -171,12 +171,41 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
     inference_config : Optional[InferenceConfig | Dict], default=None
         Fine-grained inference configuration.
 
-    enhance_candidates : bool, default=False
+    enhance_candidates : bool, default=True
         Master switch for inference enhancement. When False, runs the plain
-        single-group inference path with no ensembling enhancements.
+        single-group inference path with no ensembling enhancements. When
+        True, candidates follow the fixed group ordering of the external MiTab
+        ``regressor_attnres_ensemble.py`` reference:
+
+        1. main group (``n_estimators``): even-index candidates use plain
+           features, odd-index candidates receive SVD+cross augmentation when
+           ``n_estimators == 32`` and ``norm_methods == ['none', 'power']``;
+        2. quantile group (``n_quantile_estimators``);
+        3. quantile-SVD group (``n_quantile_svd_estimators``): even-index
+           candidates are plain quantile views, odd-index candidates receive
+           SVD+cross augmentation when the count is 32;
+        4. independent SVD group (``n_svd_ens_estimators``): an
+           ``EnsembleGenerator`` with ``use_svd=True`` views built from
+           ``svd_ens_norm_methods`` / ``svd_ens_n_components``;
+        5. HK group (high-kurtosis target transforms, original target scale,
+           appended last to the NNLS/predict candidate matrix).
 
     n_quantile_estimators : int, default=16
         Number of quantile-safe candidates.
+
+    n_quantile_svd_estimators : int, default=0
+        Number of quantile-normalized SVD/cross candidates. When set to 32,
+        odd-index candidates in this group are SVD+cross augmented.
+
+    n_svd_ens_estimators : int, default=16
+        Number of independent SVD-feature candidates (group 4 above), generated
+        by an ``EnsembleGenerator(use_svd=True)``.
+
+    svd_ens_norm_methods : list[str], default=['none', 'power', 'quantile', 'robust']
+        Normalization methods for the independent SVD group.
+
+    svd_ens_n_components : int, default=10
+        Number of SVD components in the independent SVD group.
 
     use_cross_feature : bool, default=True
         Append SVD + cross features to odd-indexed main candidates.
@@ -193,7 +222,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
     foundation_rate : float, default=0.25
         Blend ratio for foundation (equal-weight) prediction.
 
-    max_num_features : Optional[int], default=500
+    max_num_features : Optional[int], default=300
         Max features before triggering per-estimator sampling.
 
     enable_high_kurtosis_target_ensemble : bool, default=True
@@ -209,11 +238,11 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
     def __init__(
         self,
         # -- base parameters --
-        n_estimators: int = 8,
-        norm_methods: Optional[str | List[str]] = None,
-        feat_shuffle_method: str = "latin",
+        n_estimators: int = 32,
+        norm_methods: Optional[str | List[str]] = ['none','power'],
+        feat_shuffle_method: str = "random",
         outlier_threshold: float = 4.0,
-        batch_size: Optional[int | str] = 4,
+        batch_size: Optional[int | str] = 8,
         kv_cache: bool | str = False,
         model_path: Optional[str | Path] = None,
         allow_auto_download: bool = True,
@@ -228,8 +257,12 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
         # -- enhancement parameters --
-        enhance_candidates: bool = False,
+        enhance_candidates: bool = True,
         n_quantile_estimators: int = 16,
+        n_quantile_svd_estimators: int = 0,
+        n_svd_ens_estimators: int = 16,
+        svd_ens_norm_methods: Optional[List[str]] = ['none','power','quantile','robust'],
+        svd_ens_n_components: int = 10,
         use_cross_feature: bool = True,
         validation: bool = True,
         k_fold: bool = True,
@@ -262,6 +295,10 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         # enhancement
         self.enhance_candidates = enhance_candidates
         self.n_quantile_estimators = n_quantile_estimators
+        self.n_quantile_svd_estimators = n_quantile_svd_estimators
+        self.n_svd_ens_estimators = n_svd_ens_estimators
+        self.svd_ens_norm_methods = svd_ens_norm_methods or ["none", "power", "quantile", "robust"]
+        self.svd_ens_n_components = svd_ens_n_components
         self.use_cross_feature = use_cross_feature
         self.validation = validation
         self.k_fold = k_fold
@@ -476,6 +513,11 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
           'seed'        : int
         """
         n_hk = self.high_kurtosis_n_estimators  # 8
+        # Same shared UniqueFeatureFilter as the candidate groups, so HK
+        # generators emit the same column width as everything else.
+        frozen_unique_filter = getattr(
+            getattr(self, "ensemble_generator_", None), "unique_filter_", None
+        )
         n_asinh = n_hk // 2    # 4
         n_yj = n_hk - n_asinh  # 4
         base_seed = (self.random_state if self.random_state is not None else 0) + seed_offset
@@ -498,7 +540,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     outlier_threshold=self.outlier_threshold,
                     random_state=seed,
                 )
-                gen.fit(X_tr, y_tr_ts)
+                gen.fit(X_tr, y_tr_ts, frozen_unique_filter=frozen_unique_filter)
                 results.append({
                     "kind": "asinh",
                     "gen": gen,
@@ -524,7 +566,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     outlier_threshold=self.outlier_threshold,
                     random_state=seed,
                 )
-                gen.fit(X_tr, y_tr_t)
+                gen.fit(X_tr, y_tr_t, frozen_unique_filter=frozen_unique_filter)
                 results.append({
                     "kind": "yeojohnson",
                     "gen": gen,
@@ -787,10 +829,19 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         alphas: Optional[List[float]] = None,
         feat_indices: Optional[List[np.ndarray]] = None,
     ) -> np.ndarray | dict[str, np.ndarray]:
-        """Process model forward passes in batches to manage memory efficiently."""
+        """Process model forward passes in batches to manage memory efficiently.
+
+        ``feat_indices`` holds one column subset per row of ``Xs``, expressed in
+        the column space of ``Xs`` itself (see ``_feat_sample``). A ``None``
+        entry means "keep every column" for that row.
+        """
         if feat_indices is not None:
             Xs = np.stack(
-                [Xs[i][:, feat_indices[i]] for i in range(Xs.shape[0])], axis=0
+                [
+                    Xs[i] if feat_indices[i] is None else Xs[i][:, feat_indices[i]]
+                    for i in range(Xs.shape[0])
+                ],
+                axis=0,
             )
 
         batch_size = self.batch_size_ or Xs.shape[0]
@@ -889,6 +940,12 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         )
         self.ensemble_generator_.fit(X, y_scaled)
 
+        # Share one UniqueFeatureFilter across every group so they agree on
+        # column identity and width. Without this each group (and each fold)
+        # refits its own filter and can drop a different set of constant
+        # columns, which shifts the column space feature sampling lives in.
+        shared_unique_filter = self.ensemble_generator_.unique_filter_
+
         # SVD + crossing augmentation for odd estimators in main group
         self.svd_ = None
         if self.n_estimators == 32 and sorted(norm_methods) == ["none", "power"]:
@@ -905,12 +962,56 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
             )
-            self.quantile_ensemble_generator_.fit(X, y_scaled)
+            self.quantile_ensemble_generator_.fit(X, y_scaled, frozen_unique_filter=shared_unique_filter)
+
+        # Quantile-SVD + cross EnsembleGenerator (group 3)
+        self.quantile_svd_ensemble_generator_ = None
+        self._q_svd_ = None
+        self._q__svd_pre_ = None
+        self._q__X_train_svd_ = np.empty((0,), dtype=np.float32)
+        self._q__svd_selections_ = [[] for _ in range(16)]
+        self._q__cross_pool_ = []
+        self._q__cross_scaler_ = None
+        self._q__cross_pool_train_ = np.empty((0,), dtype=np.float32)
+        self._q__cross_selections_ = [[] for _ in range(16)]
+        self._q__k_ = 0
+        if self.n_quantile_svd_estimators > 0:
+            self.quantile_svd_ensemble_generator_ = EnsembleGenerator(
+                classification=False,
+                n_estimators=self.n_quantile_svd_estimators,
+                norm_methods=["quantile"],
+                feat_shuffle_method=self.feat_shuffle_method,
+                outlier_threshold=self.outlier_threshold,
+                random_state=self.random_state,
+            )
+            self.quantile_svd_ensemble_generator_.fit(X, y_scaled, frozen_unique_filter=shared_unique_filter)
+            if self.n_quantile_svd_estimators == 32:
+                self._fit_svd_cross(
+                    self.quantile_svd_ensemble_generator_.X_, attr_prefix="_q_"
+                )
+
+        # Independent SVD feature group (group 4): norms + SVD component
+        # concatenation via the EnsembleGenerator use_svd support.
+        self.svd_ens_generator_ = None
+        if self.n_svd_ens_estimators and self.n_svd_ens_estimators > 0:
+            self.svd_ens_generator_ = EnsembleGenerator(
+                classification=False,
+                n_estimators=self.n_svd_ens_estimators,
+                norm_methods=self.svd_ens_norm_methods,
+                feat_shuffle_method=self.feat_shuffle_method,
+                outlier_threshold=self.outlier_threshold,
+                random_state=self.random_state,
+                use_svd=True,
+                svd_n_components=self.svd_ens_n_components,
+            )
+            self.svd_ens_generator_.fit(X, y_scaled, frozen_unique_filter=shared_unique_filter)
 
         print(
             f"[TabLDM:enhance] Estimator groups: main={self.n_estimators}, "
             f"quantile={self.n_quantile_estimators}, "
-            f"total={self.n_estimators + self.n_quantile_estimators}"
+            f"quantile_svd={self.n_quantile_svd_estimators}, "
+            f"svd_ens(group6)={self.n_svd_ens_estimators}, "
+            f"total={self.n_estimators + (self.n_quantile_estimators or 0) + (self.n_quantile_svd_estimators or 0) + (self.n_svd_ens_estimators or 0)}"
         )
 
         # HK full-train generators
@@ -923,7 +1024,21 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             print(f"[TabLDM:hk] full-train HK generators fitted: {len(self.hk_generators_)}")
 
     def _make_and_fit_generators(self, X_tr: np.ndarray, y_tr: np.ndarray):
-        """Fit all generators on a (possibly reduced) training split."""
+        """Fit all generators on a (possibly reduced) training split.
+
+        Returns a dict with keys 'main_gen', 'val_svd' (may be None), 'q_gen'
+        (may be None), 'q_svd_gen' (may be None), 'q_svd_val_svd' (may be
+        None), 'svd_ens_gen' (may be None), and 'saved_svd' so that
+        _collect_val_predictions can use them.
+        """
+        # Reuse the full-train UniqueFeatureFilter so the fold-local generators
+        # emit the same width (and the same surviving columns) as the full-train
+        # ones. Otherwise a column that is constant only inside the fold gets
+        # dropped here and every downstream column index shifts.
+        frozen_unique_filter = getattr(
+            getattr(self, "ensemble_generator_", None), "unique_filter_", None
+        )
+
         main_gen = EnsembleGenerator(
             classification=False,
             n_estimators=self.n_estimators,
@@ -932,12 +1047,16 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             outlier_threshold=self.outlier_threshold,
             random_state=self.random_state,
         )
-        main_gen.fit(X_tr, y_tr)
+        main_gen.fit(X_tr, y_tr, frozen_unique_filter=frozen_unique_filter)
 
-        # Save and wire SVD/cross state
+        # Save and wire SVD/cross state (main group prefix "" and
+        # quantile-SVD group prefix "_q_").
         svd_attrs = ["svd_", "_svd_pre_", "_X_train_svd_", "_svd_selections_",
                      "_cross_pool_", "_cross_scaler_", "_cross_pool_train_",
-                     "_cross_selections_", "_k_"]
+                     "_cross_selections_", "_k_",
+                     "_q_svd_", "_q__svd_pre_", "_q__X_train_svd_", "_q__svd_selections_",
+                     "_q__cross_pool_", "_q__cross_scaler_", "_q__cross_pool_train_",
+                     "_q__cross_selections_", "_q__k_"]
         saved_svd = {a: getattr(self, a, None) for a in svd_attrs}
 
         val_svd = None
@@ -957,12 +1076,49 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
             )
-            q_gen.fit(X_tr, y_tr)
+            q_gen.fit(X_tr, y_tr, frozen_unique_filter=frozen_unique_filter)
+
+        # Quantile-SVD group (group 3)
+        q_svd_gen = None
+        q_svd_val_svd = None
+        if self.n_quantile_svd_estimators > 0:
+            q_svd_gen = EnsembleGenerator(
+                classification=False,
+                n_estimators=self.n_quantile_svd_estimators,
+                norm_methods=["quantile"],
+                feat_shuffle_method=self.feat_shuffle_method,
+                outlier_threshold=self.outlier_threshold,
+                random_state=self.random_state,
+            )
+            q_svd_gen.fit(X_tr, y_tr, frozen_unique_filter=frozen_unique_filter)
+            if self.n_quantile_svd_estimators == 32:
+                self._fit_svd_cross(q_svd_gen.X_, attr_prefix="_q_")
+                q_svd_val_svd = getattr(self, "_q_svd_", None)
+            else:
+                self._q_svd_ = None
+
+        # Independent SVD feature group (group 4)
+        svd_ens_gen = None
+        if self.n_svd_ens_estimators and self.n_svd_ens_estimators > 0:
+            svd_ens_gen = EnsembleGenerator(
+                classification=False,
+                n_estimators=self.n_svd_ens_estimators,
+                norm_methods=self.svd_ens_norm_methods,
+                feat_shuffle_method=self.feat_shuffle_method,
+                outlier_threshold=self.outlier_threshold,
+                random_state=self.random_state,
+                use_svd=True,
+                svd_n_components=self.svd_ens_n_components,
+            )
+            svd_ens_gen.fit(X_tr, y_tr, frozen_unique_filter=frozen_unique_filter)
 
         return {
             "main_gen": main_gen,
             "val_svd": val_svd,
             "q_gen": q_gen,
+            "q_svd_gen": q_svd_gen,
+            "q_svd_val_svd": q_svd_val_svd,
+            "svd_ens_gen": svd_ens_gen,
             "saved_svd": saved_svd,
         }
 
@@ -976,10 +1132,10 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         """Run all estimators on the validation set and return (E, n_val) predictions."""
         main_gen: EnsembleGenerator = val_gen_info["main_gen"]
         q_gen = val_gen_info["q_gen"]
+        q_svd_gen = val_gen_info.get("q_svd_gen")
         output_type = ["mean"]
 
         all_preds = []
-        fsi = getattr(self, "feat_sample_indices_", None)
 
         # ---- main group ----
         use_augment = (
@@ -1012,7 +1168,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 per_est_preds = {}
 
                 if even_idxs:
-                    fi = [fsi[g] for g in even_global] if fsi is not None else None
+                    fi = self._feat_indices_for(even_global, Xs_both.shape[-1])
                     bout = self._batch_forward(
                         Xs_both[even_idxs], ys[even_idxs], output_type=output_type, feat_indices=fi
                     )
@@ -1022,17 +1178,18 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
                 if odd_idxs:
                     Xs_odd_list = []
-                    for li, ol in zip(odd_idxs, odd_locals):
-                        x_both_i = Xs_both[li]
+                    for li, ol, g in zip(odd_idxs, odd_locals, odd_global):
+                        # Subsample base columns before the cross/SVD concat so
+                        # the augmented tail keeps its own layout.
+                        x_both_i = self._apply_feat_sample(Xs_both[li], g)
                         x_tr = self._augment_estimator(
                             x_both_i[:n_train_rows], X_raw_train, ol, is_train=True)
                         x_te = self._augment_estimator(
                             x_both_i[n_train_rows:], X_raw_val, ol, is_train=False)
                         Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
                     Xs_odd = np.stack(Xs_odd_list, axis=0)
-                    fi = [fsi[g] for g in odd_global] if fsi is not None else None
                     bout = self._batch_forward(
-                        Xs_odd, ys[odd_idxs], output_type=output_type, feat_indices=fi
+                        Xs_odd, ys[odd_idxs], output_type=output_type
                     )
                     preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                     for i, li in enumerate(odd_idxs):
@@ -1047,7 +1204,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             _grp_offset = 0
             for norm_method, (Xs, ys) in data.items():
                 n_est = Xs.shape[0]
-                fi = [fsi[_grp_offset + i] for i in range(n_est)] if fsi is not None else None
+                fi = self._feat_indices_for(range(_grp_offset, _grp_offset + n_est), Xs.shape[-1])
                 bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
                 preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                 all_preds.append(preds_val)
@@ -1059,11 +1216,104 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             _q_offset = self.n_estimators
             for norm_method, (Xs, ys) in q_data.items():
                 n_est = Xs.shape[0]
-                fi = [fsi[_q_offset + i] for i in range(n_est)] if fsi is not None else None
+                fi = self._feat_indices_for(range(_q_offset, _q_offset + n_est), Xs.shape[-1])
                 bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
                 preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                 all_preds.append(preds_val)
                 _q_offset += n_est
+
+        # ---- quantile-SVD group (group 3) ----
+        if q_svd_gen is not None:
+            q_svd_use_augment = (
+                val_gen_info.get("q_svd_val_svd") is not None
+                and self.n_quantile_svd_estimators == 32
+            )
+            _qs_offset = self.n_estimators + (self.n_quantile_estimators or 0)
+            if q_svd_use_augment:
+                q_svd_data = q_svd_gen.transform(X_val, mode="both")
+                X_raw_val_q = q_svd_gen.unique_filter_.transform(X_val)
+                X_raw_train_q = q_svd_gen.X_
+
+                q_global_est_idx = 0
+                q_odd_local = 0
+                for norm_method, (Xs_both, ys) in q_svd_data.items():
+                    n_est_this_method = Xs_both.shape[0]
+                    n_train_rows = ys.shape[1]
+                    even_idxs, odd_idxs, odd_locals = [], [], []
+                    even_global, odd_global = [], []
+                    for local in range(n_est_this_method):
+                        if q_global_est_idx % 2 == 0:
+                            even_idxs.append(local)
+                            even_global.append(q_global_est_idx)
+                        else:
+                            odd_idxs.append(local)
+                            odd_locals.append(q_odd_local)
+                            odd_global.append(q_global_est_idx)
+                            q_odd_local += 1
+                        q_global_est_idx += 1
+
+                    per_est_preds = {}
+
+                    if even_idxs:
+                        fi = self._feat_indices_for([_qs_offset + g for g in even_global], Xs_both.shape[-1])
+                        bout = self._batch_forward(
+                            Xs_both[even_idxs], ys[even_idxs], output_type=output_type, feat_indices=fi
+                        )
+                        preds_val = bout if not isinstance(bout, dict) else bout["mean"]
+                        for i, li in enumerate(even_idxs):
+                            per_est_preds[li] = preds_val[i]
+
+                    if odd_idxs:
+                        Xs_odd_list = []
+                        for li, ol, g in zip(odd_idxs, odd_locals, odd_global):
+                            # Subsample base columns before the cross/SVD concat
+                            # so the augmented tail keeps its own layout.
+                            x_both_i = self._apply_feat_sample(Xs_both[li], _qs_offset + g)
+                            x_tr = self._augment_estimator(
+                                x_both_i[:n_train_rows], X_raw_train_q, ol, is_train=True,
+                                attr_prefix="_q_")
+                            x_te = self._augment_estimator(
+                                x_both_i[n_train_rows:], X_raw_val_q, ol, is_train=False,
+                                attr_prefix="_q_")
+                            Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
+                        Xs_odd = np.stack(Xs_odd_list, axis=0)
+                        bout = self._batch_forward(
+                            Xs_odd, ys[odd_idxs], output_type=output_type
+                        )
+                        preds_val = bout if not isinstance(bout, dict) else bout["mean"]
+                        for i, li in enumerate(odd_idxs):
+                            per_est_preds[li] = preds_val[i]
+
+                    stacked = np.stack(
+                        [per_est_preds[li] for li in range(n_est_this_method)], axis=0
+                    )
+                    all_preds.append(stacked)
+            else:
+                q_svd_data = q_svd_gen.transform(X_val, mode="both")
+                for norm_method, (Xs, ys) in q_svd_data.items():
+                    n_est = Xs.shape[0]
+                    fi = self._feat_indices_for(range(_qs_offset, _qs_offset + n_est), Xs.shape[-1])
+                    bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
+                    preds_val = bout if not isinstance(bout, dict) else bout["mean"]
+                    all_preds.append(preds_val)
+                    _qs_offset += n_est
+
+        # ---- independent SVD group (group 4) ----
+        svd_ens_gen = val_gen_info.get("svd_ens_gen")
+        if svd_ens_gen is not None:
+            svd_ens_data = svd_ens_gen.transform(X_val, mode="both")
+            _svd_ens_offset = (
+                self.n_estimators
+                + (self.n_quantile_estimators or 0)
+                + (self.n_quantile_svd_estimators or 0)
+            )
+            for norm_method, (Xs, ys) in svd_ens_data.items():
+                n_est = Xs.shape[0]
+                fi = self._feat_indices_for(range(_svd_ens_offset, _svd_ens_offset + n_est), Xs.shape[-1])
+                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
+                preds_val = bout if not isinstance(bout, dict) else bout["mean"]
+                all_preds.append(preds_val)
+                _svd_ens_offset += n_est
 
         # Restore SVD attributes on self to their pre-validation state
         for attr, val in val_gen_info["saved_svd"].items():
@@ -1075,18 +1325,57 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         return np.concatenate(all_preds, axis=0)
 
     def _candidate_name(self, idx: int, n_main: int) -> str:
-        """Human-readable candidate label for NNLS weight logging."""
+        """Human-readable candidate label for NNLS weight logging.
+
+        Matches the candidate ordering produced by ``_collect_val_predictions``
+        and ``predict``: main-group estimators occupy indices ``0..n_main-1``
+        (even global index = plain "default", odd = "svd+cross" augmented when
+        the main group augmentation is active), followed by the quantile group,
+        the quantile-SVD group, the independent SVD group, and finally the HK
+        group — mirroring the external MiTab regressor_attnres_ensemble.py
+        ordering.
+        """
         if idx < n_main:
             return f"default[{idx}]" if idx % 2 == 0 else f"svd+cross[{idx}]"
         n_q = self.n_quantile_estimators if getattr(self, "n_quantile_estimators", 0) > 0 else 0
         if idx < n_main + n_q:
             return f"quantile[{idx - n_main}]"
-        hk_idx = idx - n_main - n_q
+        n_qs = self.n_quantile_svd_estimators if getattr(self, "n_quantile_svd_estimators", 0) > 0 else 0
+        if idx < n_main + n_q + n_qs:
+            return f"quantile_svd+cross[{idx - n_main - n_q}]"
+        n_svd_ens = self.n_svd_ens_estimators if getattr(self, "svd_ens_generator_", None) is not None else 0
+        if idx < n_main + n_q + n_qs + n_svd_ens:
+            return f"svd_ens(group6)[{idx - n_main - n_q - n_qs}]"
+        hk_idx = idx - n_main - n_q - n_qs - n_svd_ens
         hk_infos = getattr(self, "hk_generators_", [])
         if hk_idx < len(hk_infos):
             h = hk_infos[hk_idx]
             return f"hk_{h['kind']}[{hk_idx}]"
         return f"hk[{hk_idx}]"
+
+    def _nnls_weight_labels(self, valid_mask: np.ndarray, n_weights: int) -> List[str]:
+        """Map NNLS weight positions back to original candidate names.
+
+        ``valid_mask`` is the boolean mask over original base-estimator indices
+        (True = kept after NaN filtering). The NNLS weight vector layout is
+        [kept base estimators in original order ..., HK rows ...], so weight
+        position ``i`` maps to original estimator ``np.where(valid_mask)[0][i]``
+        for base rows, and to HK rows thereafter. ``n_weights`` is the actual
+        length of the learned weight vector (base-kept + HK rows appended).
+        """
+        valid_orig = np.where(valid_mask)[0]
+        labels = [
+            self._candidate_name(int(g), self.n_estimators)
+            for g in valid_orig[:n_weights]
+        ]
+        hk_infos = getattr(self, "hk_generators_", [])
+        n_hk_rows = max(0, int(n_weights) - len(labels))
+        for j in range(n_hk_rows):
+            if j < len(hk_infos):
+                labels.append(f"hk_{hk_infos[j]['kind']}[{j}]")
+            else:
+                labels.append(f"hk[{j}]")
+        return labels
 
     def _build_kv_cache(self) -> None:
         """Pre-compute KV caches for training data across all ensemble batches."""
@@ -1123,18 +1412,72 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
         # Build KV cache for quantile group
         self.quantile_kv_cache_ = None
-        if self.quantile_ensemble_generator_ is not None:
-            self.quantile_kv_cache_ = _cache_generator(self.quantile_ensemble_generator_)
+        q_gen = getattr(self, "quantile_ensemble_generator_", None)
+        if q_gen is not None:
+            self.quantile_kv_cache_ = _cache_generator(q_gen)
+
+        # Build KV cache for quantile-SVD group (group 3)
+        self.quantile_svd_kv_cache_ = None
+        qs_gen = getattr(self, "quantile_svd_ensemble_generator_", None)
+        if qs_gen is not None:
+            self.quantile_svd_kv_cache_ = _cache_generator(qs_gen)
+
+        # Build KV cache for independent SVD group (group 4)
+        self.svd_ens_kv_cache_ = None
+        svd_ens_gen = getattr(self, "svd_ens_generator_", None)
+        if svd_ens_gen is not None:
+            self.svd_ens_kv_cache_ = _cache_generator(svd_ens_gen)
 
     # ==================================================================
     # Feature sampling
     # ==================================================================
 
+    def _feat_sample(self, est_idx: int, n_cols: int) -> Optional[np.ndarray]:
+        """Column subset for one estimator, in the column space it actually sees.
+
+        ``n_cols`` must be the width of the matrix produced by
+        ``EnsembleGenerator.transform()`` for this estimator -- i.e. *after*
+        ``UniqueFeatureFilter`` (and after the SVD append for the group-4
+        generator), but *before* any ``_augment_estimator`` cross/SVD concat.
+
+        Sampling in that space keeps every index in bounds. Sampling against the
+        raw ``X.shape[1]`` does not: the unique filter drops constant columns,
+        so indices drawn from the raw width can exceed the filtered width and
+        raise ``IndexError``.
+
+        Deterministic in ``(est_idx, n_cols)``, so a fold-local generator and
+        the full-train generator hand the same estimator the same columns.
+        """
+        if self.max_num_features is None or n_cols <= self.max_num_features:
+            return None
+        seed_base = self.random_state if self.random_state is not None else 0
+        return np.sort(
+            np.random.default_rng(seed_base + est_idx).choice(
+                n_cols, size=self.max_num_features, replace=False
+            )
+        )
+
+    def _feat_indices_for(self, est_ids, n_cols: int) -> Optional[List[np.ndarray]]:
+        """Build a ``feat_indices`` list for ``_batch_forward``.
+
+        Returns ``None`` when sampling is inactive so callers can forward it
+        unchanged. Every entry has the same length, so the stacked batch keeps a
+        uniform width.
+        """
+        if self.max_num_features is None or n_cols <= self.max_num_features:
+            return None
+        return [self._feat_sample(g, n_cols) for g in est_ids]
+
     def _apply_feat_sample(self, X: np.ndarray, est_idx: int) -> np.ndarray:
-        """Return X with selected columns if feature sampling is active for est_idx."""
-        if self.feat_sample_indices_ is None or est_idx >= len(self.feat_sample_indices_):
-            return X
-        return X[:, self.feat_sample_indices_[est_idx]]
+        """Subsample base feature columns for ``est_idx`` before augmentation.
+
+        Must run on the generator output *before* ``_augment_estimator`` appends
+        cross/SVD columns, so the sampled columns stay aligned with the base
+        layout the cross/SVD pool was fitted on and the augmented tail keeps its
+        own layout.
+        """
+        idx = self._feat_sample(est_idx, X.shape[-1])
+        return X if idx is None else X[..., idx]
 
     # ==================================================================
     # fit()
@@ -1196,35 +1539,10 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             self.hk_kurtosis_ = float("nan")
             self.hk_triggered_, self.hk_kurtosis_ = self._check_high_kurtosis(y)
 
-            # Feature sampling
-            n_orig_features = X.shape[1]
-            _n_hk_est = self.high_kurtosis_n_estimators if self.hk_triggered_ else 0
-            n_total_estimators = (
-                self.n_estimators
-                + (self.n_quantile_estimators or 0)
-                + _n_hk_est
-            )
-            self.feat_sample_indices_ = None
-            if self.max_num_features is not None and n_orig_features > self.max_num_features:
-                seed_base = self.random_state if self.random_state is not None else 0
-                self.feat_sample_indices_ = [
-                    np.sort(
-                        np.random.default_rng(seed_base + est_idx).choice(
-                            n_orig_features, size=self.max_num_features, replace=False
-                        )
-                    )
-                    for est_idx in range(n_total_estimators)
-                ]
-                print(
-                    f"[TabLDM:enhance] feature sampling triggered: "
-                    f"n_features={n_orig_features} -> max_num_features={self.max_num_features}, "
-                    f"n_estimators={n_total_estimators}"
-                )
-            else:
-                print(
-                    f"[TabLDM:enhance] feature sampling off: n_features={n_orig_features}, "
-                    f"max_num_features={self.max_num_features}"
-                )
+            # Feature sampling is decided per estimator from the width its
+            # generator emits (see ``_feat_sample``), so there is nothing to
+            # precompute here against the raw X width -- that width is the
+            # pre-UniqueFeatureFilter one and indexes out of bounds.
 
             if self.foundation_rate < 0.0 or self.foundation_rate > 1.0:
                 raise ValueError(
@@ -1235,6 +1553,30 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
             # Fit generators
             self._fit_full_generators(X, y_scaled)
+
+            # Report feature sampling against the width the main generator
+            # actually emits (post-unique-filter), which is the space
+            # ``_feat_sample`` draws indices from.
+            n_emitted = self.ensemble_generator_.n_features_in_
+            _n_hk_est = self.high_kurtosis_n_estimators if self.hk_triggered_ else 0
+            n_total_estimators = (
+                self.n_estimators
+                + (self.n_quantile_estimators or 0)
+                + (self.n_quantile_svd_estimators or 0)
+                + (self.n_svd_ens_estimators or 0)
+                + _n_hk_est
+            )
+            if self.max_num_features is not None and n_emitted > self.max_num_features:
+                print(
+                    f"[TabLDM:enhance] feature sampling triggered: "
+                    f"n_features={n_emitted} -> max_num_features={self.max_num_features}, "
+                    f"n_estimators={n_total_estimators}"
+                )
+            else:
+                print(
+                    f"[TabLDM:enhance] feature sampling off: n_features={n_emitted}, "
+                    f"max_num_features={self.max_num_features}"
+                )
 
             # Validation + NNLS routing
             n_full = X.shape[0]
@@ -1358,26 +1700,50 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     weights = np.ones(oof_preds_orig.shape[0]) / oof_preds_orig.shape[0]
                     w_sum = 1.0
 
-                # Log group-level weight sums
+                # Log group-level weight sums. Weight-vector positions map to
+                # original estimator indices through valid_mask (NaN-filtered
+                # base rows first, then HK rows) — following the external MiTab
+                # regressor_attnres_ensemble.py group layout.
                 n_main = self.n_estimators
-                n_q = self.n_quantile_estimators if (self.n_quantile_estimators > 0) else 0
+                n_q = self.n_quantile_estimators if (self.n_quantile_estimators or 0) > 0 else 0
+                n_qs = self.n_quantile_svd_estimators if (self.n_quantile_svd_estimators or 0) > 0 else 0
+                n_svd_ens = self.n_svd_ens_estimators if getattr(self, "svd_ens_generator_", None) is not None else 0
                 vm = valid_mask
+
+                # Weight position of a kept original index i is its rank among
+                # np.where(vm)[0] (NaN-filtered base rows keep original order).
+                wpos = np.where(vm)[0]
+                w_base = weights[:len(wpos)]
+
                 def _group_sum(start, end):
-                    kept = np.where(vm[start:end])[0]
-                    return weights[kept].sum() if len(kept) > 0 else 0.0
+                    """Sum weights for original-index range [start, end) after filtering."""
+                    sel = (wpos >= start) & (wpos < end)
+                    return float(w_base[sel].sum()) if sel.any() else 0.0
+
                 w_default = _group_sum(0, n_main // 2) if n_main >= 2 else _group_sum(0, n_main)
                 w_svd = _group_sum(n_main // 2, n_main) if n_main >= 2 else 0.0
                 w_q = _group_sum(n_main, n_main + n_q)
+                qs_start = n_main + n_q
+                qs_sel = (wpos >= qs_start) & (wpos < qs_start + n_qs)
+                qs_orig = wpos[qs_sel]
+                qs_w = w_base[qs_sel]
+                w_qs_even = float(qs_w[qs_orig % 2 == 0].sum()) if len(qs_orig) > 0 else 0.0
+                w_qs_odd = float(qs_w[qs_orig % 2 == 1].sum()) if len(qs_orig) > 1 else 0.0
+                w_svd_ens = _group_sum(n_main + n_q + n_qs, n_main + n_q + n_qs + n_svd_ens)
                 n_hk_nnls = oof_preds_orig.shape[0] - n_base_valid
-                w_hk = weights[n_base_valid:].sum() if n_hk_nnls > 0 else 0.0
+                w_hk = float(weights[n_base_valid:].sum()) if n_hk_nnls > 0 else 0.0
                 print(
                     f"[TabLDM:enhance] NNLS (OOF): n_nonzero={n_nonzero}/{len(weights)}, "
                     f"weights.sum()={w_sum:.4f}, "
                     f"w_default={w_default:.4f}, w_svd/cross={w_svd:.4f}, "
-                    f"w_quantile={w_q:.4f}, w_hk={w_hk:.4f}"
+                    f"w_quantile={w_q:.4f}, "
+                    f"w_quantile_svd_even(plain)={w_qs_even:.4f}, "
+                    f"w_quantile_svd_odd(svd+cross)={w_qs_odd:.4f}, "
+                    f"w_svd_ens(group6)={w_svd_ens:.4f}, w_hk={w_hk:.4f}"
                 )
+                weight_labels = self._nnls_weight_labels(vm, len(weights))
                 nonzero_str = ", ".join(
-                    f"{self._candidate_name(i, n_main):s}={weights[i]:.4f}"
+                    f"{weight_labels[i]:s}={weights[i]:.4f}"
                     for i in range(len(weights)) if weights[i] > 0
                 )
                 print(f"[TabLDM:enhance] NNLS (OOF) nonzero weights: {nonzero_str}")
@@ -1463,28 +1829,53 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     w_sum = 1.0
 
                 n_main = self.n_estimators
-                n_q = self.n_quantile_estimators if (self.n_quantile_estimators > 0) else 0
+                n_q = self.n_quantile_estimators if (self.n_quantile_estimators or 0) > 0 else 0
+                n_qs = self.n_quantile_svd_estimators if (self.n_quantile_svd_estimators or 0) > 0 else 0
+                n_svd_ens = self.n_svd_ens_estimators if getattr(self, "svd_ens_generator_", None) is not None else 0
                 vm = valid_mask
+
+                # Weight position of a kept original index i is its rank among
+                # np.where(vm)[0] (NaN-filtered base rows keep original order).
+                wpos = np.where(vm)[0]
+                w_base = weights[:len(wpos)]
+
                 def _group_sum(start, end):
-                    kept = np.where(vm[start:end])[0]
-                    return weights[kept].sum() if len(kept) > 0 else 0.0
+                    """Sum weights for original-index range [start, end) after filtering."""
+                    sel = (wpos >= start) & (wpos < end)
+                    return float(w_base[sel].sum()) if sel.any() else 0.0
+
                 w_default = _group_sum(0, n_main // 2) if n_main >= 2 else _group_sum(0, n_main)
                 w_svd = _group_sum(n_main // 2, n_main) if n_main >= 2 else 0.0
                 w_q = _group_sum(n_main, n_main + n_q)
+                qs_start = n_main + n_q
+                qs_sel = (wpos >= qs_start) & (wpos < qs_start + n_qs)
+                qs_orig = wpos[qs_sel]
+                qs_w = w_base[qs_sel]
+                w_qs_even = float(qs_w[qs_orig % 2 == 0].sum()) if len(qs_orig) > 0 else 0.0
+                w_qs_odd = float(qs_w[qs_orig % 2 == 1].sum()) if len(qs_orig) > 1 else 0.0
+                w_svd_ens = _group_sum(n_main + n_q + n_qs, n_main + n_q + n_qs + n_svd_ens)
                 n_hk_sv = val_preds_orig.shape[0] - n_base_valid
-                w_hk = weights[n_base_valid:].sum() if n_hk_sv > 0 else 0.0
+                w_hk = float(weights[n_base_valid:].sum()) if n_hk_sv > 0 else 0.0
                 print(
                     f"[TabLDM:enhance] NNLS: n_nonzero={n_nonzero}/{len(weights)}, "
                     f"weights.sum()={w_sum:.4f}, "
                     f"w_default={w_default:.4f}, w_svd/cross={w_svd:.4f}, "
-                    f"w_quantile={w_q:.4f}, w_hk={w_hk:.4f}"
+                    f"w_quantile={w_q:.4f}, "
+                    f"w_quantile_svd_even(plain)={w_qs_even:.4f}, "
+                    f"w_quantile_svd_odd(svd+cross)={w_qs_odd:.4f}, "
+                    f"w_svd_ens(group6)={w_svd_ens:.4f}, w_hk={w_hk:.4f}"
                 )
+                weight_labels = self._nnls_weight_labels(vm, len(weights))
+                nonzero_str = ", ".join(
+                    f"{weight_labels[i]:s}={weights[i]:.4f}"
+                    for i in range(len(weights)) if weights[i] > 0
+                )
+                print(f"[TabLDM:enhance] NNLS nonzero weights: {nonzero_str}")
                 self.nnls_weights_ = weights
 
         else:
             # ---- Non-enhanced path ----
             self.hk_triggered_ = False
-            self.feat_sample_indices_ = None
             self.ensemble_generator_ = EnsembleGenerator(
                 classification=False,
                 n_estimators=self.n_estimators,
@@ -1605,7 +1996,6 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         # ---- Enhanced path ----
         output_type = ["mean"]  # enhanced path only supports mean
         results = {key: [] for key in output_type}
-        fsi = getattr(self, "feat_sample_indices_", None)
 
         # Main group
         use_augment = (
@@ -1639,7 +2029,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 per_est_preds = {}
 
                 if even_idxs:
-                    fi = [fsi[g] for g in even_global] if fsi is not None else None
+                    fi = self._feat_indices_for(even_global, Xs_both.shape[-1])
                     bout = self._batch_forward(
                         Xs_both[even_idxs], ys[even_idxs], output_type=output_type, feat_indices=fi
                     )
@@ -1649,17 +2039,18 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
                 if odd_idxs:
                     Xs_odd_list = []
-                    for li, ol in zip(odd_idxs, odd_locals):
-                        x_both_i = Xs_both[li]
+                    for li, ol, g in zip(odd_idxs, odd_locals, odd_global):
+                        # Subsample base columns before the cross/SVD concat so
+                        # the augmented tail keeps its own layout.
+                        x_both_i = self._apply_feat_sample(Xs_both[li], g)
                         x_tr = self._augment_estimator(
                             x_both_i[:n_train_rows], X_raw_train, ol, is_train=True)
                         x_te = self._augment_estimator(
                             x_both_i[n_train_rows:], X_raw_test, ol, is_train=False)
                         Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
                     Xs_odd = np.stack(Xs_odd_list, axis=0)
-                    fi = [fsi[g] for g in odd_global] if fsi is not None else None
                     bout = self._batch_forward(
-                        Xs_odd, ys[odd_idxs], output_type=output_type, feat_indices=fi
+                        Xs_odd, ys[odd_idxs], output_type=output_type
                     )
                     preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                     for i, li in enumerate(odd_idxs):
@@ -1676,7 +2067,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             _grp_offset = 0
             for norm_method, (Xs, ys) in data.items():
                 n_est = Xs.shape[0]
-                fi = [fsi[_grp_offset + i] for i in range(n_est)] if fsi is not None else None
+                fi = self._feat_indices_for(range(_grp_offset, _grp_offset + n_est), Xs.shape[-1])
                 bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
                 if isinstance(bout, dict):
                     for key in output_type:
@@ -1692,7 +2083,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             _q_offset = self.n_estimators
             for norm_method, (Xs, ys) in q_data.items():
                 n_est = Xs.shape[0]
-                fi = [fsi[_q_offset + i] for i in range(n_est)] if fsi is not None else None
+                fi = self._feat_indices_for(range(_q_offset, _q_offset + n_est), Xs.shape[-1])
                 bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
                 if isinstance(bout, dict):
                     for key in output_type:
@@ -1700,6 +2091,111 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 else:
                     results[output_type[0]].append(bout)
                 _q_offset += n_est
+
+        # Quantile-SVD group (group 3): even = plain quantile views,
+        # odd = SVD+cross augmented when the group count is 32.
+        qs_gen = getattr(self, "quantile_svd_ensemble_generator_", None)
+        if qs_gen is not None:
+            qs_use_augment = (
+                getattr(self, "_q_svd_", None) is not None
+                and self.n_quantile_svd_estimators == 32
+            )
+            _qs_offset = self.n_estimators + (self.n_quantile_estimators or 0)
+            if qs_use_augment:
+                qs_data = qs_gen.transform(X, mode="both")
+                X_raw_test_qs = qs_gen.unique_filter_.transform(X)
+                X_raw_train_qs = qs_gen.X_
+
+                q_global_est_idx = 0
+                q_odd_local = 0
+                for norm_method, (Xs_both, ys) in qs_data.items():
+                    n_est_this_method = Xs_both.shape[0]
+                    n_train_rows = ys.shape[1]
+
+                    even_idxs, odd_idxs, odd_locals = [], [], []
+                    even_global, odd_global = [], []
+                    for local in range(n_est_this_method):
+                        if q_global_est_idx % 2 == 0:
+                            even_idxs.append(local)
+                            even_global.append(q_global_est_idx)
+                        else:
+                            odd_idxs.append(local)
+                            odd_locals.append(q_odd_local)
+                            odd_global.append(q_global_est_idx)
+                            q_odd_local += 1
+                        q_global_est_idx += 1
+
+                    per_est_preds = {}
+
+                    if even_idxs:
+                        fi = self._feat_indices_for([_qs_offset + g for g in even_global], Xs_both.shape[-1])
+                        bout = self._batch_forward(
+                            Xs_both[even_idxs], ys[even_idxs], output_type=output_type,
+                            alphas=alphas, feat_indices=fi
+                        )
+                        preds_te = bout if not isinstance(bout, dict) else bout["mean"]
+                        for i, li in enumerate(even_idxs):
+                            per_est_preds[li] = preds_te[i]
+
+                    if odd_idxs:
+                        Xs_odd_list = []
+                        for li, ol, g in zip(odd_idxs, odd_locals, odd_global):
+                            # Subsample base columns before the cross/SVD concat
+                            # so the augmented tail keeps its own layout.
+                            x_both_i = self._apply_feat_sample(Xs_both[li], _qs_offset + g)
+                            x_tr = self._augment_estimator(
+                                x_both_i[:n_train_rows], X_raw_train_qs, ol, is_train=True,
+                                attr_prefix="_q_")
+                            x_te = self._augment_estimator(
+                                x_both_i[n_train_rows:], X_raw_test_qs, ol, is_train=False,
+                                attr_prefix="_q_")
+                            Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
+                        Xs_odd = np.stack(Xs_odd_list, axis=0)
+                        bout = self._batch_forward(
+                            Xs_odd, ys[odd_idxs], output_type=output_type,
+                            alphas=alphas
+                        )
+                        preds_te = bout if not isinstance(bout, dict) else bout["mean"]
+                        for i, li in enumerate(odd_idxs):
+                            per_est_preds[li] = preds_te[i]
+
+                    for key in output_type:
+                        stacked = np.stack(
+                            [per_est_preds[li] for li in range(n_est_this_method)], axis=0
+                        )
+                        results[key].append(stacked)
+            else:
+                qs_data = qs_gen.transform(X, mode="both")
+                for norm_method, (Xs, ys) in qs_data.items():
+                    n_est = Xs.shape[0]
+                    fi = self._feat_indices_for(range(_qs_offset, _qs_offset + n_est), Xs.shape[-1])
+                    bout = self._batch_forward(Xs, ys, output_type=output_type, alphas=alphas, feat_indices=fi)
+                    if isinstance(bout, dict):
+                        for key in output_type:
+                            results[key].append(bout[key])
+                    else:
+                        results[output_type[0]].append(bout)
+                    _qs_offset += n_est
+
+        # Independent SVD group (group 4)
+        svd_ens_gen = getattr(self, "svd_ens_generator_", None)
+        if svd_ens_gen is not None:
+            svd_ens_data = svd_ens_gen.transform(X, mode="both")
+            _svd_ens_offset = (
+                self.n_estimators
+                + (self.n_quantile_estimators or 0)
+                + (self.n_quantile_svd_estimators or 0)
+            )
+            for norm_method, (Xs, ys) in svd_ens_data.items():
+                n_est = Xs.shape[0]
+                fi = self._feat_indices_for(range(_svd_ens_offset, _svd_ens_offset + n_est), Xs.shape[-1])
+                bout = self._batch_forward(Xs, ys, output_type=output_type, alphas=alphas, feat_indices=fi)
+                if isinstance(bout, dict):
+                    for key in output_type:
+                        results[key].append(bout[key])
+                else:
+                    results[output_type[0]].append(bout)
+                _svd_ens_offset += n_est
 
         # Collect HK test predictions in original scale
         hk_preds_orig = None
@@ -1726,8 +2222,11 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             if self.verbose:
                 main_n = self.n_estimators
                 q_n = self.n_quantile_estimators if getattr(self, "quantile_ensemble_generator_", None) is not None else 0
+                qs_n = self.n_quantile_svd_estimators if getattr(self, "quantile_svd_ensemble_generator_", None) is not None else 0
+                svd_ens_n = self.n_svd_ens_estimators if getattr(self, "svd_ens_generator_", None) is not None else 0
                 print(
                     f"[TabLDM:enhance] Predictions merged: main={main_n}, quantile={q_n}, "
+                    f"quantile_svd={qs_n}, svd_ens(group6)={svd_ens_n}, "
                     f"total={n_estimators}, shape={arr.shape}"
                 )
 
