@@ -24,7 +24,7 @@
 
 ## 🚀 News
 
-- **[16 Sept 2026] 🚀 LimiX-2 open-source release.** 
+- **[28 Sept 2026] 🚀 LimiX-2 open-source release.** 
   Updated the Xiaomi-TabLDM weights for regression[reg_default.ckpt](https://huggingface.co/occams/Xiaomi-TabLDM/blob/main/checkpoints/reg_default.ckpt)
 - **[5 Sept 2026] 🚀 Xiaomi-TabLDM officially released.**
   The Xiaomi-TabLDM technical report is released on [arxiv](https://arxiv.org/abs/2609.03880). The Xiaomi-TabLDM weights ([`LimiX-2.ckpt`](https://huggingface.co/occams/Xiaomi-TabLDM/tree/main/checkpoints)) and inference code are released with this repository.  Usage is subject to [Xiaomi-TabLDM Non-Commercial License](https://github.com/xiaomi-research/xiaomi-tabldm/blob/main/LICENSE)
