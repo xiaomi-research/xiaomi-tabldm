@@ -22,8 +22,16 @@
 
 <br/>
 
----
+## 🚀 News
 
+- **[16 Sept 2026] 🚀 LimiX-2 open-source release.** 
+  Updated the Xiaomi-TabLDM weights for regression[reg_default.ckpt](https://huggingface.co/occams/Xiaomi-TabLDM/blob/main/checkpoints/reg_default.ckpt)
+- **[5 Sept 2026] 🚀 Xiaomi-TabLDM officially released.**
+  The Xiaomi-TabLDM technical report is released on [arxiv](https://arxiv.org/abs/2609.03880). The Xiaomi-TabLDM weights ([`LimiX-2.ckpt`](https://huggingface.co/occams/Xiaomi-TabLDM/tree/main/checkpoints)) and inference code are released with this repository.  Usage is subject to [Xiaomi-TabLDM Non-Commercial License](https://github.com/xiaomi-research/xiaomi-tabldm/blob/main/LICENSE)
+
+
+---
+## ✨ Introduction
 This repository is the official implementation of **Xiaomi-TabLDM**.
 
 Tabular foundation models establish a general prediction paradigm based on in-context learning. Given labeled samples from a downstream dataset as context, a single pretrained model can make predictions directly without task-specific training. Building on this paradigm, we introduce Xiaomi-TabLDM, a tabular large data foundation model for classification and regression via in-context learning, which delivers superior prediction accuracy without requiring task-specific fine-tuning. Pretrained exclusively on synthetic data generated from structural causal models (SCMs), our model enables more flexible context utilization and more efficient capacity scaling.
