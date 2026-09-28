@@ -121,20 +121,39 @@ _ADAPTIVE_ENS4_NORMS = ["none", "power", "quantile", "robust"]
 # ---------------------------------------------------------------------------
 # AutoGluon's bagging guard drops a whole bagged model as soon as one fold looks
 # too slow to fit ``time_limit / num_bag_folds`` (3600/8 = 450s in that setup),
-# so a merely-slow fold costs the entire dataset, not just that fold.  Measured
-# fold costs track the number of candidate forwards and roughly the *square* of
-# the per-candidate feature width — which is what put APSFailure / Bioresponse /
-# hiva_agnostic / kddcup09_appetency at 450-830s per fold (E=32-72, width up to
-# 300) while every other classification fold stayed under ~200s.  Those four are
-# also the only classification datasets above ~2M train cells (3.1M-7.5M; the
-# largest that fit comfortably was 2.0M), so ``_HEAVY_N_CELLS`` selects exactly
-# them.  On those the pool is cut to the main group at ``_HEAVY_N_ESTIMATORS``
-# candidates and feature sampling (where it was already on) narrows to
-# ``_HEAVY_MAX_NUM_FEATURES`` columns — together worth ~2-5x on the fold, enough
-# to clear the 450s guard with margin.  See ``_apply_enhancement_budget``.
+# so a merely-slow fold costs the entire dataset, not just that fold.  Two
+# different dataset shapes blow that budget and they need different levers
+# (fold timings from the tabldm_eval_0927_0210 run):
+#
+#   * row-heavy folds — GiveMeSomeCredit (100k x 10 -> 469s/fold),
+#     customer_satisfaction_in_airline (87k x 21 -> 408s), SDSS17 (52k x 11 ->
+#     289s), Diabetes130US (48k x 43 -> 238s): ~11s per candidate and a routed
+#     pool of 36-56 candidates (main + adaptive_plus + gaussian_rank).  The cost
+#     is ``E * n_train``; feature sampling is off (<= 300 columns) so the width
+#     is not a lever at all.
+#   * width-heavy folds — Bioresponse (2.5k x 1774), APSFailure (50k x 169),
+#     kddcup09_appetency: each candidate is several times more expensive because
+#     of the feature width (and Bioresponse also pays for the 300-dim sampling
+#     width), so the pool itself has to be small.
+#
+# So the budget is spent on *candidates* and never on the sampling width.  The
+# 300-dim feature sampling is itself a measured enhancement (see
+# ``max_num_features``) and is worth more per candidate than one more candidate
+# is: the sparse NNLS fusion only ends up using 5-15 of the 16-56 candidates it
+# is offered.  The previous arm of this budget narrowed the sampling width to
+# ``_HEAVY_MAX_NUM_FEATURES = 192``; that only ever applied to width-heavy folds
+# (the row-heavy ones never sample), cost every candidate a third of its view,
+# and let the two row-heavy datasets escape the budget entirely.  See
+# ``_apply_enhancement_budget``.
 _HEAVY_N_CELLS = 2_500_000
-_HEAVY_N_ESTIMATORS = 16
-_HEAVY_MAX_NUM_FEATURES = 192
+#: Fold-row trigger for the row-heavy arm.  40k fit rows is the ~60k-row
+#: TabArena "large dataset" band once a CV split holds a third back.
+_HEAVY_N_TRAIN = 40_000
+#: Width at which one candidate costs several narrow ones.
+_HEAVY_WIDE_MIN_FEATURES = 150
+_HEAVY_POOL_SIZE = 16
+_HEAVY_WIDE_POOL_SIZE = 8
+_HEAVY_MIN_GROUP_SIZE = 4
 
 
 def _get_adaptive_inference_config(n_features, n_num, enable_augmentations=False):
@@ -216,7 +235,8 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
     max_num_features : Optional[int], default=300
         Per-candidate feature sampling width. Must be kept: the 300-dim
         sampling is itself an effective enhancement and defines ``high_dim``
-        for the v2 §3.4 rules.
+        for the v2 §3.4 rules. The heavy-dataset budget never narrows it
+        (``_apply_enhancement_budget`` spends its budget on candidates).
 
     outlier_threshold : float, default=4.0
         Z-score threshold for outlier detection.
@@ -292,7 +312,10 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
     use_cross_feature : bool, default=True
         Append SVD + cross features to odd-indexed main candidates. Only
-        takes effect when ``n_estimators == 32`` (v2 §3.2 keeps it as-is).
+        takes effect when the *requested* main size is ``32`` (v2 §3.2 keeps it
+        as-is). The gate reads the pre-budget size, so a heavy-dataset cap
+        shrinks the plain and cross halves together instead of dropping the
+        cross candidates.
 
     validation : bool, default=True
         Use a single stratified holdout for the NNLS weights and for the
@@ -376,17 +399,21 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         Number of Gaussian rank candidates (v2 §3.4 rule size).
 
     heavy_enhancement_budget : bool, default=True
-        Cap the enhancement pool on datasets whose folds would blow a bagging
-        time budget (``n_train * n_features >= 2.5e6`` — the four datasets that
-        timed out in the tabarena test6 run). On those the main group is capped
-        at 16 candidates, the extra groups (adaptive_plus / gaussian_rank /
-        svd_ens / quantile) are switched off, and feature sampling narrows to
-        192 columns. Routing and the group prior are computed *before* the cap,
-        so the v2 §3.4 rules are unchanged and the off-groups' prior mass folds
-        into ``main`` as usual (§3.6); the cap does override explicitly passed
-        group sizes (printed as ``[TabLDM:route] heavy dataset budget``). Set to
-        False to keep the full pool everywhere (the fold then risks the
-        bagging guard on those datasets).
+        Cap the candidate pool on datasets whose folds would blow a bagging
+        time budget (``feat_sampled``, or ``n_train * n_features >= 2.5e6``, or
+        ``n_train >= 40k`` — the datasets that timed out in the tabarena test6
+        run and the row-heavy ones that measured 238-469s per fold). Width-heavy
+        folds (``feat_sampled`` or ``n_features >= 150``) get the main group
+        only at 8 candidates; row-heavy folds keep every routed-on group
+        (adaptive_plus / gaussian_rank / svd_ens / quantile) scaled to 16
+        candidates in total, at least 4 each. The feature-sampling width is
+        never touched — it stays at ``max_num_features`` (300). Routing and the
+        group prior are computed *before* the cap, so the v2 §3.4 rules are
+        unchanged and the off-groups' prior mass folds into ``main`` as usual
+        (§3.6); the cap does override explicitly passed group sizes (printed as
+        ``[TabLDM:route] heavy dataset budget``). Set to False to keep the full
+        pool everywhere (the fold then risks the bagging guard on those
+        datasets).
     """
 
     def __init__(
@@ -691,13 +718,15 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             # ---- v2 §3.3 / §3.4 / §3.6 routing (before any generator is fitted) ----
             self.route_stats_ = self._compute_route_stats(X)
             self.group_config_ = self._route_candidate_pool(self.route_stats_)
+            # Freeze adaptive_plus structure before any holdout splitting and
+            # before the budget, so the budget can scale its size like the other
+            # groups.
+            if self.group_config_["use_ap"]:
+                self._freeze_adaptive_plus_structure(X)
             self._apply_enhancement_budget(X)
             self.group_prior_ = self._resolve_group_prior(self.route_stats_, self.group_config_)
             self._log_routing()
 
-            # Freeze adaptive_plus structure before any holdout splitting
-            if self.group_config_["use_ap"]:
-                self._freeze_adaptive_plus_structure(X)
             self._fit_enhanced_generators(X, y)
             self.n_candidates_ = (
                 self._frozen_main_views_
@@ -1145,45 +1174,126 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             return 0.25
         return 0.0
 
-    def _apply_enhancement_budget(self, X: np.ndarray) -> None:
-        """Cap the inference-enhancement pool on heavy datasets (bag-fold budget).
+    def _main_routed_n(self) -> int:
+        """Main-group size before any heavy-dataset cap (input of the §3.2 gate).
 
-        Called after the v2 §3.4 pool decision and before the group prior is
-        resolved, so routing itself is untouched and the disabled groups' prior
-        mass folds into ``main`` through the regular §3.6 path. Feature sampling
-        keeps its original ``max_num_features`` *trigger* (only the sampled width
-        shrinks), so ``feat_sampled`` / ``high_dim`` — and therefore the rule and
-        the prior — stay consistent with what routing predicted.
+        The SVD/cross half of the main group is decided from this value, not
+        from ``self.n_estimators``: ``_apply_enhancement_budget`` narrows the
+        latter in place, and a cap must shrink the plain and cross halves
+        together rather than silently drop the cross candidates.
+        """
+        return int(getattr(self, "_n_estimators_routed_", self.n_estimators))
+
+    def _apply_enhancement_budget(self, X: np.ndarray) -> None:
+        """Cap the candidate pool on heavy datasets (bag-fold budget).
+
+        Called after the v2 §3.4 pool decision (and after the adaptive_plus
+        structure is frozen, so its size can be scaled too) and before the group
+        prior is resolved, so routing itself is untouched and the disabled
+        groups' prior mass folds into ``main`` through the regular §3.6 path.
+        Feature sampling keeps its original ``max_num_features`` *trigger* and
+        width — the budget is spent on candidates, never on the sampled width —
+        so ``feat_sampled`` / ``high_dim``, and therefore the rule and the prior,
+        stay consistent with what routing predicted.
+
+        Two shapes of heavy fold get different caps (see the module constants):
+
+        * width-heavy (``feat_sampled`` or ``n_features >= 150``): every
+          candidate is expensive, so the pool is cut to the main group at
+          ``_HEAVY_WIDE_POOL_SIZE`` candidates — a full 300-dim view is worth
+          more than one more candidate on these folds.
+        * row-heavy (heavy, but not width-heavy): candidates are cheaper but
+          there are many rows, so the *whole* routed pool is scaled to
+          ``_HEAVY_POOL_SIZE`` candidates while keeping every routed-on group —
+          adaptive_plus / gaussian_rank carry most of the measured fusion mass
+          on those folds — with at least ``_HEAVY_MIN_GROUP_SIZE`` each.
 
         ``self.n_estimators`` is narrowed in place because every downstream use
-        (generator sizes, the ``== 32`` cross-feature gate, the candidate-index
-        layout, ``predict``) has to see the same pool the fit built.
+        (generator sizes, the candidate-index layout, ``predict``) has to see
+        the same pool the fit built.
         """
         self._feat_sample_width_ = self.max_num_features
+        self._n_estimators_routed_ = self.n_estimators
         if not self.heavy_enhancement_budget:
             return
-        n_cells = int(X.shape[0]) * int(X.shape[1])
-        if n_cells < _HEAVY_N_CELLS:
+
+        n_rows, n_cols = int(X.shape[0]), int(X.shape[1])
+        n_cells = n_rows * n_cols
+        n_features = int(self.route_stats_["n_features"])
+        feat_sampled = bool(self.route_stats_["feat_sampled"])
+        wide = feat_sampled or n_features >= _HEAVY_WIDE_MIN_FEATURES
+        heavy = feat_sampled or n_cells >= _HEAVY_N_CELLS or n_rows >= _HEAVY_N_TRAIN
+        if not heavy:
             return
 
-        n_est_og, feat_og = self.n_estimators, self._feat_sample_width_
-        self.n_estimators = min(self.n_estimators, _HEAVY_N_ESTIMATORS)
-        if self._feat_sample_width_ is not None:
-            self._feat_sample_width_ = min(self._feat_sample_width_, _HEAVY_MAX_NUM_FEATURES)
-
         cfg = self.group_config_
-        cfg["use_ap"] = False
-        cfg["use_gr"] = False
-        cfg["use_svd_ens"] = False
-        cfg["n_gr"] = 0
-        cfg["n_svd_ens"] = 0
-        cfg["n_quantile"] = 0
+        sizes = {
+            "main": int(self.n_estimators),
+            "ap": int(self.adaptive_plus_structure_["n_estimators"]) if cfg["use_ap"] else 0,
+            "gr": int(cfg["n_gr"]),
+            "svd": int(cfg["n_svd_ens"]),
+            "q": int(cfg["n_quantile"]),
+        }
+        total = sum(sizes.values())
+
+        if wide:
+            target = _HEAVY_WIDE_POOL_SIZE
+            self.n_estimators = min(self.n_estimators, target)
+            cfg["use_ap"] = False
+            cfg["use_gr"] = False
+            cfg["use_svd_ens"] = False
+            cfg["n_gr"] = 0
+            cfg["n_svd_ens"] = 0
+            cfg["n_quantile"] = 0
+            scaled = {"main": int(self.n_estimators)}
+            print(
+                f"[TabLDM:route] heavy dataset budget (width-heavy: n_rows={n_rows}, "
+                f"n_features={n_features}, feat_sampled={feat_sampled}, n_cells={n_cells}): "
+                f"pool {total}->{scaled['main']} (main {sizes['main']}->{scaled['main']}, "
+                f"extra groups off: ap/gr/svd_ens/quantile), "
+                f"sample_width={self._feat_sample_width_} (unchanged)"
+            )
+            return
+
+        target = _HEAVY_POOL_SIZE
+        if total <= target:
+            print(
+                f"[TabLDM:route] heavy dataset budget (row-heavy: n_rows={n_rows} >= "
+                f"{_HEAVY_N_TRAIN} or n_cells={n_cells} >= {_HEAVY_N_CELLS}): "
+                f"pool {total} already <= {target}, no cut; "
+                f"sample_width={self._feat_sample_width_} (unchanged)"
+            )
+            return
+
+        # Proportional shrink to `target`, floor `_HEAVY_MIN_GROUP_SIZE` per
+        # on-group so the sparse NNLS still has candidates to pick from in
+        # every group it was routed.
+        floor = _HEAVY_MIN_GROUP_SIZE
+        scaled = {g: max(floor, round(target * n / total)) for g, n in sizes.items() if n > 0}
+        while sum(scaled.values()) > target:
+            g_max = max(scaled, key=lambda g: scaled[g])
+            if scaled[g_max] <= floor:
+                break
+            scaled[g_max] -= 1
+
+        self.n_estimators = int(scaled.get("main", self.n_estimators))
+        if cfg["use_ap"]:
+            cfg["use_ap"] = int(scaled.get("ap", 0)) > 0
+            self.adaptive_plus_structure_["n_estimators"] = int(scaled.get("ap", 0))
+        cfg["n_gr"] = int(scaled.get("gr", 0))
+        cfg["n_svd_ens"] = int(scaled.get("svd", 0))
+        cfg["n_quantile"] = int(scaled.get("q", 0))
 
         print(
-            f"[TabLDM:route] heavy dataset budget (n_cells={n_cells} >= {_HEAVY_N_CELLS}): "
-            f"n_estimators {n_est_og}->{self.n_estimators}, "
-            f"sample_width {feat_og}->{self._feat_sample_width_}, "
-            f"extra groups off (ap/gr/svd_ens/quantile)"
+            f"[TabLDM:route] heavy dataset budget (row-heavy: n_rows={n_rows} >= "
+            f"{_HEAVY_N_TRAIN} or n_cells={n_cells} >= {_HEAVY_N_CELLS}): "
+            f"pool {total}->{sum(scaled.values())} (target {target}) "
+            f"main {sizes['main']}->{scaled.get('main', 0)}, "
+            f"ap {sizes['ap']}->{scaled.get('ap', 0)}, "
+            f"gr {sizes['gr']}->{scaled.get('gr', 0)}, "
+            f"svd_ens {sizes['svd']}->{scaled.get('svd', 0)}, "
+            f"q {sizes['q']}->{scaled.get('q', 0)}; "
+            f"sample_width={self._feat_sample_width_} (unchanged)"
         )
 
     def _log_routing(self) -> None:
@@ -1248,7 +1358,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         # ---- SVD + feature-crossing augmentation ----
         self.svd_ = None
-        if self.n_estimators == 32 and sorted(norm_methods) == ["none", "power"]:
+        if self._main_routed_n() == 32 and sorted(norm_methods) == ["none", "power"]:
             self._fit_svd_cross(self.ensemble_generator_.X_)
 
         # ---- quantile_safe group ----
@@ -1342,7 +1452,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self._frozen_ap_views_ = _count_views(getattr(self, "adaptive_plus_generator_", None))
         self._frozen_gr_views_ = _count_views(getattr(self, "gaussian_rank_generator_", None))
 
-        _use_augment = getattr(self, "svd_", None) is not None and self.n_estimators == 32
+        _use_augment = getattr(self, "svd_", None) is not None and self._main_routed_n() == 32
         if _use_augment:
             self._frozen_plain_views_ = self._frozen_main_views_ // 2
             self._frozen_cross_svd_views_ = self._frozen_main_views_ - self._frozen_plain_views_
@@ -1635,7 +1745,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         # ---- main group ----
         data = main_gen.transform(X, mode="both")
-        use_augment = getattr(self, "svd_", None) is not None and self.n_estimators == 32
+        use_augment = getattr(self, "svd_", None) is not None and self._main_routed_n() == 32
         if use_augment:
             X_raw_test = main_gen.unique_filter_.transform(X)
             X_raw_train = main_gen.X_
@@ -2011,7 +2121,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         ]
         saved_svd = {a: getattr(self, a, None) for a in svd_attrs}
 
-        if self.n_estimators == 32 and sorted(norm_methods) == ["none", "power"]:
+        if self._main_routed_n() == 32 and sorted(norm_methods) == ["none", "power"]:
             self._fit_svd_cross(main_gen.X_)
         else:
             self.svd_ = None
