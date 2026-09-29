@@ -24,7 +24,7 @@
 
 ## 🚀 News
 - **[29 Sept 2026] 🚀 Updated inference code for regression.** 
-  Updated the Xiaomi-TabLDM inference code for regression. Here is details for ([changes0929-reg](https://github.com/xiaomi-research/xiaomi-tabldm/commit/2d9d509334c15ce5dfa58cee49d135820b1099de)).
+  Updated the Xiaomi-TabLDM inference code for regression. For details, see [changes0929-reg](https://github.com/xiaomi-research/xiaomi-tabldm/commit/2d9d509334c15ce5dfa58cee49d135820b1099de).
 - **[28 Sept 2026] 🚀 Updated Xiaomi-TabLDM weights.** 
   Updated the Xiaomi-TabLDM weights for regression ([reg_default.ckpt](https://huggingface.co/occams/Xiaomi-TabLDM/blob/main/checkpoints/reg_default.ckpt)).
 - **[5 Sept 2026] 🚀 Xiaomi-TabLDM officially released.**
