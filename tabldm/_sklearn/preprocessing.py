@@ -658,7 +658,7 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
     ----------
     normalization_method : str, default='power'
         Method for normalization: ``'power'``, ``'quantile'``,
-        ``'quantile_rtdl'``, ``'robust'``, ``'none'``.
+        ``'quantile_rtdl'``, ``'robust'``, ``'qtl'``, ``'none'``.
 
     outlier_threshold : float, default=4.0
         Z-score threshold for outlier detection. Values with
@@ -735,12 +735,35 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
                 )
             elif self.normalization_method == "robust":
                 self.normalizer_ = RobustScaler(unit_variance=True)
+            elif self.normalization_method == "qtl":
+                # Uniform [0, 1] quantile transform — preserves intra-bin amplitude
+                # relationships while making the marginal distribution uniform.
+                # Reference: KMLP (2026).
+                self.normalizer_ = QuantileTransformer(output_distribution="uniform", random_state=self.random_state)
             else:
                 raise ValueError(f"Unknown normalization method: {self.normalization_method}")
 
             self.X_min_ = np.min(X_scaled, axis=0, keepdims=True)
             self.X_max_ = np.max(X_scaled, axis=0, keepdims=True)
-            X_normalized = self.normalizer_.fit_transform(X_scaled)
+            try:
+                X_normalized = self.normalizer_.fit_transform(X_scaled)
+                # 安全检查: 归一化后若出现 NaN/Inf，回退到无归一化
+                if not np.isfinite(X_normalized).all():
+                    import warnings
+                    warnings.warn(
+                        f"Normalization '{self.normalization_method}' produced NaN/Inf, "
+                        f"falling back to 'none'. Data range: [{np.nanmin(X_scaled):.2e}, {np.nanmax(X_scaled):.2e}]"
+                    )
+                    self.normalizer_ = None
+                    X_normalized = X_scaled
+            except Exception as e:
+                import warnings
+                warnings.warn(
+                    f"Normalization '{self.normalization_method}' failed ({e}), "
+                    f"falling back to 'none'."
+                )
+                self.normalizer_ = None
+                X_normalized = X_scaled
         else:
             self.normalizer_ = None
             X_normalized = X_scaled
@@ -773,10 +796,21 @@ class PreprocessingPipeline(TransformerMixin, BaseEstimator):
             try:
                 # this can fail in rare cases if there is an outlier in X that was not present in fit()
                 X = self.normalizer_.transform(X)
-            except ValueError:
+                # 安全检查: NaN/Inf → clip 后重试，仍失败则跳过归一化
+                if not np.isfinite(X).all():
+                    X = validate_data(self, X, reset=False, copy=True)
+                    X = self.standard_scaler_.transform(X)
+                    X = np.clip(X, self.X_min_, self.X_max_)
+                    X = self.normalizer_.transform(X)
+                    if not np.isfinite(X).all():
+                        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+            except (ValueError, Exception):
                 # clip values to train min/max
-                X = np.clip(X, self.X_min_, self.X_max_)
-                X = self.normalizer_.transform(X)
+                try:
+                    X = np.clip(X, self.X_min_, self.X_max_)
+                    X = self.normalizer_.transform(X)
+                except Exception:
+                    pass  # keep X as-is (standard-scaled only)
         # Outlier removal
         X = self.outlier_remover_.transform(X)
 

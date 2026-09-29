@@ -47,7 +47,7 @@ Usage:
     python infer_talent_reg.py --all --seed-num 3 --limit 5
 """
 from __future__ import annotations
-import argparse, json, os, random, sys, time
+import argparse, json, os, random, subprocess, sys, time
 from pathlib import Path
 
 import numpy as np
@@ -57,8 +57,8 @@ from sklearn.metrics import (
     mean_squared_error, mean_absolute_error, r2_score,
 )
 
-# Import the LOCAL tabldm package (this script lives in the TabLDM project root).
-TABLDM_DIR = Path(os.environ.get("TABLDM_DIR", Path(__file__).resolve().parent))
+# Import the LOCAL tabldm package from the repo root (this script lives in tests/).
+TABLDM_DIR = Path(os.environ.get("TABLDM_DIR", Path(__file__).resolve().parent.parent))
 if str(TABLDM_DIR) not in sys.path:
     sys.path.insert(0, str(TABLDM_DIR))
 import tabldm
@@ -179,6 +179,7 @@ def run_dataset(ds_dir, ckpt, n_estimators, batch_size, device, verbose, seed_nu
     for seed in range(seed_num):
         set_seeds(seed)
         reg = TabLDMRegressor(
+            enhance_candidates=True,
             n_estimators=n_estimators,
             norm_methods=["none", "power"],
             model_path=ckpt, allow_auto_download=False,
@@ -226,6 +227,85 @@ def summarize_all(all_summaries, save_path):
     print(f"Saved overall -> {save_path}/overall_averages.csv")
 
 
+def _parse_gpu_ids(device: str):
+    """Return physical GPU ids from a device string, or [] for non-GPU devices."""
+    if device is None:
+        return []
+    value = str(device).strip()
+    if value == "" or value.startswith("cpu"):
+        return []
+    ids = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.isdigit():
+            ids.append(int(part))
+        elif part == "cuda":
+            ids.append(0)
+        elif part.startswith("cuda:") and part[5:].isdigit():
+            ids.append(int(part[5:]))
+        else:
+            return []
+    return ids
+
+
+def _worker_summary_path(save_path: str, worker_id: int) -> str:
+    return os.path.join(save_path, f".worker_{worker_id}_summary.json")
+
+
+def _run_datasets_subset(names, data_root, args, save_path, worker_id):
+    """Run one worker's dataset slice and persist its summaries for the parent."""
+    all_summaries = []
+    for i, name in enumerate(names, 1):
+        ds_dir = data_root / name
+        if worker_id is None:
+            print(f"[{i}/{len(names)}] {name}")
+        else:
+            print(f"[worker {worker_id}] [{i}/{len(names)}] {name}")
+        try:
+            summary = run_dataset(ds_dir, args.ckpt, args.n_estimators, args.batch_size,
+                                  args.device, args.verbose, args.seed_num, save_path, args.model_type)
+            all_summaries.append(summary)
+        except Exception as e:
+            print(f"  ERROR: {e!r}")
+        print()
+
+    if worker_id is not None:
+        summary_path = _worker_summary_path(save_path, worker_id)
+        with open(summary_path, "w") as f:
+            json.dump(all_summaries, f)
+        print(f"[worker {worker_id}] saved {len(all_summaries)} summaries -> {summary_path}")
+    return all_summaries
+
+
+def _build_worker_cmd(args, save_path, worker_id, worker_count):
+    """Build a subprocess command for one dataset-level GPU worker."""
+    cmd = [
+        sys.executable, str(Path(__file__).resolve()),
+        "--ckpt", str(args.ckpt),
+        "--data-root", str(args.data_root),
+        "--model-type", str(args.model_type),
+        "--n-estimators", str(args.n_estimators),
+        "--batch-size", str(args.batch_size),
+        "--seed-num", str(args.seed_num),
+        "--device", "cuda:0",
+        "--save-path", str(save_path),
+        "--worker-id", str(worker_id),
+        "--worker-count", str(worker_count),
+    ]
+    if args.all:
+        cmd.append("--all")
+    else:
+        cmd += ["--dataset", str(args.dataset)]
+    if args.verbose:
+        cmd.append("--verbose")
+    if args.limit is not None:
+        cmd += ["--limit", str(args.limit)]
+    return cmd
+
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dataset", default="MiamiHousing", help="dataset dir name (ignored if --all)")
@@ -236,10 +316,16 @@ def main():
     ap.add_argument("--n-estimators", type=int, default=32)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--seed-num", type=int, default=1, help="#trials (upstream reference uses 15)")
-    ap.add_argument("--device", default="cpu")
+    ap.add_argument(
+        "--device",
+        default="cpu",
+        help="inference device: cpu, cuda, cuda:0, or comma-separated GPU ids (0,1,2,3) / cuda:0,cuda:1; with --all, each GPU runs a distinct dataset slice",
+    )
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--limit", type=int, default=None, help="cap #datasets (with --all)")
     ap.add_argument("--save-path", default=None, help="save root (default: <script_dir>/results/<ckpt_stem>)")
+    ap.add_argument("--worker-id", type=int, default=-1, help=argparse.SUPPRESS)
+    ap.add_argument("--worker-count", type=int, default=1, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     ckpt_stem = Path(args.ckpt).stem
@@ -259,20 +345,58 @@ def main():
           f"| seed_num={args.seed_num} | device={args.device}")
     print(f"data_root={data_root} | datasets={len(names)} | save_path={save_path}\n")
 
-    all_summaries = []
-    for i, name in enumerate(names, 1):
-        ds_dir = data_root / name
-        print(f"[{i}/{len(names)}] {name}")
-        try:
-            summary = run_dataset(ds_dir, args.ckpt, args.n_estimators, args.batch_size,
-                                  args.device, args.verbose, args.seed_num, save_path, args.model_type)
-            all_summaries.append(summary)
-        except Exception as e:
-            print(f"  ERROR: {e!r}")
-        print()
+    # Worker mode: process only this worker's dataset slice, then exit before
+    # the parent spawns any additional subprocesses.
+    if args.worker_id >= 0:
+        worker_names = names[args.worker_id::args.worker_count]
+        _run_datasets_subset(worker_names, data_root, args, save_path, args.worker_id)
+        return
 
-    summarize_all(all_summaries, save_path) if len(all_summaries) >= 1 else None
+    # Dataset-level parallelism: with --all and multiple GPU ids, one subprocess
+    # per GPU runs a disjoint slice of datasets.  Single-dataset and CPU runs
+    # fall through to the original sequential path below.
+    gpu_ids = _parse_gpu_ids(args.device)
+    if args.all and len(gpu_ids) > 1:
+        worker_count = min(len(gpu_ids), len(names))
+        if worker_count > 1:
+            print(f"[multi-gpu] {len(names)} datasets over {worker_count} GPU worker(s): "
+                  f"{gpu_ids[:worker_count]}\n")
+            procs = []
+            for worker_id in range(worker_count):
+                stale_summary = _worker_summary_path(save_path, worker_id)
+                if os.path.exists(stale_summary):
+                    os.remove(stale_summary)
+            for worker_id in range(worker_count):
+                env = os.environ.copy()
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[worker_id])
+                cmd = _build_worker_cmd(args, save_path, worker_id, worker_count)
+                print(f"[multi-gpu] launch worker {worker_id} on physical GPU {gpu_ids[worker_id]}: "
+                      f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
+                procs.append(subprocess.Popen(cmd, env=env))
 
+            failed = False
+            for proc in procs:
+                proc.wait()
+                if proc.returncode != 0:
+                    failed = True
+                    print(f"[multi-gpu] worker exited with status {proc.returncode}")
+
+            all_summaries = []
+            for worker_id in range(worker_count):
+                summary_path = _worker_summary_path(save_path, worker_id)
+                if os.path.exists(summary_path):
+                    with open(summary_path) as f:
+                        all_summaries.extend(json.load(f))
+            all_summaries.sort(key=lambda r: r.get("dataset", ""))
+            summarize_all(all_summaries, save_path) if all_summaries else None
+            if failed:
+                sys.exit(1)
+            return
+
+    # Sequential single-process path (also used for single-dataset multi-GPU,
+    # where TabLDMRegressor itself shards ensemble members across devices).
+    all_summaries = _run_datasets_subset(names, data_root, args, save_path, None)
+    summarize_all(all_summaries, save_path) if all_summaries else None
 
 if __name__ == "__main__":
     main()

@@ -229,6 +229,28 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
     calibration_lambda : float, default=1e-2
         Regularization for calibration.
 
+    calibration_objective : {"logloss", "accuracy"}, default="logloss"
+        Objective for binary Platt scaling. ``"accuracy"`` performs an exact
+        OOF threshold search and encodes the selected threshold as a Platt
+        shift; multiclass vector scaling remains NLL-based.
+
+    ensemble_weight_objective : {"nnls", "fixed_boundary"}, default="nnls"
+        Objective used to learn candidate ensemble weights. ``"nnls"`` keeps
+        the legacy one-hot least-squares objective. ``"fixed_boundary"``
+        optimizes a fixed-probability-0.5 margin without learning a decision
+        threshold; it is binary-classification only.
+
+    fixed_boundary_margin_scale : float, default=10.0
+        Logistic margin scale for the fixed-boundary weight objective.
+
+    fixed_boundary_weight_l2 : float, default=1e-2
+        Shrinkage strength toward uniform candidate weights for the
+        fixed-boundary objective.
+
+    nnls_weight_mix : float, default=0.75
+        Fraction of the legacy NNLS solution retained when blending with
+        uniform candidate weights. ``0.9`` means 90% NNLS and 10% uniform.
+
     use_gaussian_rank_ens : bool, default=True
         Enable Gaussian rank normalization ensemble.
 
@@ -279,6 +301,11 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         adaptive_plus_enable_augmentations: bool = True,
         enable_calibration: bool = True,
         calibration_lambda: float = 1e-2,
+        calibration_objective: str = "logloss",
+        ensemble_weight_objective: str = "nnls",
+        nnls_weight_mix: float = 0.75,
+        fixed_boundary_margin_scale: float = 10.0,
+        fixed_boundary_weight_l2: float = 1e-2,
         use_gaussian_rank_ens: bool = True,
         n_gaussian_rank_estimators: int = 16,
     ):
@@ -323,6 +350,34 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         self.adaptive_plus_enable_augmentations = adaptive_plus_enable_augmentations
         self.enable_calibration = enable_calibration
         self.calibration_lambda = calibration_lambda
+        calibration_objective = str(calibration_objective).lower()
+        if calibration_objective == "acc":
+            calibration_objective = "accuracy"
+        if calibration_objective not in {"logloss", "accuracy"}:
+            raise ValueError(
+                "calibration_objective must be 'logloss' or 'accuracy'"
+            )
+        self.calibration_objective = calibration_objective
+        ensemble_weight_objective = str(ensemble_weight_objective).lower()
+        if ensemble_weight_objective not in {"nnls", "fixed_boundary"}:
+            raise ValueError(
+                "ensemble_weight_objective must be 'nnls' or 'fixed_boundary'"
+            )
+        if ensemble_weight_objective == "fixed_boundary" and calibration_objective == "accuracy":
+            raise ValueError(
+                "fixed_boundary weight optimization cannot use accuracy calibration; "
+                "use calibration_objective='logloss' to preserve the fixed boundary"
+            )
+        if not np.isfinite(fixed_boundary_margin_scale) or fixed_boundary_margin_scale <= 0:
+            raise ValueError("fixed_boundary_margin_scale must be a positive finite number")
+        if not np.isfinite(fixed_boundary_weight_l2) or fixed_boundary_weight_l2 < 0:
+            raise ValueError("fixed_boundary_weight_l2 must be a non-negative finite number")
+        if not np.isfinite(nnls_weight_mix) or not 0.0 <= nnls_weight_mix <= 1.0:
+            raise ValueError("nnls_weight_mix must be a finite number in [0, 1]")
+        self.ensemble_weight_objective = ensemble_weight_objective
+        self.nnls_weight_mix = float(nnls_weight_mix)
+        self.fixed_boundary_margin_scale = float(fixed_boundary_margin_scale)
+        self.fixed_boundary_weight_l2 = float(fixed_boundary_weight_l2)
         self.use_gaussian_rank_ens = use_gaussian_rank_ens
         self.n_gaussian_rank_estimators = n_gaussian_rank_estimators
 
@@ -993,30 +1048,72 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
     def _batch_forward(
         self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: Optional[np.ndarray] = None
     ) -> np.ndarray:
-        """Process model forward passes in batches."""
-        batch_size = self.batch_size_ or Xs.shape[0]
-        n_batches = np.ceil(Xs.shape[0] / batch_size)
-        Xs = np.array_split(Xs, n_batches)
-        ys = np.array_split(ys, n_batches)
-        if feature_shuffles is None:
-            feature_shuffles = [None] * n_batches
-        else:
-            feature_shuffles = np.array_split(feature_shuffles, n_batches)
+        """Process model forward passes in batches, optionally across GPUs."""
+        devices = getattr(self, "devices_", [self.device_])
 
+        if len(devices) <= 1:
+            return self._forward_on_device(
+                self.model_, self.device_, Xs, ys, feature_shuffles
+            )
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        chunks = np.array_split(np.arange(Xs.shape[0]), len(devices))
+
+        def run_on_device(device: torch.device, indices: np.ndarray):
+            shuffled = None if feature_shuffles is None else feature_shuffles[indices]
+            return self._forward_on_device(
+                self._model_for_device(device), device, Xs[indices], ys[indices], shuffled
+            )
+
+        with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+            futures = [
+                executor.submit(run_on_device, device, indices)
+                if indices.size > 0 else None
+                for device, indices in zip(devices, chunks)
+            ]
+            results = [None if future is None else future.result() for future in futures]
+
+        return np.concatenate([result for result in results if result is not None], axis=0)
+
+    def _forward_on_device(
+        self,
+        model,
+        device: torch.device,
+        Xs: np.ndarray,
+        ys: np.ndarray,
+        feature_shuffles: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Run the classifier forward pass on one device and return CPU logits/probs."""
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+
+        batch_size = self.batch_size_ or Xs.shape[0]
+        n_batches = int(np.ceil(Xs.shape[0] / batch_size))
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        if feature_shuffles is None:
+            shuffles_split = [None] * len(Xs_split)
+        else:
+            shuffles_split = np.array_split(feature_shuffles, n_batches)
+
+        inference_config = self._inference_config_for_device(device)
         outputs = []
-        for X_batch, y_batch, shuffle_batch in zip(Xs, ys, feature_shuffles):
-            X_batch = torch.from_numpy(X_batch).float().to(self.device_)
-            y_batch = torch.from_numpy(y_batch).float().to(self.device_)
+        for X_batch, y_batch, shuffle_batch in zip(Xs_split, ys_split, shuffles_split):
+            if X_batch.shape[0] == 0:
+                continue
+            X_batch = torch.from_numpy(X_batch).float().to(device)
+            y_batch = torch.from_numpy(y_batch).float().to(device)
             if shuffle_batch is not None:
                 shuffle_batch = shuffle_batch.tolist()
             with torch.no_grad():
-                out = self.model_(
+                out = model(
                     X=X_batch,
                     y_train=y_batch,
                     feature_shuffles=shuffle_batch,
                     return_logits=True if self.average_logits else False,
                     softmax_temperature=self.softmax_temperature,
-                    inference_config=self.inference_config_,
+                    inference_config=inference_config,
                 )
             outputs.append(out.float().cpu().numpy())
         return np.concatenate(outputs, axis=0)
@@ -1294,7 +1391,10 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         n_full = X.shape[0]
         n_val = math.ceil(0.2 * n_full)
         route = self._route_validation(self.validation, self.k_fold, n_full, n_val)
-        print(f"[TabLDM:nnls] routing: k_fold={self.k_fold}, n_train={n_full}, n_val={n_val}, path={route}")
+        print(
+            f"[TabLDM:nnls] routing: objective={self.ensemble_weight_objective}, "
+            f"k_fold={self.k_fold}, n_train={n_full}, n_val={n_val}, path={route}"
+        )
         if route == "default":
             print("[TabLDM:nnls] routed to default -> equal-weight ensemble")
             return
@@ -1322,14 +1422,25 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         self.nnls_valid_candidate_mask_ = valid_mask
 
-        weights = self._solve_nnls_classification(probs, y_target)
+        if self.ensemble_weight_objective == "fixed_boundary" and self.n_classes_ == 2:
+            weights = self._solve_fixed_boundary_weights(probs, y_target)
+            if weights is None:
+                print("[TabLDM:fixed_boundary] optimization failed -> falling back to legacy NNLS")
+                weights = self._solve_nnls_classification(probs, y_target)
+        else:
+            if self.ensemble_weight_objective == "fixed_boundary":
+                print(
+                    "[TabLDM:fixed_boundary] multiclass task -> using legacy NNLS "
+                    "because the fixed 0.5 boundary is binary-only"
+                )
+            weights = self._solve_nnls_classification(probs, y_target)
         if weights is None:
-            print("[TabLDM:nnls] NNLS could not solve stably -> equal-weight ensemble")
+            print("[TabLDM:nnls] ensemble weight solver failed -> equal-weight ensemble")
             return
 
         self.nnls_weights_ = weights
         print(
-            f"[TabLDM:nnls] learned ensemble weights: E={weights.shape[0]} "
+            f"[TabLDM:{self.ensemble_weight_objective}] learned ensemble weights: E={weights.shape[0]} "
             f"(over {int(valid_mask.sum())}/{valid_mask.shape[0]} valid candidates), "
             f"sum={weights.sum():.6f}"
         )
@@ -1576,7 +1687,8 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         nnls_weight = raw_weights / w_sum
         uniform_weight = np.ones(E, dtype=np.float64) / E
-        final_weight = 0.75 * nnls_weight + 0.25 * uniform_weight
+        nnls_mix = self.nnls_weight_mix
+        final_weight = nnls_mix * nnls_weight + (1.0 - nnls_mix) * uniform_weight
         final_weight = final_weight / final_weight.sum()
 
         assert np.all(final_weight >= 0), "[TabLDM:nnls] final weights contain negatives."
@@ -1584,9 +1696,85 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         print(
             f"[TabLDM:nnls] solved: n_nonzero={n_nonzero}/{E}, raw_sum={w_sum:.4f}, "
+            f"nnls_mix={nnls_mix:.6f}, uniform_mix={1.0 - nnls_mix:.6f}, "
             f"final_weight_sum={float(final_weight.sum()):.6f}"
         )
         return final_weight
+
+    def _solve_fixed_boundary_weights(self, probs, y_val):
+        """Learn simplex weights while keeping the binary boundary at 0.5."""
+        E, n_val, n_classes = probs.shape
+        if n_classes != 2:
+            return None
+        if not np.all(np.isfinite(probs)) or np.any(probs < 0):
+            print("[TabLDM:fixed_boundary] invalid validation probabilities")
+            return None
+
+        candidate_positive = np.asarray(probs[:, :, 1].T, dtype=np.float64)
+        labels = np.asarray(y_val, dtype=np.int64)
+        if candidate_positive.shape != (n_val, E):
+            print("[TabLDM:fixed_boundary] unexpected candidate probability shape")
+            return None
+        if labels.shape != (n_val,) or not np.all((labels == 0) | (labels == 1)):
+            print("[TabLDM:fixed_boundary] labels are not binary")
+            return None
+
+        uniform = np.ones(E, dtype=np.float64) / E
+        label_sign = 2.0 * labels.astype(np.float64) - 1.0
+        margin_scale = self.fixed_boundary_margin_scale
+        weight_l2 = self.fixed_boundary_weight_l2
+
+        def objective(weights):
+            positive_probability = np.clip(candidate_positive @ weights, 1e-7, 1.0 - 1e-7)
+            signed_margin = label_sign * (positive_probability - 0.5)
+            logistic_loss = np.mean(np.logaddexp(0.0, -margin_scale * signed_margin))
+            regularization = weight_l2 * np.sum((weights - uniform) ** 2)
+            return float(logistic_loss + regularization)
+
+        def gradient(weights):
+            positive_probability = candidate_positive @ weights
+            signed_margin = label_sign * (positive_probability - 0.5)
+            loss_gradient = -margin_scale * _expit(-margin_scale * signed_margin) * label_sign
+            return (candidate_positive.T @ loss_gradient) / n_val + 2.0 * weight_l2 * (weights - uniform)
+
+        try:
+            result = _scipy_minimize(
+                objective,
+                x0=uniform,
+                jac=gradient,
+                method="SLSQP",
+                bounds=[(0.0, 1.0)] * E,
+                constraints={
+                    "type": "eq",
+                    "fun": lambda weights: float(np.sum(weights) - 1.0),
+                    "jac": lambda weights: np.ones(E, dtype=np.float64),
+                },
+                options={"maxiter": 300, "ftol": 1e-9, "disp": False},
+            )
+        except Exception as exc:
+            print(f"[TabLDM:fixed_boundary] optimizer failed: {exc!r}")
+            return None
+
+        if not result.success or not np.all(np.isfinite(result.x)):
+            print(f"[TabLDM:fixed_boundary] optimizer did not converge: {result.message}")
+            return None
+
+        weights = np.clip(np.asarray(result.x, dtype=np.float64), 0.0, None)
+        weight_sum = float(weights.sum())
+        if not np.isfinite(weight_sum) or weight_sum <= 0:
+            print("[TabLDM:fixed_boundary] degenerate optimized weights")
+            return None
+        weights /= weight_sum
+
+        positive_probability = candidate_positive @ weights
+        oof_accuracy = float(np.mean((positive_probability >= 0.5) == labels))
+        print(
+            "[TabLDM:fixed_boundary] solved: "
+            f"E={E}, nonzero={(weights > 1e-8).sum()}/{E}, "
+            f"oof_accuracy={oof_accuracy:.6f}, "
+            f"margin_scale={margin_scale:g}, weight_l2={weight_l2:g}"
+        )
+        return weights
 
     # ==================================================================
     # Probability calibration
@@ -1597,6 +1785,47 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         eps = 1e-15
         n = len(y)
         return -float(np.sum(np.log(np.clip(P[np.arange(n), y], eps, 1.0))) / n)
+
+    @staticmethod
+    def _fit_binary_accuracy_platt(P, y):
+        """Find the exact OOF accuracy threshold and encode it as Platt shift."""
+        eps = 1e-15
+        positive_probability = np.clip(
+            np.asarray(P[:, 1], dtype=np.float64), eps, 1.0 - eps
+        )
+        labels = np.asarray(y, dtype=np.int64)
+        n_samples = labels.shape[0]
+        if n_samples == 0 or not np.all((labels == 0) | (labels == 1)):
+            raise ValueError("binary accuracy calibration requires non-empty 0/1 labels")
+
+        order = np.argsort(positive_probability, kind="mergesort")
+        sorted_probability = positive_probability[order]
+        sorted_labels = labels[order]
+        cumulative_positive = np.cumsum(sorted_labels, dtype=np.int64)
+        total_positive = int(cumulative_positive[-1])
+
+        group_ends = np.flatnonzero(
+            np.r_[sorted_probability[1:] != sorted_probability[:-1], True]
+        ) + 1
+        splits = np.r_[0, group_ends]
+        positive_before = np.r_[0, cumulative_positive[group_ends - 1]]
+        accuracy = (
+            splits - positive_before + total_positive - positive_before
+        ) / float(n_samples)
+        best_index = int(np.argmax(accuracy))
+        split = int(splits[best_index])
+
+        if split == 0:
+            threshold = 0.0
+        elif split == n_samples:
+            threshold = 1.0
+        else:
+            threshold = float(
+                (sorted_probability[split - 1] + sorted_probability[split]) / 2.0
+            )
+        threshold = float(np.clip(threshold, eps, 1.0 - eps))
+        threshold_logit = math.log(threshold / (1.0 - threshold))
+        return 1.0, -threshold_logit, threshold, float(accuracy[best_index])
 
     def _fit_calibration(self) -> None:
         """Fit Platt (binary) or vector scaling (multiclass) on stored OOF probs."""
@@ -1622,29 +1851,86 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         try:
             if n_classes == 2:
-                z = np.log((P_cal[:, 1] + eps) / (P_cal[:, 0] + eps))
+                if self.ensemble_weight_objective == "fixed_boundary":
+                    z = np.log((P_cal[:, 1] + eps) / (P_cal[:, 0] + eps))
 
-                def _platt_nll(params):
-                    A, B = params
-                    p1 = _expit(A * z + B)
-                    p1 = np.clip(p1, eps, 1.0 - eps)
-                    nll = -np.mean(y_cal * np.log(p1) + (1 - y_cal) * np.log(1.0 - p1))
-                    reg = lam * ((A - 1.0) ** 2 + B ** 2)
-                    return nll + reg
+                    def _temperature_nll(params):
+                        A = float(params[0])
+                        p1 = _expit(A * z)
+                        p1 = np.clip(p1, eps, 1.0 - eps)
+                        nll = -np.mean(y_cal * np.log(p1) + (1 - y_cal) * np.log(1.0 - p1))
+                        reg = lam * (A - 1.0) ** 2
+                        return nll + reg
 
-                result = _scipy_minimize(
-                    _platt_nll, x0=[1.0, 0.0], method="L-BFGS-B",
-                    bounds=[(0.8, 1.2), (-1.0, 1.0)],
-                )
-                if not result.success:
-                    print(f"[TabLDM:calibration] WARNING: Platt optimizer did not converge ({result.message}); skipping.")
-                    return
-                A, B = float(result.x[0]), float(result.x[1])
-                if not (np.isfinite(A) and np.isfinite(B)):
-                    print("[TabLDM:calibration] WARNING: Platt params non-finite; skipping.")
-                    return
-                params = {"type": "platt", "A": A, "B": B}
+                    result = _scipy_minimize(
+                        _temperature_nll,
+                        x0=[1.0],
+                        method="L-BFGS-B",
+                        bounds=[(0.8, 1.2)],
+                    )
+                    if not result.success:
+                        print(
+                            "[TabLDM:calibration] WARNING: fixed-boundary temperature "
+                            f"optimizer did not converge ({result.message}); skipping."
+                        )
+                        return
+                    A = float(result.x[0])
+                    if not np.isfinite(A):
+                        print("[TabLDM:calibration] WARNING: fixed-boundary temperature non-finite; skipping.")
+                        return
+                    params = {
+                        "type": "platt",
+                        "A": A,
+                        "B": 0.0,
+                        "objective": "logloss_fixed_boundary",
+                    }
+                    print(
+                        "[TabLDM:calibration] binary fixed-boundary temperature scaling; "
+                        f"A={A:.6g}, B=0"
+                    )
+                elif self.calibration_objective == "accuracy":
+                    A, B, threshold, best_accuracy = self._fit_binary_accuracy_platt(
+                        P_cal, y_cal
+                    )
+                    print(
+                        "[TabLDM:calibration] binary objective=accuracy; "
+                        f"threshold={threshold:.6g}; oof_accuracy={best_accuracy:.6f}"
+                    )
+                    params = {
+                        "type": "platt",
+                        "A": A,
+                        "B": B,
+                        "objective": "accuracy",
+                    }
+                else:
+                    z = np.log((P_cal[:, 1] + eps) / (P_cal[:, 0] + eps))
+
+                    def _platt_nll(params):
+                        A, B = params
+                        p1 = _expit(A * z + B)
+                        p1 = np.clip(p1, eps, 1.0 - eps)
+                        nll = -np.mean(y_cal * np.log(p1) + (1 - y_cal) * np.log(1.0 - p1))
+                        reg = lam * ((A - 1.0) ** 2 + B ** 2)
+                        return nll + reg
+
+                    result = _scipy_minimize(
+                        _platt_nll, x0=[1.0, 0.0], method="L-BFGS-B",
+                        bounds=[(0.8, 1.2), (-1.0, 1.0)],
+                    )
+                    if not result.success:
+                        print(f"[TabLDM:calibration] WARNING: Platt optimizer did not converge ({result.message}); skipping.")
+                        return
+                    A, B = float(result.x[0]), float(result.x[1])
+                    if not (np.isfinite(A) and np.isfinite(B)):
+                        print("[TabLDM:calibration] WARNING: Platt params non-finite; skipping.")
+                        return
+                    params = {"type": "platt", "A": A, "B": B, "objective": "logloss"}
             else:
+                if self.calibration_objective == "accuracy":
+                    print(
+                        "[TabLDM:calibration] WARNING: accuracy objective is only "
+                        "supported for binary Platt scaling; using multiclass NLL."
+                    )
                 log_P = np.log(np.clip(P_cal, eps, 1.0))
 
                 def _vs_nll(params):
