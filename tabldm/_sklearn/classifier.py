@@ -679,11 +679,11 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                     f"Consider enabling many-class support."
                 )
             if self.verbose:
-                print(
-                    f"[TabLDM] n_classes={self.n_classes_} > max_classes={self.model_.max_classes}; "
-                    f"enabling many-class strategy."
-                )
-
+                # print(
+                    # f"[TabLDM] n_classes={self.n_classes_} > max_classes={self.model_.max_classes}; "
+                    # f"enabling many-class strategy."
+                # )
+                pass
         # Transform features
         self.X_encoder_ = TransformToNumerical(verbose=self.verbose)
         X = self.X_encoder_.fit_transform(X)
@@ -763,15 +763,16 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                     )
                     for est_idx in range(n_total_estimators)
                 ]
-                print(
-                    f"[TabLDM] feature sampling triggered: "
-                    f"n_features={n_features} -> max_num_features={sample_width}, "
-                    f"n_estimators={n_total_estimators}"
-                )
+                # print(
+                    # f"[TabLDM] feature sampling triggered: "
+                    # f"n_features={n_features} -> max_num_features={sample_width}, "
+                    # f"n_estimators={n_total_estimators}"
+                # )
             else:
-                print(
-                    f"[TabLDM] feature sampling off: n_features={n_features}, max_num_features={self.max_num_features}"
-                )
+                # print(
+                    # f"[TabLDM] feature sampling off: n_features={n_features}, max_num_features={self.max_num_features}"
+                # )
+                pass
             if (self.feat_sample_indices_ is not None) != bool(self.route_stats_["feat_sampled"]):
                 print(
                     f"[TabLDM:route] WARNING: feature sampling outcome "
@@ -890,13 +891,13 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             "use_interactions": use_ia,
             "ia_active": ia_active,
         }
-        print(
-            f"[TabLDM:adaptive_plus] frozen structure: "
-            f"n_estimators={self.adaptive_plus_structure_['n_estimators']}, "
-            f"norm_methods={self.adaptive_plus_structure_['norm_methods']}, "
-            f"use_svd={self.adaptive_plus_structure_['use_svd']}, "
-            f"pca_active={pca_active}, ia_active={ia_active}"
-        )
+        # print(
+            # f"[TabLDM:adaptive_plus] frozen structure: "
+            # f"n_estimators={self.adaptive_plus_structure_['n_estimators']}, "
+            # f"norm_methods={self.adaptive_plus_structure_['norm_methods']}, "
+            # f"use_svd={self.adaptive_plus_structure_['use_svd']}, "
+            # f"pca_active={pca_active}, ia_active={ia_active}"
+        # )
 
     # ==================================================================
     # v2 no-K-Fold routing (candidate pool, group prior, fusion shrinkage)
@@ -1135,10 +1136,10 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         }
         for g in ("ap", "gr", "svd", "q"):
             if not on[g] and pi.get(g, 0.0) > 0.0:
-                print(
-                    f"[TabLDM:route] group '{g}' is off but carries pi={pi[g]:.4f}; "
-                    f"folding its mass into 'main' (v2 §3.6)."
-                )
+                # print(
+                    # f"[TabLDM:route] group '{g}' is off but carries pi={pi[g]:.4f}; "
+                    # f"folding its mass into 'main' (v2 §3.6)."
+                # )
                 pi["main"] = pi.get("main", 0.0) + pi[g]
                 pi[g] = 0.0
 
@@ -1246,23 +1247,23 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             cfg["n_svd_ens"] = 0
             cfg["n_quantile"] = 0
             scaled = {"main": int(self.n_estimators)}
-            print(
-                f"[TabLDM:route] heavy dataset budget (width-heavy: n_rows={n_rows}, "
-                f"n_features={n_features}, feat_sampled={feat_sampled}, n_cells={n_cells}): "
-                f"pool {total}->{scaled['main']} (main {sizes['main']}->{scaled['main']}, "
-                f"extra groups off: ap/gr/svd_ens/quantile), "
-                f"sample_width={self._feat_sample_width_} (unchanged)"
-            )
+            # print(
+                # f"[TabLDM:route] heavy dataset budget (width-heavy: n_rows={n_rows}, "
+                # f"n_features={n_features}, feat_sampled={feat_sampled}, n_cells={n_cells}): "
+                # f"pool {total}->{scaled['main']} (main {sizes['main']}->{scaled['main']}, "
+                # f"extra groups off: ap/gr/svd_ens/quantile), "
+                # f"sample_width={self._feat_sample_width_} (unchanged)"
+            # )
             return
 
         target = _HEAVY_POOL_SIZE
         if total <= target:
-            print(
-                f"[TabLDM:route] heavy dataset budget (row-heavy: n_rows={n_rows} >= "
-                f"{_HEAVY_N_TRAIN} or n_cells={n_cells} >= {_HEAVY_N_CELLS}): "
-                f"pool {total} already <= {target}, no cut; "
-                f"sample_width={self._feat_sample_width_} (unchanged)"
-            )
+            # print(
+                # f"[TabLDM:route] heavy dataset budget (row-heavy: n_rows={n_rows} >= "
+                # f"{_HEAVY_N_TRAIN} or n_cells={n_cells} >= {_HEAVY_N_CELLS}): "
+                # f"pool {total} already <= {target}, no cut; "
+                # f"sample_width={self._feat_sample_width_} (unchanged)"
+            # )
             return
 
         # Proportional shrink to `target`, floor `_HEAVY_MIN_GROUP_SIZE` per
@@ -1284,49 +1285,49 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         cfg["n_svd_ens"] = int(scaled.get("svd", 0))
         cfg["n_quantile"] = int(scaled.get("q", 0))
 
-        print(
-            f"[TabLDM:route] heavy dataset budget (row-heavy: n_rows={n_rows} >= "
-            f"{_HEAVY_N_TRAIN} or n_cells={n_cells} >= {_HEAVY_N_CELLS}): "
-            f"pool {total}->{sum(scaled.values())} (target {target}) "
-            f"main {sizes['main']}->{scaled.get('main', 0)}, "
-            f"ap {sizes['ap']}->{scaled.get('ap', 0)}, "
-            f"gr {sizes['gr']}->{scaled.get('gr', 0)}, "
-            f"svd_ens {sizes['svd']}->{scaled.get('svd', 0)}, "
-            f"q {sizes['q']}->{scaled.get('q', 0)}; "
-            f"sample_width={self._feat_sample_width_} (unchanged)"
-        )
+        # print(
+            # f"[TabLDM:route] heavy dataset budget (row-heavy: n_rows={n_rows} >= "
+            # f"{_HEAVY_N_TRAIN} or n_cells={n_cells} >= {_HEAVY_N_CELLS}): "
+            # f"pool {total}->{sum(scaled.values())} (target {target}) "
+            # f"main {sizes['main']}->{scaled.get('main', 0)}, "
+            # f"ap {sizes['ap']}->{scaled.get('ap', 0)}, "
+            # f"gr {sizes['gr']}->{scaled.get('gr', 0)}, "
+            # f"svd_ens {sizes['svd']}->{scaled.get('svd', 0)}, "
+            # f"q {sizes['q']}->{scaled.get('q', 0)}; "
+            # f"sample_width={self._feat_sample_width_} (unchanged)"
+        # )
 
     def _log_routing(self) -> None:
         """One-shot log of the routing inputs and decisions (v2 §4.5)."""
         s = self.route_stats_
         cfg = self.group_config_
         pi = self.group_prior_
-        print(
-            f"[TabLDM:route] stats: n_train={s['n_train']}, n_features={s['n_features']} "
-            f"(encoded={s['n_features_encoded']}), n_num={s['n_num']}, n_cat={s['n_cat']}, "
-            f"cat_ratio={s['cat_ratio']:.4f}, share_kurt10={s['share_kurt10']:.4f}, "
-            f"mean_cat_card={s['mean_cat_card']:.2f}, n_classes={s['n_classes']}, "
-            f"heavy_tail={s['heavy_tail']}, cat_dominant={s['cat_dominant']}, "
-            f"high_dim={s['high_dim']}, feat_sampled={s['feat_sampled']}"
-        )
-        print(
-            f"[TabLDM:route] pool ({cfg['rule']}): main={self.n_estimators}, "
-            f"adaptive_plus={'on' if cfg['use_ap'] else 'off'}, "
-            f"gaussian_rank={cfg['n_gr']}, "
-            f"svd_ens={cfg['n_svd_ens']}"
-            + ("" if cfg["use_svd_ens"] else f" (n_svd_ens_estimators={self.n_svd_ens_estimators} ignored)")
-            + f", quantile={cfg['n_quantile']}, use_cross_feature={self.use_cross_feature}"
-        )
-        print(
-            f"[TabLDM:route] group prior pi_0: main={pi['main']:.4f}, ap={pi['ap']:.4f}, "
-            f"gr={pi['gr']:.4f}, svd={pi['svd']:.4f}, q={pi['q']:.4f} "
-            f"({'explicit' if self.group_prior is not None else cfg['rule']})"
-        )
-        print(
-            f"[TabLDM:route] fusion: k_fold=disabled, shrink_lambda="
-            f"{'auto(val/E tiers)' if self.shrink_lambda is None else self.shrink_lambda}, "
-            f"validation={self.validation}, enable_calibration={self.enable_calibration}"
-        )
+        # print(
+            # f"[TabLDM:route] stats: n_train={s['n_train']}, n_features={s['n_features']} "
+            # f"(encoded={s['n_features_encoded']}), n_num={s['n_num']}, n_cat={s['n_cat']}, "
+            # f"cat_ratio={s['cat_ratio']:.4f}, share_kurt10={s['share_kurt10']:.4f}, "
+            # f"mean_cat_card={s['mean_cat_card']:.2f}, n_classes={s['n_classes']}, "
+            # f"heavy_tail={s['heavy_tail']}, cat_dominant={s['cat_dominant']}, "
+            # f"high_dim={s['high_dim']}, feat_sampled={s['feat_sampled']}"
+        # )
+        # print(
+            # f"[TabLDM:route] pool ({cfg['rule']}): main={self.n_estimators}, "
+            # f"adaptive_plus={'on' if cfg['use_ap'] else 'off'}, "
+            # f"gaussian_rank={cfg['n_gr']}, "
+            # f"svd_ens={cfg['n_svd_ens']}"
+            # + ("" if cfg["use_svd_ens"] else f" (n_svd_ens_estimators={self.n_svd_ens_estimators} ignored)")
+            # + f", quantile={cfg['n_quantile']}, use_cross_feature={self.use_cross_feature}"
+        # )
+        # print(
+            # f"[TabLDM:route] group prior pi_0: main={pi['main']:.4f}, ap={pi['ap']:.4f}, "
+            # f"gr={pi['gr']:.4f}, svd={pi['svd']:.4f}, q={pi['q']:.4f} "
+            # f"({'explicit' if self.group_prior is not None else cfg['rule']})"
+        # )
+        # print(
+            # f"[TabLDM:route] fusion: k_fold=disabled, shrink_lambda="
+            # f"{'auto(val/E tiers)' if self.shrink_lambda is None else self.shrink_lambda}, "
+            # f"validation={self.validation}, enable_calibration={self.enable_calibration}"
+        # )
 
     # ==================================================================
     # Enhanced X-side candidate generation
@@ -1460,19 +1461,19 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             self._frozen_plain_views_ = self._frozen_main_views_
             self._frozen_cross_svd_views_ = 0
 
-        print(
-            f"[TabLDM:enhance] generators fitted: "
-            f"requested_n_estimators=(main={self.n_estimators}, "
-            f"q={cfg['n_quantile']}, "
-            f"ap={self.adaptive_plus_structure_['n_estimators'] if cfg['use_ap'] else 0}, "
-            f"svd_ens={cfg['n_svd_ens']}, gr={cfg['n_gr']}), "
-            f"frozen_effective_n=(main={self._frozen_main_views_}, "
-            f"plain={self._frozen_plain_views_}, cross_svd={self._frozen_cross_svd_views_}, "
-            f"quantile_safe={self._frozen_q_views_}, svd_ens(group6)={self._frozen_svd_ens_views_}, "
-            f"adaptive_plus(group7)={self._frozen_ap_views_}, gaussian_rank(group8)={self._frozen_gr_views_}), "
-            f"svd/cross={'on' if getattr(self, 'svd_', None) is not None else 'off'}, "
-            f"use_cross_feature={self.use_cross_feature}"
-        )
+        # print(
+            # f"[TabLDM:enhance] generators fitted: "
+            # f"requested_n_estimators=(main={self.n_estimators}, "
+            # f"q={cfg['n_quantile']}, "
+            # f"ap={self.adaptive_plus_structure_['n_estimators'] if cfg['use_ap'] else 0}, "
+            # f"svd_ens={cfg['n_svd_ens']}, gr={cfg['n_gr']}), "
+            # f"frozen_effective_n=(main={self._frozen_main_views_}, "
+            # f"plain={self._frozen_plain_views_}, cross_svd={self._frozen_cross_svd_views_}, "
+            # f"quantile_safe={self._frozen_q_views_}, svd_ens(group6)={self._frozen_svd_ens_views_}, "
+            # f"adaptive_plus(group7)={self._frozen_ap_views_}, gaussian_rank(group8)={self._frozen_gr_views_}), "
+            # f"svd/cross={'on' if getattr(self, 'svd_', None) is not None else 'off'}, "
+            # f"use_cross_feature={self.use_cross_feature}"
+        # )
 
     # ==================================================================
     # SVD + cross feature fitting
@@ -1734,11 +1735,11 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 bad_mask = ~np.isfinite(p)
                 n_bad = int(bad_mask.sum())
                 bad_rows, bad_cols = np.where(bad_mask)
-                print(
-                    f"[TabLDM:finite_check{_fold_label}] DISCARD "
-                    f"mode={mode_name} estimator={est_offset + i} "
-                    f"prob_shape={p.shape} n_nonfinite={n_bad}"
-                )
+                # print(
+                    # f"[TabLDM:finite_check{_fold_label}] DISCARD "
+                    # f"mode={mode_name} estimator={est_offset + i} "
+                    # f"prob_shape={p.shape} n_nonfinite={n_bad}"
+                # )
             return valid
 
         fsi = getattr(self, "feat_sample_indices_", None)
@@ -1808,10 +1809,10 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         n_main = sum(p.shape[0] for p in all_probs)
         rep_shape = all_probs[0].shape[1:] if all_probs else (0, 0)
-        print(
-            f"[TabLDM:enhance:{tag}] mode=default n_estimators={n_main} "
-            f"per_estimator_prob_shape=(n_test={rep_shape[0]}, n_classes={rep_shape[1]})"
-        )
+        # print(
+            # f"[TabLDM:enhance:{tag}] mode=default n_estimators={n_main} "
+            # f"per_estimator_prob_shape=(n_test={rep_shape[0]}, n_classes={rep_shape[1]})"
+        # )
 
         # ---- quantile_safe group ----
         n_q = 0
@@ -1831,7 +1832,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 _q_offset += n_est
             all_probs.extend(q_probs)
             n_q = sum(p.shape[0] for p in q_probs)
-            print(f"[TabLDM:enhance:{tag}] mode=quantile_safe n_estimators={n_q}")
+            # print(f"[TabLDM:enhance:{tag}] mode=quantile_safe n_estimators={n_q}")
 
         # ---- group 6: svd+ ensemble ----
         n_svd_ens = 0
@@ -1851,7 +1852,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 _s_offset += n_est
             all_probs.extend(s_probs)
             n_svd_ens = sum(p.shape[0] for p in s_probs)
-            print(f"[TabLDM:enhance:{tag}] mode=svd_ens(group6) n_estimators={n_svd_ens}")
+            # print(f"[TabLDM:enhance:{tag}] mode=svd_ens(group6) n_estimators={n_svd_ens}")
 
         # ---- group 7: adaptive_plus ----
         n_adaptive = 0
@@ -1876,7 +1877,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 _ap_offset += n_est
             all_probs.extend(ap_probs)
             n_adaptive = sum(p.shape[0] for p in ap_probs)
-            print(f"[TabLDM:enhance:{tag}] mode=adaptive_plus(group7) n_estimators={n_adaptive}")
+            # print(f"[TabLDM:enhance:{tag}] mode=adaptive_plus(group7) n_estimators={n_adaptive}")
 
         # ---- group 8: Gaussian rank ----
         n_gaussian_rank = 0
@@ -1891,7 +1892,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 _gr_offset += n_est
             all_probs.extend(gr_probs)
             n_gaussian_rank = sum(p.shape[0] for p in gr_probs)
-            print(f"[TabLDM:enhance:{tag}] mode=gaussian_rank(group8) n_estimators={n_gaussian_rank}")
+            # print(f"[TabLDM:enhance:{tag}] mode=gaussian_rank(group8) n_estimators={n_gaussian_rank}")
 
         # ---- Per-estimator finite check ----
         all_probs_concat = np.concatenate(all_probs, axis=0)
@@ -2006,14 +2007,14 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         # calibration fit (§2.9 keeps calibration on), so run it whenever
         # either needs it.
         need_holdout = route == "single_validation" and (lam > 0.0 or self.enable_calibration)
-        print(
-            f"[TabLDM:nnls] v2 fusion: k_fold=disabled, n_train={n_full}, n_val={n_val}, "
-            f"E={n_candidates}, val_per_weight={n_val / max(n_candidates, 1):.2f}, "
-            f"lambda={lam:.2f}, path={route}, holdout={'yes' if need_holdout else 'no'}"
-        )
+        # print(
+            # f"[TabLDM:nnls] v2 fusion: k_fold=disabled, n_train={n_full}, n_val={n_val}, "
+            # f"E={n_candidates}, val_per_weight={n_val / max(n_candidates, 1):.2f}, "
+            # f"lambda={lam:.2f}, path={route}, holdout={'yes' if need_holdout else 'no'}"
+        # )
         if not need_holdout:
             self.shrink_lambda_ = 0.0
-            print("[TabLDM:nnls] no holdout -> pure group prior pi_0")
+            # print("[TabLDM:nnls] no holdout -> pure group prior pi_0")
             return
 
         class_counts = np.bincount(y.astype(int), minlength=self.n_classes_)
@@ -2049,18 +2050,18 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             pi_hold = self._slot_group_mass(weights, names_valid) or dict(self.group_prior_)
             self.group_prior_holdout_ = dict(pi_hold)
             rho = float(self.slot_blend_rate)
-            print(
-                f"[TabLDM:nnls] learned ensemble weights: E={weights.shape[0]} "
-                f"(over {int(valid_mask.sum())}/{valid_mask.shape[0]} valid candidates), "
-                f"sum={weights.sum():.6f}"
-            )
-            print(
-                f"[TabLDM:nnls] holdout shrinkage: lambda={lam:.2f}, rho={rho:.2f}, "
-                f"blend={1.0 - lam:.2f}*mix(pi_0) + {lam * (1.0 - rho):.2f}*mix(pi_hold) "
-                f"+ {lam * rho:.2f}*slot_nnls, "
-                f"pi_hold=({pi_hold.get('main', 0.0):.4f}, ap={pi_hold.get('ap', 0.0):.4f}, "
-                f"gr={pi_hold.get('gr', 0.0):.4f}, svd={pi_hold.get('svd', 0.0):.4f})"
-            )
+            # print(
+                # f"[TabLDM:nnls] learned ensemble weights: E={weights.shape[0]} "
+                # f"(over {int(valid_mask.sum())}/{valid_mask.shape[0]} valid candidates), "
+                # f"sum={weights.sum():.6f}"
+            # )
+            # print(
+                # f"[TabLDM:nnls] holdout shrinkage: lambda={lam:.2f}, rho={rho:.2f}, "
+                # f"blend={1.0 - lam:.2f}*mix(pi_0) + {lam * (1.0 - rho):.2f}*mix(pi_hold) "
+                # f"+ {lam * rho:.2f}*slot_nnls, "
+                # f"pi_hold=({pi_hold.get('main', 0.0):.4f}, ap={pi_hold.get('ap', 0.0):.4f}, "
+                # f"gr={pi_hold.get('gr', 0.0):.4f}, svd={pi_hold.get('svd', 0.0):.4f})"
+            # )
 
         if self.enable_calibration:
             # Calibration is fitted on the *final* fused holdout probabilities
@@ -2078,10 +2079,10 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             random_state=self.random_state,
             stratify=y,
         )
-        print(f"[TabLDM:nnls] stratified validation split: n_train={X_tr.shape[0]}, n_val={X_val.shape[0]}")
+        # print(f"[TabLDM:nnls] stratified validation split: n_train={X_tr.shape[0]}, n_val={X_val.shape[0]}")
         gen_info = self._make_and_fit_enhanced_generators(X_tr, y_tr)
         val_probs, valid_mask, names = self._collect_val_probs(X_val, gen_info)
-        print(f"[TabLDM:nnls] validation probability matrix shape={val_probs.shape}")
+        # print(f"[TabLDM:nnls] validation probability matrix shape={val_probs.shape}")
         return val_probs, y_val, valid_mask, names
 
     def _make_and_fit_enhanced_generators(self, X_tr, y_tr):
@@ -2347,10 +2348,10 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         totals = dict.fromkeys(self._GROUP_KEYS, 0.0)
         for nm, w in zip(names, weights, strict=False):
             totals[self._candidate_group(nm)] += float(w)
-        print(
-            f"[TabLDM:nnls] group_mass: main={totals['main']:.4f}, ap={totals['ap']:.4f}, "
-            f"gr={totals['gr']:.4f}, svd_ens={totals['svd']:.4f}, quantile={totals['q']:.4f}"
-        )
+        # print(
+            # f"[TabLDM:nnls] group_mass: main={totals['main']:.4f}, ap={totals['ap']:.4f}, "
+            # f"gr={totals['gr']:.4f}, svd_ens={totals['svd']:.4f}, quantile={totals['q']:.4f}"
+        # )
         nonzero_str = ", ".join(f"{nm}={w:.4f}" for nm, w in zip(names, weights, strict=False) if w > 0)
         print(
             f"[TabLDM:nnls] solved: n_nonzero={n_nonzero}/{len(weights)}, raw_sum={raw_sum:.4f}; "
@@ -2424,7 +2425,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         if self.verbose:
             method_name = "platt_scaling" if n_classes == 2 else "vector_scaling"
-            print(f"[TabLDM:calibration] method={method_name}, n_cal={n_cal}, n_classes={n_classes}, lambda={lam}")
+            # print(f"[TabLDM:calibration] method={method_name}, n_cal={n_cal}, n_classes={n_classes}, lambda={lam}")
 
         try:
             if n_classes == 2:
@@ -2550,9 +2551,10 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 effective_mask = predict_mask & oof_mask
                 n_oof_extra_dropped = int(predict_mask.sum()) - int(effective_mask.sum())
                 if n_oof_extra_dropped > 0:
-                    print(
-                        f"[TabLDM:enhance] OOF mask drops {n_oof_extra_dropped} additional candidate(s); {int(effective_mask.sum())} remain."
-                    )
+                    # print(
+                        # f"[TabLDM:enhance] OOF mask drops {n_oof_extra_dropped} additional candidate(s); {int(effective_mask.sum())} remain."
+                    # )
+                    pass
             predict_valid_indices = np.where(predict_mask)[0]
             effective_local = effective_mask[predict_valid_indices]
             probs = probs_all[effective_local]
@@ -2570,13 +2572,13 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         group_counts = dict.fromkeys(self._GROUP_KEYS, 0)
         for nm in names_valid:
             group_counts[self._candidate_group(nm)] += 1
-        print(
-            f"[TabLDM:enhance:predict] effective_valid_candidates={n_estimators} "
-            f"(total_generated={effective_mask.shape[0]}, "
-            f"main={group_counts['main']}, quantile={group_counts['q']}, "
-            f"svd_ens={group_counts['svd']}, adaptive_plus={group_counts['ap']}, "
-            f"gaussian_rank={group_counts['gr']})"
-        )
+        # print(
+            # f"[TabLDM:enhance:predict] effective_valid_candidates={n_estimators} "
+            # f"(total_generated={effective_mask.shape[0]}, "
+            # f"main={group_counts['main']}, quantile={group_counts['q']}, "
+            # f"svd_ens={group_counts['svd']}, adaptive_plus={group_counts['ap']}, "
+            # f"gaussian_rank={group_counts['gr']})"
+        # )
 
         # v2 §3.5 fusion: two-level shrinkage of the holdout term towards the
         # group prior. Never an unweighted candidate mean (v2 §4.1).
@@ -2584,9 +2586,9 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         lam = float(getattr(self, "shrink_lambda_", 0.0) or 0.0)
         weight_mode = f"prior+holdout(lam={lam:.2f},rho={self.slot_blend_rate:.2f})" if lam > 0.0 else "group_prior"
-        print(
-            f"[TabLDM:enhance] weight_mode={weight_mode} valid_candidates={n_estimators} final_proba_shape={proba.shape}"
-        )
+        # print(
+            # f"[TabLDM:enhance] weight_mode={weight_mode} valid_candidates={n_estimators} final_proba_shape={proba.shape}"
+        # )
 
         # Probability calibration
         return self._apply_calibration(proba)

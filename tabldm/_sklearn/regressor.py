@@ -502,21 +502,21 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         mask = np.isfinite(y_flat)
         y_valid = y_flat[mask]
         if len(y_valid) < 10:
-            print("[TabLDM:hk] skipped: too few valid samples")
+            # print("[TabLDM:hk] skipped: too few valid samples")
             return False, float("nan")
         if y_valid.std() < 1e-8:
-            print("[TabLDM:hk] skipped: y is near-constant")
+            # print("[TabLDM:hk] skipped: y is near-constant")
             return False, float("nan")
         try:
             kurt = float(_scipy_kurtosis(y_valid, fisher=True, bias=False))
         except Exception:
-            print("[TabLDM:hk] skipped: kurtosis computation failed")
+            # print("[TabLDM:hk] skipped: kurtosis computation failed")
             return False, float("nan")
         if not np.isfinite(kurt):
-            print("[TabLDM:hk] skipped: kurtosis is not finite")
+            # print("[TabLDM:hk] skipped: kurtosis is not finite")
             return False, float("nan")
         triggered = kurt > self.high_kurtosis_threshold
-        print(f"[TabLDM:hk] kurtosis={kurt:.4f}, threshold={self.high_kurtosis_threshold}, triggered={triggered}")
+        # print(f"[TabLDM:hk] kurtosis={kurt:.4f}, threshold={self.high_kurtosis_threshold}, triggered={triggered}")
         return triggered, kurt
 
     def _fit_asinh_transformer(self, y: np.ndarray) -> dict:
@@ -581,7 +581,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                         "seed": seed,
                     }
                 )
-                print(f"[TabLDM:hk] asinh[{i}] seed={seed} center={params['center']:.4f} scale={params['scale']:.4f}")
+                # print(f"[TabLDM:hk] asinh[{i}] seed={seed} center={params['center']:.4f} scale={params['scale']:.4f}")
             except Exception as e:
                 print(f"[TabLDM:hk] asinh[{i}] failed: {e}, skipping")
 
@@ -609,7 +609,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                         "seed": seed,
                     }
                 )
-                print(f"[TabLDM:hk] yj[{i}] seed={seed}")
+                # print(f"[TabLDM:hk] yj[{i}] seed={seed}")
             except Exception as e:
                 print(f"[TabLDM:hk] yj[{i}] failed: {e}, skipping")
 
@@ -1358,19 +1358,19 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         # kinds, so a skipped HK estimator cannot shift the asinh/yj split.
         self.candidate_names_ = [self._candidate_name(i) for i in range(self.n_main_actual_ + self.n_quantile_actual_)]
 
-        print(
-            f"[TabLDM:enhance] Estimator groups: main={self.n_main_actual_} "
-            f"(requested {self.n_estimators}), "
-            f"quantile={self.n_quantile_actual_} (requested {self.n_quantile_estimators}), "
-            f"total={self.n_main_actual_ + self.n_quantile_actual_}"
-        )
+        # print(
+            # f"[TabLDM:enhance] Estimator groups: main={self.n_main_actual_} "
+            # f"(requested {self.n_estimators}), "
+            # f"quantile={self.n_quantile_actual_} (requested {self.n_quantile_estimators}), "
+            # f"total={self.n_main_actual_ + self.n_quantile_actual_}"
+        # )
 
         # HK full-train generators
         self.hk_generators_ = []
         if self.hk_triggered_:
             y_orig_full = self.y_scaler_.inverse_transform(y_scaled.reshape(-1, 1)).flatten()
             self.hk_generators_ = self._make_hk_generators(X, y_orig_full, seed_offset=0)
-            print(f"[TabLDM:hk] full-train HK generators fitted: {len(self.hk_generators_)}")
+            # print(f"[TabLDM:hk] full-train HK generators fitted: {len(self.hk_generators_)}")
 
     def _make_and_fit_generators(self, X_tr: np.ndarray, y_tr: np.ndarray):
         """Fit all generators on a (possibly reduced) training split.
@@ -1706,18 +1706,18 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             if not (0.0 <= self.slot_blend_rate <= 1.0):
                 raise ValueError(f"slot_blend_rate must be in [0, 1], got {self.slot_blend_rate}")
             if not self.validation and self.shrink_lambda:
-                print(
-                    f"[TabLDM:enhance] validation=False: holdout is skipped and "
-                    f"shrink_lambda={self.shrink_lambda} is ignored; pure group prior will be used."
-                )
-
-            print(f"[TabLDM:enhance] use_cross_feature={self.use_cross_feature}")
-            print(
-                f"[TabLDM:enhance] v3.1 group-prior rules active: "
-                f"shrink_lambda={'auto' if self.shrink_lambda is None else self.shrink_lambda}, "
-                f"shrink_kappa={self.shrink_kappa}, slot_blend_rate={self.slot_blend_rate}, "
-                f"hk_kind_ratio={self.hk_kind_ratio}"
-            )
+                # print(
+                    # f"[TabLDM:enhance] validation=False: holdout is skipped and "
+                    # f"shrink_lambda={self.shrink_lambda} is ignored; pure group prior will be used."
+                # )
+                pass
+            # print(f"[TabLDM:enhance] use_cross_feature={self.use_cross_feature}")
+            # print(
+                # f"[TabLDM:enhance] v3.1 group-prior rules active: "
+                # f"shrink_lambda={'auto' if self.shrink_lambda is None else self.shrink_lambda}, "
+                # f"shrink_kappa={self.shrink_kappa}, slot_blend_rate={self.slot_blend_rate}, "
+                # f"hk_kind_ratio={self.hk_kind_ratio}"
+            # )
 
             # Fit generators
             self._fit_full_generators(X, y_scaled)
@@ -1742,17 +1742,17 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     )
                     for est_idx in range(n_total_estimators)
                 ]
-                print(
-                    f"[TabLDM:enhance] feature sampling triggered: "
-                    f"n_features={n_features} -> max_num_features={self.max_num_features}, "
-                    f"n_estimators={n_total_estimators}"
-                )
+                # print(
+                    # f"[TabLDM:enhance] feature sampling triggered: "
+                    # f"n_features={n_features} -> max_num_features={self.max_num_features}, "
+                    # f"n_estimators={n_total_estimators}"
+                # )
             else:
-                print(
-                    f"[TabLDM:enhance] feature sampling off: n_features={n_features}, "
-                    f"max_num_features={self.max_num_features}"
-                )
-
+                # print(
+                    # f"[TabLDM:enhance] feature sampling off: n_features={n_features}, "
+                    # f"max_num_features={self.max_num_features}"
+                # )
+                pass
             # Feature-side statistics for routing analysis (§4.5)
             self._compute_feature_stats(X)
 
@@ -1801,22 +1801,22 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 rule_tag = "explicit (heavy_tail)"
             elif heavy_tail and not rule_tag.startswith("R2"):
                 rule_tag = "R2 heavy_tail + " + rule_tag
-            print(
-                f"[TabLDM:enhance] routing: n_train={n_full}, n_features={n_features_eff}, "
-                f"n_main={n_main_actual}, n_q={n_q_actual}, heavy_tail={heavy_tail}, "
-                f"feat_sampled={feat_sampled}, rule={rule_tag}"
-            )
-            print(
-                f"[TabLDM:enhance] group prior pi_0: main={pi_0.get('main', 0.0):.4f}, "
-                f"quantile={pi_0.get('quantile', 0.0):.4f}, "
-                f"hk={pi_0.get('hk', 0.0):.4f}"
-            )
-            print(
-                f"[TabLDM:enhance] feature-side stats: n_num={self.n_num_}, n_cat={self.n_cat_}, "
-                f"feat_skew_mean={self.feat_skew_mean_:.4f}, "
-                f"feat_kurt_mean={self.feat_kurt_mean_:.4f}, "
-                f"feat_outlier_rate={self.feat_outlier_rate_:.4f}"
-            )
+            # print(
+                # f"[TabLDM:enhance] routing: n_train={n_full}, n_features={n_features_eff}, "
+                # f"n_main={n_main_actual}, n_q={n_q_actual}, heavy_tail={heavy_tail}, "
+                # f"feat_sampled={feat_sampled}, rule={rule_tag}"
+            # )
+            # print(
+                # f"[TabLDM:enhance] group prior pi_0: main={pi_0.get('main', 0.0):.4f}, "
+                # f"quantile={pi_0.get('quantile', 0.0):.4f}, "
+                # f"hk={pi_0.get('hk', 0.0):.4f}"
+            # )
+            # print(
+                # f"[TabLDM:enhance] feature-side stats: n_num={self.n_num_}, n_cat={self.n_cat_}, "
+                # f"feat_skew_mean={self.feat_skew_mean_:.4f}, "
+                # f"feat_kurt_mean={self.feat_kurt_mean_:.4f}, "
+                # f"feat_outlier_rate={self.feat_outlier_rate_:.4f}"
+            # )
 
             # ---- single-holdout group-level shrinkage (§3.6, v3) ----
             # K-Fold is completely disabled.  The holdout learns a
@@ -1830,15 +1830,16 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             self.nan_valid_idx_ = None
             n_val = math.ceil(0.2 * n_full)
             route = self._route_validation(self.validation, self.k_fold, n_full)
-            print(
-                f"[TabLDM:enhance] shrinkage path: k_fold=disabled, n_train={n_full}, "
-                f"n_val={n_val}, path={route}, shrink_lambda="
-                f"{'auto' if self.shrink_lambda is None else self.shrink_lambda}, "
-                f"shrink_kappa={self.shrink_kappa}"
-            )
+            # print(
+                # f"[TabLDM:enhance] shrinkage path: k_fold=disabled, n_train={n_full}, "
+                # f"n_val={n_val}, path={route}, shrink_lambda="
+                # f"{'auto' if self.shrink_lambda is None else self.shrink_lambda}, "
+                # f"shrink_kappa={self.shrink_kappa}"
+            # )
 
             if route != "single_validation":
-                print("[TabLDM:enhance] no holdout: using pure group prior pi_0")
+                # print("[TabLDM:enhance] no holdout: using pure group prior pi_0")
+                pass
             else:
                 X_tr, X_val, y_tr_scaled, y_val_scaled = train_test_split(
                     X,
@@ -1849,7 +1850,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 )
                 y_val_orig = self.y_scaler_.inverse_transform(y_val_scaled.reshape(-1, 1)).flatten()
                 y_tr_orig_sv = self.y_scaler_.inverse_transform(y_tr_scaled.reshape(-1, 1)).flatten()
-                print(f"[TabLDM:enhance] validation split: n_train={X_tr.shape[0]}, n_val={X_val.shape[0]}")
+                # print(f"[TabLDM:enhance] validation split: n_train={X_tr.shape[0]}, n_val={X_val.shape[0]}")
                 val_gen = self._make_and_fit_generators(X_tr, y_tr_scaled)
                 val_preds_scaled = self._collect_val_predictions(X_tr, y_tr_scaled, X_val, val_gen)
                 # Detect and skip NaN estimators
@@ -1889,11 +1890,11 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     sv_hk_preds, sv_hk_kinds = self._collect_hk_val_predictions_orig(X_val, sv_hk_infos)
                     if sv_hk_preds.shape[0] > 0:
                         val_preds_orig = np.concatenate([val_preds_orig, sv_hk_preds], axis=0)
-                        print(
-                            f"[TabLDM:hk] appended {sv_hk_preds.shape[0]} HK val rows; total={val_preds_orig.shape[0]}"
-                        )
+                        # print(
+                            # f"[TabLDM:hk] appended {sv_hk_preds.shape[0]} HK val rows; total={val_preds_orig.shape[0]}"
+                        # )
 
-                print(f"[TabLDM:enhance] val_predictions shape={val_preds_orig.shape}")
+                # print(f"[TabLDM:enhance] val_predictions shape={val_preds_orig.shape}")
 
                 names_w = [self._candidate_name(int(gi)) for gi in valid_idx]
                 names_w += [f"hk_{kind}[{i}]" for i, kind in enumerate(sv_hk_kinds)]
@@ -1925,13 +1926,13 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 w_svd = _sum_prefixes("svd+cross")
                 w_q = _sum_prefixes("quantile")
                 w_hk = _sum_prefixes("hk")
-                print(
-                    f"[TabLDM:enhance] NNLS (diagnostic): n_nonzero={n_nonzero}/{len(weights)}, "
-                    f"weights.sum()={w_sum:.4f}, "
-                    f"w_main={w_default + w_svd:.4f} "
-                    f"(w_default={w_default:.4f}, w_svd/cross={w_svd:.4f}), "
-                    f"w_quantile={w_q:.4f}, w_hk={w_hk:.4f}"
-                )
+                # print(
+                    # f"[TabLDM:enhance] NNLS (diagnostic): n_nonzero={n_nonzero}/{len(weights)}, "
+                    # f"weights.sum()={w_sum:.4f}, "
+                    # f"w_main={w_default + w_svd:.4f} "
+                    # f"(w_default={w_default:.4f}, w_svd/cross={w_svd:.4f}), "
+                    # f"w_quantile={w_q:.4f}, w_hk={w_hk:.4f}"
+                # )
                 # §4.2: index the *global* candidate name, not the filtered
                 # weight position (wrong the moment NaN filtering drops one).
                 nonzero_str = ", ".join(f"{nm}={w:.4f}" for nm, w in zip(names_w, weights, strict=False) if w > 0)
@@ -1956,16 +1957,16 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 self.group_prior_holdout_ = dict(pi_hold)
                 self.shrink_lambda_ = lam
                 rho = float(self.slot_blend_rate)
-                print(
-                    f"[TabLDM:enhance] holdout shrinkage: lambda={lam:.4f} "
-                    f"(n_val={n_val_rows}, kappa={self.shrink_kappa}), rho={rho:.4f}, "
-                    f"blend={1.0 - lam:.4f}*mix(pi_0) + {lam * (1.0 - rho):.4f}*mix(pi_hold) "
-                    f"+ {lam * rho:.4f}*slot_nnls, "
-                    f"pi_0=({pi_0.get('main', 0.0):.4f}, {pi_0.get('quantile', 0.0):.4f}, "
-                    f"{pi_0.get('hk', 0.0):.4f}), "
-                    f"pi_hold=({pi_hold.get('main', 0.0):.4f}, {pi_hold.get('quantile', 0.0):.4f}, "
-                    f"{pi_hold.get('hk', 0.0):.4f})"
-                )
+                # print(
+                    # f"[TabLDM:enhance] holdout shrinkage: lambda={lam:.4f} "
+                    # f"(n_val={n_val_rows}, kappa={self.shrink_kappa}), rho={rho:.4f}, "
+                    # f"blend={1.0 - lam:.4f}*mix(pi_0) + {lam * (1.0 - rho):.4f}*mix(pi_hold) "
+                    # f"+ {lam * rho:.4f}*slot_nnls, "
+                    # f"pi_0=({pi_0.get('main', 0.0):.4f}, {pi_0.get('quantile', 0.0):.4f}, "
+                    # f"{pi_0.get('hk', 0.0):.4f}), "
+                    # f"pi_hold=({pi_hold.get('main', 0.0):.4f}, {pi_hold.get('quantile', 0.0):.4f}, "
+                    # f"{pi_hold.get('hk', 0.0):.4f})"
+                # )
 
         else:
             # ---- Non-enhanced path ----
@@ -2227,10 +2228,10 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             if self.verbose:
                 main_n = getattr(self, "n_main_actual_", self.n_estimators)
                 q_n = getattr(self, "n_quantile_actual_", 0)
-                print(
-                    f"[TabLDM:enhance] Predictions merged: main={main_n}, quantile={q_n}, "
-                    f"total={n_estimators}, shape={arr.shape}"
-                )
+                # print(
+                    # f"[TabLDM:enhance] Predictions merged: main={main_n}, quantile={q_n}, "
+                    # f"total={n_estimators}, shape={arr.shape}"
+                # )
 
             if arr.ndim == 2:
                 arr = self.y_scaler_.inverse_transform(arr.reshape(-1, 1)).reshape(n_estimators, n_samples)
