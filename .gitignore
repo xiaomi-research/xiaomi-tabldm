@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 results/
+
+# Claude Code agent worktrees (never tracked)
+.claude/worktrees/
