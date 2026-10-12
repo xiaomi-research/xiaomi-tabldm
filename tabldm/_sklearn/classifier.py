@@ -95,7 +95,7 @@ from tabldm._model.attnres_light_rmsnorm_moe import TabLDMSparseMoE
 from tabldm._model.embedding_dual_stream import ColEmbeddingDualStream
 from tabldm._model.kv_cache import TabLDMCache
 
-from .base import TabLDMBaseEstimator
+from .base import TabLDMBaseEstimator, _FitBudget, _reserve
 from .preprocessing import (
     EnsembleGenerator,
     GaussianRankGenerator,
@@ -639,14 +639,48 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
     # fit()
     # ==================================================================
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> TabLDMClassifier:
+    def fit(
+        self, X: np.ndarray, y: np.ndarray, *, time_limit: float | None = None
+    ) -> TabLDMClassifier:
         """Fit the classifier to training data.
 
         When ``enhance_candidates=True``, fits multiple candidate generators
         and optionally learns NNLS ensemble weights via validation/OOF.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training features.
+        y : array-like of shape (n_samples,)
+            Training labels.
+        time_limit : float or None, default=None
+            Wall-clock budget for this ``fit`` call, in seconds. Three
+            contracts hold:
+
+            1. ``time_limit=None`` (the default) leaves behavior bit-identical
+               to fitting without the argument: same candidate pool, same
+               fusion weights, same predictions.
+            2. Overshoot is bounded. The budget is checked *between* estimator
+               batches, so a fit may exceed ``time_limit`` by at most one batch
+               forward (at most ``batch_size_`` candidates).
+            3. The pool is only ever truncated from the tail of the canonical
+               candidate order — never by skipping candidates in the middle.
+               Candidates that were not run are marked invalid and dropped from
+               fusion; the fitted mask (``nnls_valid_candidate_mask_``) is
+               replayed at predict time, so the pool fit froze is exactly the
+               pool predict combines.
+
+            ``time_limit<=0`` is normalized to the floor path rather than an
+            error: at least one estimator batch always runs, so the returned
+            model is always able to ``predict``.
         """
         if y is None:
             raise ValueError("This classifier requires y to be passed, but the target y is None.")
+
+        # Wall-clock budget covering the whole fit (from here, so it lines up
+        # with the caller's window).  NNLS + calibration get a small reserve so
+        # the candidate loop cannot starve them.
+        self._fit_budget_ = _FitBudget(time_limit, reserve=_reserve(time_limit) if time_limit else 0.0)
 
         X, y = validate_data(self, X, y, dtype=None, skip_check_array=True)
         check_classification_targets(y)
@@ -1600,9 +1634,22 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
     # ==================================================================
 
     def _forward_candidates(
-        self, Xs: np.ndarray, ys: np.ndarray, feat_indices: list[np.ndarray] | None = None
+        self,
+        Xs: np.ndarray,
+        ys: np.ndarray,
+        feat_indices: list[np.ndarray] | None = None,
+        budget: _FitBudget | None = None,
     ) -> np.ndarray:
-        """Forward a batch of ensemble members and return per-estimator probabilities."""
+        """Forward a batch of ensemble members and return per-estimator probabilities.
+
+        When ``budget`` is given and expires mid-loop, the remaining estimator
+        slots are returned as NaN rows (full planned shape, prefix completed).
+        Downstream finite-checks drop those rows and record the drop in the
+        valid-candidate mask, which predict time replays — so fit and predict
+        combine exactly the same pool. Truncation only happens after at least
+        one batch has completed across the whole fit (``budget.n_batches_done``),
+        so a fitted model always retains >= 1 candidate.
+        """
         n_bad_xs = int(np.sum(~np.isfinite(Xs)))
         if n_bad_xs > 0:
             print(
@@ -1620,6 +1667,11 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         outputs = []
         for X_batch, y_batch in zip(Xs_split, ys_split, strict=False):
+            # Budget checkpoint: stop between estimator batches. The floor
+            # (``n_batches_done > 0``) guarantees at least one batch runs per
+            # fit and that the output shape is known before any NaN fill.
+            if budget is not None and budget.expired() and budget.n_batches_done > 0:
+                break
             X_batch = torch.from_numpy(X_batch).float().to(self.device_)
             y_batch = torch.from_numpy(y_batch).float().to(self.device_)
             with torch.no_grad():
@@ -1639,6 +1691,18 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                     f"{n_bad_logits}/{raw.size} non-finite values (batch_shape={raw.shape})"
                 )
             outputs.append(raw)
+            if budget is not None:
+                budget.n_batches_done += 1
+                budget.out_shapes.setdefault("probs", raw.shape[1:])
+
+        if not outputs:
+            # Budget already spent by an earlier call in this fit. The floor
+            # guarantees ``out_shapes`` is set; return all-NaN, which the caller
+            # drops as invalid candidates.
+            n_est = int(Xs.shape[0])
+            fill = np.full((n_est,) + tuple(budget.out_shapes["probs"]), np.nan, dtype=np.float32)
+            budget.n_truncated += n_est
+            return fill
 
         logits = np.concatenate(outputs, axis=0)
         probs = self.softmax(logits, axis=-1, temperature=self.softmax_temperature)
@@ -1648,6 +1712,12 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 f"[TabLDM:forward_candidates] WARNING: final probs has "
                 f"{n_bad_probs}/{probs.size} non-finite values after softmax (shape={probs.shape})"
             )
+
+        if budget is not None and len(outputs) < len(Xs_split):
+            n_left = int(sum(int(s.shape[0]) for s in Xs_split[len(outputs) :]))
+            fill = np.full((n_left,) + probs.shape[1:], np.nan, dtype=probs.dtype)
+            budget.n_truncated += n_left
+            probs = np.concatenate([probs, fill], axis=0)
         return probs
 
     def _batch_forward(self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: np.ndarray | None = None) -> np.ndarray:
@@ -1723,6 +1793,11 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         """Collect per-estimator probabilities in canonical candidate order."""
         all_probs = []
         _fold_label = getattr(self, "_current_fold_label_", "")
+        # Fit-time collections honour the fit budget; predict-time collections
+        # never do (predict is not under ``time_limit``) and must keep running
+        # the full frozen pool, so pass ``None`` there.
+        budget = getattr(self, "_fit_budget_", None) if tag != "predict" else None
+        _n_trunc_before = int(budget.n_truncated) if budget is not None else 0
 
         def _check_and_log_finite(group_probs, mode_name, est_offset):
             n_est = group_probs.shape[0]
@@ -1772,7 +1847,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                 per_est_probs = {}
                 if even_idxs:
                     fi = [fsi[g] for g in even_global] if fsi is not None else None
-                    _p = self._forward_candidates(Xs_both[even_idxs], ys[even_idxs], feat_indices=fi)
+                    _p = self._forward_candidates(Xs_both[even_idxs], ys[even_idxs], feat_indices=fi, budget=budget)
                     for i, li in enumerate(even_idxs):
                         per_est_probs[li] = _p[i]
                 if odd_idxs:
@@ -1784,7 +1859,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
                         Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
                     Xs_odd = np.stack(Xs_odd_list, axis=0)
                     fi = [fsi[g] for g in odd_global] if fsi is not None else None
-                    _p = self._forward_candidates(Xs_odd, ys[odd_idxs], feat_indices=fi)
+                    _p = self._forward_candidates(Xs_odd, ys[odd_idxs], feat_indices=fi, budget=budget)
                     for i, li in enumerate(odd_idxs):
                         per_est_probs[li] = _p[i]
 
@@ -1799,7 +1874,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             for norm_method, (Xs, ys) in data.items():
                 n_est = Xs.shape[0]
                 fi = [fsi[_grp_offset + i] for i in range(n_est)] if fsi is not None else None
-                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi)
+                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi, budget=budget)
                 if hasattr(main_gen, "class_shuffles_") and norm_method in main_gen.class_shuffles_:
                     shuffles = main_gen.class_shuffles_[norm_method]
                     for _si in range(n_est):
@@ -1823,7 +1898,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             for norm_method, (Xs, ys) in q_data.items():
                 n_est = Xs.shape[0]
                 fi = [fsi[_q_offset + i] for i in range(n_est)] if fsi is not None else None
-                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi)
+                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi, budget=budget)
                 if hasattr(q_gen, "class_shuffles_") and norm_method in q_gen.class_shuffles_:
                     shuffles = q_gen.class_shuffles_[norm_method]
                     for _si in range(n_est):
@@ -1843,7 +1918,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             for norm_method, (Xs, ys) in s_data.items():
                 n_est = Xs.shape[0]
                 fi = [fsi[_s_offset + i] for i in range(n_est)] if fsi is not None else None
-                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi)
+                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi, budget=budget)
                 if hasattr(svd_ens_gen, "class_shuffles_") and norm_method in svd_ens_gen.class_shuffles_:
                     shuffles = svd_ens_gen.class_shuffles_[norm_method]
                     for _si in range(n_est):
@@ -1868,7 +1943,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             for norm_method, (Xs, ys) in ap_data.items():
                 n_est = Xs.shape[0]
                 fi = [fsi[_ap_offset + i] for i in range(n_est)] if fsi is not None else None
-                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi)
+                probs_arr = self._forward_candidates(Xs, ys, feat_indices=fi, budget=budget)
                 if hasattr(adaptive_plus_gen, "class_shuffles_") and norm_method in adaptive_plus_gen.class_shuffles_:
                     shuffles = adaptive_plus_gen.class_shuffles_[norm_method]
                     for _si in range(n_est):
@@ -1888,7 +1963,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             for norm_method, (Xs, ys) in gr_data.items():
                 n_est = Xs.shape[0]
                 fi = [fsi[_gr_offset + i] for i in range(n_est)] if fsi is not None else None
-                gr_probs.append(self._forward_candidates(Xs, ys, feat_indices=fi))
+                gr_probs.append(self._forward_candidates(Xs, ys, feat_indices=fi, budget=budget))
                 _gr_offset += n_est
             all_probs.extend(gr_probs)
             n_gaussian_rank = sum(p.shape[0] for p in gr_probs)
@@ -1912,10 +1987,18 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
 
         n_valid = int(valid_mask.sum())
         n_dropped = E_total - n_valid
+        n_budget = (int(budget.n_truncated) - _n_trunc_before) if budget is not None else 0
         if n_dropped > 0:
             print(
                 f"[TabLDM:finite_check{_fold_label}] dropped {n_dropped}/{E_total} "
                 f"non-finite candidates; {n_valid} remaining."
+                + (f" ({n_budget} of them never ran: time_limit early-stop)" if n_budget else "")
+            )
+        if n_budget > 0:
+            print(
+                f"[TabLDM:time_limit{_fold_label}] early-stop: {E_total - n_budget}/{E_total} "
+                f"candidates ran within the budget; the rest are excluded from fusion "
+                f"(elapsed={budget.elapsed:.1f}s)."
             )
         if n_valid == 0:
             raise RuntimeError(
@@ -2005,8 +2088,15 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         route = self._route_validation(self.validation, self.k_fold, n_full)
         # The holdout feeds both the NNLS term (lambda > 0) and the
         # calibration fit (§2.9 keeps calibration on), so run it whenever
-        # either needs it.
-        need_holdout = route == "single_validation" and (lam > 0.0 or self.enable_calibration)
+        # either needs it.  If the fit budget is already spent, skip the
+        # holdout entirely and fall through to the pure-group-prior path
+        # below rather than burning time on forwards we would truncate.
+        _budget = getattr(self, "_fit_budget_", None)
+        need_holdout = (
+            route == "single_validation"
+            and (lam > 0.0 or self.enable_calibration)
+            and not (_budget is not None and _budget.expired())
+        )
         # print(
             # f"[TabLDM:nnls] v2 fusion: k_fold=disabled, n_train={n_full}, n_val={n_val}, "
             # f"E={n_candidates}, val_per_weight={n_val / max(n_candidates, 1):.2f}, "

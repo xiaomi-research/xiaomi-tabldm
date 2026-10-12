@@ -83,7 +83,7 @@ from tabldm._model.attnres_light_rmsnorm_moe import TabLDMSparseMoE
 from tabldm._model.embedding_dual_stream import ColEmbeddingDualStream
 from tabldm._model.kv_cache import TabLDMCache
 
-from .base import TabLDMBaseEstimator
+from .base import TabLDMBaseEstimator, _FitBudget, _reserve
 from .preprocessing import EnsembleGenerator, TransformToNumerical
 from .sklearn_utils import _moe_load_mismatch, _num_samples, validate_data
 
@@ -642,8 +642,15 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         output_type = ["mean"]
         all_preds = []
         all_kinds = []
+        budget = getattr(self, "_fit_budget_", None)
         for hk in hk_infos:
             gen = hk["gen"]
+            # Budget checkpoint: HK is optional enrichment, so once the fit
+            # budget is spent just stop here rather than forward rows we would
+            # have to drop. Skipping keeps the surviving HK kinds aligned with
+            # their rows (see the docstring above).
+            if budget is not None and budget.expired() and budget.n_batches_done > 0:
+                break
             try:
                 data = gen.transform(X_val, mode="both")
                 for Xs, ys in data.values():
@@ -1227,11 +1234,22 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         output_type: str | list[str] = "mean",
         alphas: list[float] | None = None,
         feat_indices: list[np.ndarray] | None = None,
+        budget: _FitBudget | None = None,
     ) -> np.ndarray | dict[str, np.ndarray]:
-        """Process model forward passes in batches to manage memory efficiently."""
+        """Process model forward passes in batches to manage memory efficiently.
+
+        When ``budget`` is given and expires mid-loop, the remaining estimator
+        slots are returned as NaN rows (full planned shape, prefix completed).
+        The existing NaN-estimator filter drops those rows and records the drop
+        in ``nan_valid_mask_``, which predict time replays — so fit and predict
+        combine exactly the same pool. Truncation only happens after at least
+        one batch has completed across the whole fit, so a fitted model always
+        retains >= 1 candidate.
+        """
         if feat_indices is not None:
             Xs = np.stack([Xs[i][:, feat_indices[i]] for i in range(Xs.shape[0])], axis=0)
 
+        n_total_est = int(Xs.shape[0])
         batch_size = self.batch_size_ or Xs.shape[0]
         n_batches = np.ceil(Xs.shape[0] / batch_size)
         Xs = np.array_split(Xs, n_batches)
@@ -1239,8 +1257,14 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
         output_type = [output_type] if isinstance(output_type, str) else output_type
         results = {key: [] for key in output_type}
+        n_done = 0
 
         for X_batch, y_batch in zip(Xs, ys, strict=False):
+            # Budget checkpoint: stop between estimator batches. The floor
+            # (``n_batches_done > 0``) guarantees at least one batch runs per
+            # fit and that the output shape is known before any NaN fill.
+            if budget is not None and budget.expired() and budget.n_batches_done > 0:
+                break
             X_batch = torch.from_numpy(X_batch).float().to(self.device_)
             y_batch = torch.from_numpy(y_batch).float().to(self.device_)
 
@@ -1257,9 +1281,34 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                         results[key].append(out[key].float().cpu().numpy())
                 else:
                     results[output_type[0]].append(out.float().cpu().numpy())
+            n_done += int(X_batch.shape[0])
+            if budget is not None:
+                budget.n_batches_done += 1
+                for key in output_type:
+                    budget.out_shapes.setdefault(key, results[key][-1].shape[1:])
 
-        for key in results:
-            results[key] = np.concatenate(results[key], axis=0)
+        if budget is not None and n_done < n_total_est:
+            # Truncated: keep the completed prefix and NaN-fill the tail so the
+            # planned estimator count is preserved and the caller's existing
+            # NaN filter marks the unrun candidates invalid.
+            n_left = n_total_est - n_done
+            budget.n_truncated += n_left
+            for key in output_type:
+                if results[key]:
+                    base = np.concatenate(results[key], axis=0)
+                    fill = np.full((n_left,) + base.shape[1:], np.nan, dtype=base.dtype)
+                    results[key] = np.concatenate([base, fill], axis=0)
+                else:
+                    shape = budget.out_shapes.get(key)
+                    if shape is None:
+                        raise RuntimeError(
+                            f"cannot NaN-fill output {key!r} after the fit budget expired: "
+                            "no earlier batch recorded its shape"
+                        )
+                    results[key] = np.full((n_left,) + tuple(shape), np.nan, dtype=np.float32)
+        else:
+            for key in results:
+                results[key] = np.concatenate(results[key], axis=0)
 
         if len(output_type) == 1:
             return results[output_type[0]]
@@ -1445,6 +1494,9 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
         all_preds = []
         fsi = getattr(self, "feat_sample_indices_", None)
+        # Fit-time collection honours the fit budget; predict-time collection
+        # (which never calls this) must keep running the full frozen pool.
+        budget = getattr(self, "_fit_budget_", None)
 
         # ---- main group ----
         use_augment = val_gen_info["val_svd"] is not None and self.n_estimators == 32
@@ -1476,7 +1528,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 if even_idxs:
                     fi = [fsi[g] for g in even_global] if fsi is not None else None
                     bout = self._batch_forward(
-                        Xs_both[even_idxs], ys[even_idxs], output_type=output_type, feat_indices=fi
+                        Xs_both[even_idxs], ys[even_idxs], output_type=output_type, feat_indices=fi, budget=budget
                     )
                     preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                     for i, li in enumerate(even_idxs):
@@ -1491,7 +1543,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                         Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
                     Xs_odd = np.stack(Xs_odd_list, axis=0)
                     fi = [fsi[g] for g in odd_global] if fsi is not None else None
-                    bout = self._batch_forward(Xs_odd, ys[odd_idxs], output_type=output_type, feat_indices=fi)
+                    bout = self._batch_forward(Xs_odd, ys[odd_idxs], output_type=output_type, feat_indices=fi, budget=budget)
                     preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                     for i, li in enumerate(odd_idxs):
                         per_est_preds[li] = preds_val[i]
@@ -1504,7 +1556,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             for norm_method, (Xs, ys) in data.items():
                 n_est = Xs.shape[0]
                 fi = [fsi[_grp_offset + i] for i in range(n_est)] if fsi is not None else None
-                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
+                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi, budget=budget)
                 preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                 all_preds.append(preds_val)
                 _grp_offset += n_est
@@ -1516,7 +1568,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             for norm_method, (Xs, ys) in q_data.items():
                 n_est = Xs.shape[0]
                 fi = [fsi[_q_offset + i] for i in range(n_est)] if fsi is not None else None
-                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
+                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi, budget=budget)
                 preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                 all_preds.append(preds_val)
                 _q_offset += n_est
@@ -1625,16 +1677,57 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
     # fit()
     # ==================================================================
 
-    def fit(self, X: np.ndarray, y: np.ndarray, kv_cache: bool | str = False) -> TabLDMRegressor:
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        kv_cache: bool | str = False,
+        *,
+        time_limit: float | None = None,
+    ) -> TabLDMRegressor:
         """Fit the regressor to training data.
 
         When ``enhance_candidates=True``, fits multiple candidate generators
         and optionally learns NNLS ensemble weights via validation/OOF.
         When ``enhance_candidates=False``, runs the plain single-group
         inference path.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training features.
+        y : array-like of shape (n_samples,)
+            Training targets.
+        kv_cache : bool or str, default=False
+            Non-enhanced path only; see the class docstring.
+        time_limit : float or None, default=None
+            Wall-clock budget for this ``fit`` call, in seconds. Three
+            contracts hold:
+
+            1. ``time_limit=None`` (the default) leaves behavior bit-identical
+               to fitting without the argument: same candidate pool, same
+               shrinkage weights, same predictions.
+            2. Overshoot is bounded. The budget is checked *between* estimator
+               batches, so a fit may exceed ``time_limit`` by at most one batch
+               forward (at most ``batch_size_`` candidates).
+            3. The pool is only ever truncated from the tail of the canonical
+               candidate order — never by skipping candidates in the middle.
+               Candidates that were not run are marked invalid and dropped from
+               fusion; the fitted mask (``nan_valid_mask_``) is replayed at
+               predict time, so the pool fit froze is exactly the pool predict
+               combines.
+
+            ``time_limit<=0`` is normalized to the floor path rather than an
+            error: at least one estimator batch always runs, so the returned
+            model is always able to ``predict``.
         """
         if y is None:
             raise ValueError("This regressor requires y to be passed, but the target y is None.")
+
+        # Wall-clock budget covering the whole fit (from here, so it lines up
+        # with the caller's window).  The shrinkage holdout gets a small
+        # reserve so the candidate loop cannot starve it.
+        self._fit_budget_ = _FitBudget(time_limit, reserve=_reserve(time_limit) if time_limit else 0.0)
 
         X, y = validate_data(self, X, y, dtype=None, skip_check_array=True)
         y = np.asarray(y, dtype=np.float32)
@@ -1837,7 +1930,11 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 # f"shrink_kappa={self.shrink_kappa}"
             # )
 
-            if route != "single_validation":
+            # If the fit budget is already spent, skip the holdout entirely and
+            # fall through to the pure-group-prior path rather than burning time
+            # on forwards we would only truncate.
+            _budget = getattr(self, "_fit_budget_", None)
+            if route != "single_validation" or (_budget is not None and _budget.expired()):
                 # print("[TabLDM:enhance] no holdout: using pure group prior pi_0")
                 pass
             else:
@@ -1867,6 +1964,12 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 else:
                     valid_mask = np.ones(val_preds_scaled.shape[0], dtype=bool)
                 self.nan_valid_mask_ = valid_mask
+                if _budget is not None and _budget.n_truncated > 0:
+                    print(
+                        f"[TabLDM:time_limit] early-stop: {int(valid_mask.sum())}/{valid_mask.shape[0]} "
+                        f"candidates ran within the budget; the rest are excluded from fusion "
+                        f"(elapsed={_budget.elapsed:.1f}s)."
+                    )
                 # Map from the filtered (valid-only) weight index back to the
                 # global candidate index so names/log sums stay aligned (§4.2).
                 valid_idx = np.where(valid_mask)[0]
