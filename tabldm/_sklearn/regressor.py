@@ -15,11 +15,31 @@
 """TabLDM Regressor with inference enhancement methods.
 
 This module provides ``TabLDMRegressor``, the public sklearn-style
-estimator for TabLDM in-context tabular regression, with multi-group
-candidate ensembling, NNLS weight learning, SVD+cross feature
-augmentation, high-kurtosis target transforms, and other inference-time
-enhancements ported from the MiTabAttnResEnsembleRegressor reference
-implementation.
+estimator for TabLDM in-context tabular regression.
+
+Inference enhancement follows the **v3.1 two-level shrinkage rules** (a
+revision of ``docs/tabldm_regression_no_kfold_recommendations.md``,
+recalibrated against TabArena regression holdout statistics):
+
+* Rules decide only the **group mixing ratios** ``pi`` (main / quantile /
+  hk); candidate slots are never filtered by name or index.  The v2 rule
+  table is kept but recalibrated (R3/R4 quantile mass lowered, R2 uses
+  its own measured split instead of falling through to R5).
+* Within each group all candidates are averaged with equal weight
+  (HK group splits mass asinh : yeo-johnson = 2 : 1).
+* K-Fold is **completely disabled**.  A single holdout supplies two
+  shrinkage targets and the final prediction blends all three terms::
+
+      pi_hold     = group masses of the slot-level NNLS   (smooth, 2-3 numbers)
+      holdout_pred = (1 - rho) * mix(pi_hold) + rho * slot_nnls_pred
+      pred         = (1 - lambda) * mix(pi_0) + lambda * holdout_pred
+
+      lambda = n_val / (n_val + shrink_kappa)   # when shrink_lambda=None
+      rho    = slot_blend_rate                  # default 0.3
+
+  The group-mass part is the stable signal (v2 §0); the slot-level part
+  only restores within-group reweighting and is capped to ``rho`` of the
+  holdout budget.
 
 All log messages use the ``[TabLDM:...]`` prefix for consistency with the
 Xiaomi-TabLDM project conventions.
@@ -31,8 +51,6 @@ Usage::
     model = TabLDMRegressor(
         model_path="path/to/regressor_checkpoint.ckpt",
         enhance_candidates=True,
-        n_estimators=32,
-        n_quantile_estimators=16,
     )
     model.fit(X_train, y_train)
     preds = model.predict(X_test)
@@ -42,36 +60,40 @@ from __future__ import annotations
 
 import itertools
 import math
-import re
 import warnings
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from scipy.optimize import nnls as _scipy_nnls
-from scipy.stats import kurtosis as _scipy_kurtosis
-from sklearn.base import BaseEstimator, RegressorMixin
+from scipy.stats import (
+    kurtosis as _scipy_kurtosis,
+    skew as _scipy_skew,
+)
+from sklearn.base import RegressorMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import TruncatedSVD
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder, PowerTransformer, StandardScaler
 from sklearn.utils.validation import check_is_fitted
 
-from .base import TabLDMBaseEstimator
-from .preprocessing import EnsembleGenerator, TransformToNumerical
-from .sklearn_utils import _moe_load_mismatch, _num_samples, validate_data
-
-from tabldm import InferenceConfig
 from tabldm._model.attnres_light_rmsnorm_moe import TabLDMSparseMoE
 from tabldm._model.embedding_dual_stream import ColEmbeddingDualStream
 from tabldm._model.kv_cache import TabLDMCache
 
+from .base import TabLDMBaseEstimator, _FitBudget, _reserve
+from .preprocessing import EnsembleGenerator, TransformToNumerical
+from .sklearn_utils import _moe_load_mismatch, _num_samples, validate_data
+
+if TYPE_CHECKING:
+    from tabldm import InferenceConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _safe_ensemble_mean(arr: np.ndarray, axis: int = 0) -> np.ndarray:
     """NaN-aware mean across ensemble members.
@@ -94,7 +116,8 @@ def _safe_ensemble_mean(arr: np.ndarray, axis: int = 0) -> np.ndarray:
         out = np.where(all_nan, 0.0, out)
     warnings.warn(
         f"Ensemble produced {n_bad} NaN/Inf logits; recovered with nanmean "
-        f"({n_all_nan} samples had all-NaN estimators, replaced with 0=z-space mean)"
+        f"({n_all_nan} samples had all-NaN estimators, replaced with 0=z-space mean)",
+        stacklevel=2,
     )
     return out
 
@@ -102,6 +125,7 @@ def _safe_ensemble_mean(arr: np.ndarray, axis: int = 0) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Enhanced Regressor
 # ---------------------------------------------------------------------------
+
 
 class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
     """TabLDM Regressor with inference enhancement.
@@ -115,19 +139,19 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
     Parameters
     ----------
-    n_estimators : int, default=32
+    n_estimators : int, default=8
         Number of estimators for the main ensemble group.
 
     norm_methods : str or list[str] or None, default=None
         Normalization methods for the main group.
 
-    feat_shuffle_method : str, default='random'
+    feat_shuffle_method : str, default='latin'
         Feature permutation strategy.
 
     outlier_threshold : float, default=4.0
         Z-score threshold for outlier detection.
 
-    batch_size : int, "auto", or None, default=8
+    batch_size : int, "auto", or None, default=4
         Batch size for inference. ``"auto"`` picks a value based on
         ``n_samples_in_ * n_features_in_`` to reduce CUDA memory pressure on
         large datasets (<=1M cells -> 8, <=2M -> 4, <=5M -> 2, else 1).
@@ -171,59 +195,40 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
     inference_config : Optional[InferenceConfig | Dict], default=None
         Fine-grained inference configuration.
 
-    enhance_candidates : bool, default=True
+    enhance_candidates : bool, default=False
         Master switch for inference enhancement. When False, runs the plain
-        single-group inference path with no ensembling enhancements. When
-        True, candidates follow the fixed group ordering of the external MiTab
-        ``regressor_attnres_ensemble.py`` reference:
-
-        1. main group (``n_estimators``): even-index candidates use plain
-           features, odd-index candidates receive SVD+cross augmentation when
-           ``n_estimators == 32`` and ``norm_methods == ['none', 'power']``;
-        2. quantile group (``n_quantile_estimators``);
-        3. quantile-SVD group (``n_quantile_svd_estimators``): even-index
-           candidates are plain quantile views, odd-index candidates receive
-           SVD+cross augmentation when the count is 32;
-        4. independent SVD group (``n_svd_ens_estimators``): an
-           ``EnsembleGenerator`` with ``use_svd=True`` views built from
-           ``svd_ens_norm_methods`` / ``svd_ens_n_components``;
-        5. HK group (high-kurtosis target transforms, original target scale,
-           appended last to the NNLS/predict candidate matrix).
+        single-group inference path with no ensembling enhancements.
 
     n_quantile_estimators : int, default=16
-        Number of quantile-safe candidates.
+        Number of quantile-safe candidates (effective size is
+        ``min(n_quantile_estimators, n_features)`` inside
+        ``EnsembleGenerator``).
 
-    n_quantile_svd_estimators : int, default=0
-        Number of quantile-normalized SVD/cross candidates. When set to 32,
-        odd-index candidates in this group are SVD+cross augmented.
-
-    n_svd_ens_estimators : int, default=16
-        Number of independent SVD-feature candidates (group 4 above), generated
-        by an ``EnsembleGenerator(use_svd=True)``.
-
-    svd_ens_norm_methods : list[str], default=['none', 'power', 'quantile', 'robust']
-        Normalization methods for the independent SVD group.
-
-    svd_ens_n_components : int, default=10
-        Number of SVD components in the independent SVD group.
-
-    use_cross_feature : bool, default=True
-        Append SVD + cross features to odd-indexed main candidates.
+    use_cross_feature : bool, default=False
+        Append SVD + cross features to odd-indexed main candidates. Only
+        takes effect when ``n_estimators == 32``; default False so the
+        candidate names stay honest (v2 §3.2).
 
     validation : bool, default=True
-        Enable NNLS weight learning via validation.
+        When False, the holdout is skipped entirely and the pure group
+        prior ``pi_0`` is used (no ``pi_hold`` diagnostics either).
 
-    k_fold : bool, default=True
-        Use K-Fold OOF for NNLS.
+    k_fold : bool, default=False
+        **Completely disabled** (v2 §3.2). The parameter is retained only
+        for backward compatibility and is ignored; a DeprecationWarning is
+        raised when set to True.
 
     n_splits : int, default=5
-        Number of OOF folds.
+        Deprecated. No longer used (K-Fold is disabled).
 
     foundation_rate : float, default=0.25
-        Blend ratio for foundation (equal-weight) prediction.
+        Deprecated. Replaced by ``shrink_lambda`` / ``shrink_kappa`` /
+        ``slot_blend_rate`` (v3.1 §3.6).
 
     max_num_features : Optional[int], default=300
-        Max features before triggering per-estimator sampling.
+        Max features before triggering per-estimator sampling. Must be
+        kept: the 300-dim sampling is the source of main-group diversity
+        for high-dimensional data (v2 §3.2).
 
     enable_high_kurtosis_target_ensemble : bool, default=True
         Enable high-kurtosis target transform ensemble.
@@ -233,45 +238,83 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
     high_kurtosis_n_estimators : int, default=8
         Number of HK candidates (split evenly between asinh and Yeo-Johnson).
+
+    group_prior : Optional[dict[str, float]], default=None
+        Explicit group mixing ratios ``pi_0``, e.g.
+        ``{'main': 0.55, 'quantile': 0.25, 'hk': 0.20}``. When None, the
+        ratios are auto-routed from dataset statistics per v3 §3.3-3.4.
+        Groups absent from the dict get weight 0. Values are normalized
+        to sum to 1.
+
+    hk_kind_ratio : tuple[float, float], default=(2.0, 1.0)
+        Within-HK-group mass split ``(asinh, yeo-johnson)``. The 4 asinh
+        slots share ``ratio[0] / sum(ratio)`` of the HK mass and the 4
+        yeo-johnson slots share ``ratio[1] / sum(ratio)`` (v2 §3.5).
+
+    shrink_lambda : float or None, default=None
+        Shrinkage ratio for blending the holdout term into the group
+        prior (v3.1 §3.6):
+        ``pred = (1 - lambda) * mix(pi_0) + lambda * holdout_pred``.
+        ``None`` (default) picks ``lambda = n_val / (n_val + shrink_kappa)``
+        automatically — the more holdout evidence, the more the holdout
+        is trusted.  An explicit float in ``[0, 1]`` overrides this
+        (``0`` = pure group prior, ``1.0`` = pure holdout term).  Ignored
+        when ``validation=False``.
+
+    shrink_kappa : float, default=750.0
+        Half-weight holdout size for the automatic ``lambda`` above:
+        at ``n_val == shrink_kappa`` the holdout and the prior count
+        equally.  Only used when ``shrink_lambda is None``.
+
+    slot_blend_rate : float, default=0.3
+        Split of the *holdout* budget between the stable group-level
+        target and the full slot-level NNLS prediction (v3.1 §3.6):
+        ``holdout_pred = (1 - rho) * mix(pi_hold) + rho * slot_nnls``
+        with ``rho = slot_blend_rate``.  ``0`` = group masses only
+        (v3.0 behaviour, which lost within-group reweighting), ``1`` =
+        pure sparse-NNLS prediction.  ``0.3`` keeps most of the weight on
+        the stable signal while restoring the within-group detail.
     """
 
     def __init__(
         self,
         # -- base parameters --
-        n_estimators: int = 32,
-        norm_methods: Optional[str | List[str]] = ['none','power'],
-        feat_shuffle_method: str = "random",
+        n_estimators: int = 8,
+        norm_methods: str | list[str] | None = None,
+        feat_shuffle_method: str = "latin",
         outlier_threshold: float = 4.0,
-        batch_size: Optional[int | str] = 8,
+        batch_size: int | str | None = 4,
         kv_cache: bool | str = False,
-        model_path: Optional[str | Path] = None,
+        model_path: str | Path | None = None,
         allow_auto_download: bool = True,
         checkpoint_version: str = "checkpoints/reg_default.ckpt",
-        device: Optional[str | torch.device] = None,
+        device: str | torch.device | None = None,
         use_amp: bool | str = "auto",
         use_fa3: bool | str = "auto",
         offload_mode: str | bool = "auto",
-        disk_offload_dir: Optional[str] = None,
+        disk_offload_dir: str | None = None,
         random_state: int | None = 42,
-        n_jobs: Optional[int] = None,
+        n_jobs: int | None = None,
         verbose: bool = False,
-        inference_config: Optional[InferenceConfig | Dict] = None,
+        inference_config: InferenceConfig | dict | None = None,
         # -- enhancement parameters --
         enhance_candidates: bool = True,
         n_quantile_estimators: int = 16,
-        n_quantile_svd_estimators: int = 0,
-        n_svd_ens_estimators: int = 16,
-        svd_ens_norm_methods: Optional[List[str]] = ['none','power','quantile','robust'],
-        svd_ens_n_components: int = 10,
-        use_cross_feature: bool = True,
+        use_cross_feature: bool = False,
         validation: bool = True,
-        k_fold: bool = True,
-        n_splits: int = 5,
+        k_fold: bool = False,
+        n_splits: int = 1,
         foundation_rate: float = 0.25,
-        max_num_features: Optional[int] = 300,
+        max_num_features: int | None = 300,
         enable_high_kurtosis_target_ensemble: bool = True,
         high_kurtosis_threshold: float = 10.0,
         high_kurtosis_n_estimators: int = 8,
+        # -- v2/v3 group-prior parameters --
+        group_prior: dict[str, float] | None = None,
+        hk_kind_ratio: tuple[float, float] = (2.0, 1.0),
+        shrink_lambda: float | None = None,
+        shrink_kappa: float = 750.0,
+        slot_blend_rate: float = 0.3,
     ):
         # base
         self.n_estimators = n_estimators
@@ -295,10 +338,6 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         # enhancement
         self.enhance_candidates = enhance_candidates
         self.n_quantile_estimators = n_quantile_estimators
-        self.n_quantile_svd_estimators = n_quantile_svd_estimators
-        self.n_svd_ens_estimators = n_svd_ens_estimators
-        self.svd_ens_norm_methods = svd_ens_norm_methods or ["none", "power", "quantile", "robust"]
-        self.svd_ens_n_components = svd_ens_n_components
         self.use_cross_feature = use_cross_feature
         self.validation = validation
         self.k_fold = k_fold
@@ -308,6 +347,12 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         self.enable_high_kurtosis_target_ensemble = enable_high_kurtosis_target_ensemble
         self.high_kurtosis_threshold = high_kurtosis_threshold
         self.high_kurtosis_n_estimators = high_kurtosis_n_estimators
+        # v2/v3 group-prior parameters
+        self.group_prior = group_prior
+        self.hk_kind_ratio = hk_kind_ratio
+        self.shrink_lambda = shrink_lambda
+        self.shrink_kappa = shrink_kappa
+        self.slot_blend_rate = slot_blend_rate
 
     # ==================================================================
     # Model loading (MoE architecture)
@@ -330,37 +375,33 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 model_path_ = Path(hf_hub_download(repo_id=repo_id, filename=filename, local_files_only=True))
             except LocalEntryNotFoundError:
                 if self.allow_auto_download:
-                    print(
-                        f"Checkpoint '{filename}' not cached.\n"
-                        f" Downloading from Hugging Face Hub ({repo_id}).\n"
-                    )
+                    print(f"Checkpoint '{filename}' not cached.\n Downloading from Hugging Face Hub ({repo_id}).\n")
                     model_path_ = Path(hf_hub_download(repo_id=repo_id, filename=filename))
                 else:
                     raise ValueError(
                         f"Checkpoint '{filename}' not cached and automatic download is disabled.\n"
                         f"Set allow_auto_download=True to download the checkpoint from Hugging Face Hub ({repo_id})."
-                    )
+                    ) from None
             checkpoint = torch.load(model_path_, map_location="cpu", weights_only=True)
         else:
             model_path_ = Path(self.model_path) if isinstance(self.model_path, str) else self.model_path
             if model_path_.exists():
                 checkpoint = torch.load(model_path_, map_location="cpu", weights_only=True)
+            elif self.allow_auto_download:
+                print(
+                    f"Checkpoint not found at '{model_path_}'.\n"
+                    f"Downloading '{filename}' from Hugging Face Hub ({repo_id}) to this location.\n"
+                )
+                model_path_.parent.mkdir(parents=True, exist_ok=True)
+                cache_path = hf_hub_download(repo_id=repo_id, filename=filename, local_dir=model_path_.parent)
+                Path(cache_path).rename(model_path_)
+                checkpoint = torch.load(model_path_, map_location="cpu", weights_only=True)
             else:
-                if self.allow_auto_download:
-                    print(
-                        f"Checkpoint not found at '{model_path_}'.\n"
-                        f"Downloading '{filename}' from Hugging Face Hub ({repo_id}) to this location.\n"
-                    )
-                    model_path_.parent.mkdir(parents=True, exist_ok=True)
-                    cache_path = hf_hub_download(repo_id=repo_id, filename=filename, local_dir=model_path_.parent)
-                    Path(cache_path).rename(model_path_)
-                    checkpoint = torch.load(model_path_, map_location="cpu", weights_only=True)
-                else:
-                    raise ValueError(
-                        f"Checkpoint not found at '{model_path_}' and automatic download is disabled.\n"
-                        f"Either provide a valid checkpoint path, or set allow_auto_download=True to download "
-                        f"'{filename}' from Hugging Face Hub ({repo_id})."
-                    )
+                raise ValueError(
+                    f"Checkpoint not found at '{model_path_}' and automatic download is disabled.\n"
+                    f"Either provide a valid checkpoint path, or set allow_auto_download=True to download "
+                    f"'{filename}' from Hugging Face Hub ({repo_id})."
+                )
 
         if "config" not in checkpoint or "state_dict" not in checkpoint:
             raise ValueError("The checkpoint must contain 'config' and 'state_dict'.")
@@ -377,8 +418,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         parent_config = {
             key: value
             for key, value in config.items()
-            if key not in ("global_dilation", "global_max_span")
-            and not key.startswith("icl_moe_")
+            if key not in ("global_dilation", "global_max_span") and not key.startswith("icl_moe_")
         }
         for legacy_name, native_name in {
             "icl_moe_num_experts": "moe_num_experts",
@@ -434,9 +474,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 "Inference requires an exact current AttnRes/RMSNorm/MoE checkpoint; "
                 "legacy checkpoints must be converted during training first."
             ) from exc
-        bad_missing, bad_unexpected = _moe_load_mismatch(
-            set(self.model_.state_dict().keys()), missing, unexpected
-        )
+        bad_missing, bad_unexpected = _moe_load_mismatch(set(self.model_.state_dict().keys()), missing, unexpected)
         if bad_missing or bad_unexpected:
             raise RuntimeError(
                 "Inference requires an exact current AttnRes/RMSNorm/MoE checkpoint; "
@@ -464,24 +502,21 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         mask = np.isfinite(y_flat)
         y_valid = y_flat[mask]
         if len(y_valid) < 10:
-            print("[TabLDM:hk] skipped: too few valid samples")
+            # print("[TabLDM:hk] skipped: too few valid samples")
             return False, float("nan")
         if y_valid.std() < 1e-8:
-            print("[TabLDM:hk] skipped: y is near-constant")
+            # print("[TabLDM:hk] skipped: y is near-constant")
             return False, float("nan")
         try:
             kurt = float(_scipy_kurtosis(y_valid, fisher=True, bias=False))
         except Exception:
-            print("[TabLDM:hk] skipped: kurtosis computation failed")
+            # print("[TabLDM:hk] skipped: kurtosis computation failed")
             return False, float("nan")
         if not np.isfinite(kurt):
-            print("[TabLDM:hk] skipped: kurtosis is not finite")
+            # print("[TabLDM:hk] skipped: kurtosis is not finite")
             return False, float("nan")
         triggered = kurt > self.high_kurtosis_threshold
-        print(
-            f"[TabLDM:hk] kurtosis={kurt:.4f}, threshold={self.high_kurtosis_threshold}, "
-            f"triggered={triggered}"
-        )
+        # print(f"[TabLDM:hk] kurtosis={kurt:.4f}, threshold={self.high_kurtosis_threshold}, triggered={triggered}")
         return triggered, kurt
 
     def _fit_asinh_transformer(self, y: np.ndarray) -> dict:
@@ -513,12 +548,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
           'seed'        : int
         """
         n_hk = self.high_kurtosis_n_estimators  # 8
-        # Same shared UniqueFeatureFilter as the candidate groups, so HK
-        # generators emit the same column width as everything else.
-        frozen_unique_filter = getattr(
-            getattr(self, "ensemble_generator_", None), "unique_filter_", None
-        )
-        n_asinh = n_hk // 2    # 4
+        n_asinh = n_hk // 2  # 4
         n_yj = n_hk - n_asinh  # 4
         base_seed = (self.random_state if self.random_state is not None else 0) + seed_offset
 
@@ -540,16 +570,18 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     outlier_threshold=self.outlier_threshold,
                     random_state=seed,
                 )
-                gen.fit(X_tr, y_tr_ts, frozen_unique_filter=frozen_unique_filter)
-                results.append({
-                    "kind": "asinh",
-                    "gen": gen,
-                    "asinh_params": params,
-                    "asinh_ss": ss,
-                    "yj_pt": None,
-                    "seed": seed,
-                })
-                print(f"[TabLDM:hk] asinh[{i}] seed={seed} center={params['center']:.4f} scale={params['scale']:.4f}")
+                gen.fit(X_tr, y_tr_ts)
+                results.append(
+                    {
+                        "kind": "asinh",
+                        "gen": gen,
+                        "asinh_params": params,
+                        "asinh_ss": ss,
+                        "yj_pt": None,
+                        "seed": seed,
+                    }
+                )
+                # print(f"[TabLDM:hk] asinh[{i}] seed={seed} center={params['center']:.4f} scale={params['scale']:.4f}")
             except Exception as e:
                 print(f"[TabLDM:hk] asinh[{i}] failed: {e}, skipping")
 
@@ -566,16 +598,18 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     outlier_threshold=self.outlier_threshold,
                     random_state=seed,
                 )
-                gen.fit(X_tr, y_tr_t, frozen_unique_filter=frozen_unique_filter)
-                results.append({
-                    "kind": "yeojohnson",
-                    "gen": gen,
-                    "asinh_params": None,
-                    "asinh_ss": None,
-                    "yj_pt": pt,
-                    "seed": seed,
-                })
-                print(f"[TabLDM:hk] yj[{i}] seed={seed}")
+                gen.fit(X_tr, y_tr_t)
+                results.append(
+                    {
+                        "kind": "yeojohnson",
+                        "gen": gen,
+                        "asinh_params": None,
+                        "asinh_ss": None,
+                        "yj_pt": pt,
+                        "seed": seed,
+                    }
+                )
+                # print(f"[TabLDM:hk] yj[{i}] seed={seed}")
             except Exception as e:
                 print(f"[TabLDM:hk] yj[{i}] failed: {e}, skipping")
 
@@ -589,20 +623,34 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             params = hk_info["asinh_params"]
             z_unscaled = ss.inverse_transform(z.reshape(-1, 1)).flatten()
             return self._asinh_inverse(z_unscaled, params)
-        else:
-            pt = hk_info["yj_pt"]
-            return pt.inverse_transform(z.reshape(-1, 1)).flatten().astype(np.float64)
+        pt = hk_info["yj_pt"]
+        return pt.inverse_transform(z.reshape(-1, 1)).flatten().astype(np.float64)
 
     def _collect_hk_val_predictions_orig(
         self,
         X_val: np.ndarray,
         hk_infos: list,
-    ) -> np.ndarray:
-        """Run each HK estimator on val set, return (n_hk_valid, n_val) in ORIGINAL scale."""
+    ) -> tuple[np.ndarray, list[str]]:
+        """Run each HK estimator on val set.
+
+        Returns ``(preds, kinds)``: preds has shape ``(n_hk_valid, n_val)``
+        in ORIGINAL scale and ``kinds`` lists the surviving estimators'
+        kinds in row order.  ``kinds`` must travel with the rows — when an
+        estimator is skipped the remaining rows shift, and re-deriving
+        names by position would mis-assign the asinh / yeo-johnson split.
+        """
         output_type = ["mean"]
         all_preds = []
+        all_kinds = []
+        budget = getattr(self, "_fit_budget_", None)
         for hk in hk_infos:
             gen = hk["gen"]
+            # Budget checkpoint: HK is optional enrichment, so once the fit
+            # budget is spent just stop here rather than forward rows we would
+            # have to drop. Skipping keeps the surviving HK kinds aligned with
+            # their rows (see the docstring above).
+            if budget is not None and budget.expired() and budget.n_batches_done > 0:
+                break
             try:
                 data = gen.transform(X_val, mode="both")
                 for Xs, ys in data.values():
@@ -613,20 +661,25 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                         print(f"[TabLDM:hk] {hk['kind']} seed={hk['seed']}: val preds contain NaN/Inf, skipping")
                         continue
                     all_preds.append(p_orig[np.newaxis, :])
+                    all_kinds.append(hk["kind"])
             except Exception as e:
                 print(f"[TabLDM:hk] {hk['kind']} seed={hk['seed']}: val prediction failed: {e}, skipping")
         if all_preds:
-            return np.concatenate(all_preds, axis=0)
-        return np.empty((0, X_val.shape[0]), dtype=np.float64)
+            return np.concatenate(all_preds, axis=0), all_kinds
+        return np.empty((0, X_val.shape[0]), dtype=np.float64), []
 
     def _collect_hk_test_predictions_orig(
         self,
         X: np.ndarray,
         hk_infos: list,
-    ) -> np.ndarray:
-        """Run each HK estimator on test X, return (n_hk_valid, n_test) in ORIGINAL scale."""
+    ) -> tuple[np.ndarray, list[str]]:
+        """Run each HK estimator on test X.
+
+        Returns ``(preds, kinds)`` like ``_collect_hk_val_predictions_orig``.
+        """
         output_type = ["mean"]
         all_preds = []
+        all_kinds = []
         for hk in hk_infos:
             gen = hk["gen"]
             try:
@@ -639,34 +692,389 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                         print(f"[TabLDM:hk] {hk['kind']} seed={hk['seed']}: test preds contain NaN/Inf, skipping")
                         continue
                     all_preds.append(p_orig[np.newaxis, :])
+                    all_kinds.append(hk["kind"])
             except Exception as e:
                 print(f"[TabLDM:hk] {hk['kind']} seed={hk['seed']}: test prediction failed: {e}, skipping")
         if all_preds:
-            return np.concatenate(all_preds, axis=0)
-        return np.empty((0,), dtype=np.float64)
+            return np.concatenate(all_preds, axis=0), all_kinds
+        return np.empty((0, X.shape[0]), dtype=np.float64), []
 
     # ==================================================================
-    # Validation routing
+    # Validation routing (v2: K-Fold completely disabled)
     # ==================================================================
 
     @staticmethod
-    def _route_validation(validation: bool, k_fold: bool, n_train: int, n_val: int) -> str:
+    def _route_validation(validation: bool, k_fold: bool, n_train: int) -> str:
         """Decide which validation path fit() takes. Returns one of:
-        'default', 'single_validation', 'kfold'.
+        'default', 'single_validation'.
 
-        Decision table:
-          | k_fold | condition       | path                     |
-          |--------|-----------------|--------------------------|
-          | False  | n_train < 1000  | default                  |
-          | False  | n_train >= 1000 | single_validation        |
-          | True   | n_val > 2000    | single_validation        |
-          | True   | n_val <= 2000   | kfold                    |
+        K-Fold is **completely disabled** (v2 §3.2 / §4.6).  The only
+        remaining question is whether a single holdout is worth running at
+        all.  Small training sets no longer skip it (v3): the holdout
+        solution is *group-level* (2-3 unknowns) and the automatic
+        ``shrink_lambda`` already decays with ``n_val``, so a small
+        holdout contributes a small nudge instead of being thrown away.
+        The floor ``n_train >= 50`` merely keeps ``train_test_split`` and
+        the group solve well-defined.
+
+          | condition                  | path              |
+          |----------------------------|-------------------|
+          | validation=False           | default           |
+          | k_fold=True (ignored)      | *warn*            |
+          | n_train < 50               | default           |
+          | n_train >= 50              | single_validation |
+
+        ``k_fold`` is accepted for backward compatibility only and never
+        routes to a K-Fold path.
         """
+        if k_fold:
+            warnings.warn(
+                "k_fold is deprecated and completely disabled in TabLDMRegressor "
+                "(v2 no-K-Fold rules). The parameter is ignored; a single holdout "
+                "is used at most for shrinkage. Pass k_fold=False to silence this "
+                "warning.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if not validation:
             return "default"
-        if not k_fold:
-            return "single_validation" if n_train >= 1000 else "default"
-        return "single_validation" if n_val > 2000 else "kfold"
+        return "single_validation" if n_train >= 50 else "default"
+
+    # ==================================================================
+    # v2 group-prior routing and prediction
+    # ==================================================================
+
+    @staticmethod
+    def _route_group_prior(
+        n_train: int,
+        n_features: int,
+        heavy_tail: bool,
+        feat_sampled: bool,
+    ) -> dict[str, float]:
+        """Compute group mixing ratios ``pi_0`` from dataset statistics (v3 §3.4).
+
+        Routing inputs are computed from the training set actually received
+        by this outer split — ``random_state`` is never used as a routing
+        condition.
+
+        The v2 table is recalibrated against TabArena regression holdout
+        group masses (the slot-level NNLS ``w_quantile`` logged per split):
+
+        ===========  =========  ==============  =========================================
+        rule         v2 ``pi_q``  holdout ``w_q``  v3 ``pi_q`` (share of non-HK mass)
+        ===========  =========  ==============  =========================================
+        R1 high_dim      0.05          0.00       0.05   (unchanged)
+        R2 heavy_tail    0.32*         0.19       0.25 absolute (0.3125 of remaining)
+        R3 low_dim       0.15          ~0.00-0.09 0.05
+        R4 large_n       0.65          0.18-0.39  0.35
+        R5 default       0.40          0.30-0.45  0.40   (unchanged)
+        ===========  =========  ==============  =========================================
+
+        (*) v2's stacking formula dropped R2 into the R5 branch and gave
+        miami 0.48/0.32/0.20 instead of the intended 0.55/0.25/0.20 —
+        R2 now owns its measured main:quantile split (0.55:0.25) and only
+        falls through to the chain below when combined with other rules.
+
+        Parameters
+        ----------
+        n_train : int
+            Number of training samples.
+        n_features : int
+            Effective (encoded) feature count.
+        heavy_tail : bool
+            Target excess kurtosis > 10.
+        feat_sampled : bool
+            Whether the 300-dim per-estimator feature sampling triggered.
+
+        Returns:
+        -------
+        dict
+            ``{'main': ..., 'quantile': ..., 'hk': ...}`` — 'hk' is only
+            present when ``heavy_tail`` is True. Values sum to 1.
+        """
+        high_dim = n_features > 100 or feat_sampled
+        low_dim = n_features <= 5
+        large_n = n_train >= 10000
+
+        pi_hk = 0.20 if heavy_tail else 0.0
+        remaining = 1.0 - pi_hk
+
+        # Quantile share of the non-HK mass, by priority
+        # high_dim > heavy_tail > low_dim > large_n > default.
+        if high_dim:
+            q_share = 0.05
+        elif heavy_tail:
+            q_share = 0.25 / 0.80  # R2's measured 0.55 : 0.25 split
+        elif low_dim:
+            q_share = 0.05
+        elif large_n:
+            q_share = 0.35
+        else:
+            q_share = 0.40
+
+        pi_quantile = q_share * remaining
+        pi_main = remaining - pi_quantile
+
+        prior: dict[str, float] = {"main": pi_main, "quantile": pi_quantile}
+        if pi_hk > 0.0:
+            prior["hk"] = pi_hk
+        return prior
+
+    @staticmethod
+    def _candidate_group(name: str) -> str:
+        """Resolve group membership from candidate name prefix (v2 §3.8).
+
+        Group membership **must** be parsed by name prefix rather than by
+        global integer index: whether HK is triggered and how large the
+        quantile pool is both shift the index layout (v2 §1.4).
+
+        Returns one of ``'main'``, ``'quantile'``, ``'hk_asinh'``,
+        ``'hk_yj'``, or ``'hk_other'``.
+        """
+        if name.startswith("hk_asinh"):
+            return "hk_asinh"
+        if name.startswith(("hk_yeojohnson", "hk_yj")):
+            return "hk_yj"
+        if name.startswith("hk"):
+            return "hk_other"
+        if name.startswith("quantile"):
+            return "quantile"
+        if name.startswith(("svd+cross", "default")):
+            return "main"
+        return "main"
+
+    def _group_means(self, arr: np.ndarray, names: list[str]) -> dict[str, np.ndarray | None]:
+        """Per-group mean predictions (v2 §3.5).
+
+        Within every group all candidates are averaged with equal weight
+        (candidate slots are never filtered).  The HK group splits its
+        mass between asinh and yeo-johnson according to
+        ``hk_kind_ratio``.
+
+        Parameters
+        ----------
+        arr : np.ndarray, shape (n_candidates, n_samples)
+            Candidate predictions in **original** target scale.
+        names : list[str]
+            Candidate labels, one per row of ``arr``.  Group membership is
+            parsed from these (v2 §3.8) — never from integer slices.
+
+        Returns:
+        -------
+        dict
+            ``{'main': ..., 'quantile': ..., 'hk': ...}``; ``None`` for
+            groups with no row in ``arr``.
+        """
+        groups = [self._candidate_group(n) for n in names]
+
+        def _gmean(pred_group: str) -> np.ndarray | None:
+            mask = np.array([g == pred_group for g in groups])
+            if not mask.any():
+                return None
+            return _safe_ensemble_mean(arr[mask], axis=0)
+
+        main_pred = _gmean("main")
+        q_pred = _gmean("quantile")
+
+        # HK group with asinh : yeo-johnson = hk_kind_ratio (v2 §3.5)
+        hk_asinh_ratio, hk_yj_ratio = self.hk_kind_ratio
+        hk_parts: list[np.ndarray] = []
+        hk_weights: list[float] = []
+        for pred_group, ratio in (("hk_asinh", hk_asinh_ratio), ("hk_yj", hk_yj_ratio), ("hk_other", 1.0)):
+            part = _gmean(pred_group)
+            if part is not None:
+                hk_parts.append(part)
+                hk_weights.append(ratio)
+        hk_pred = None
+        if hk_parts:
+            w_sum = float(sum(hk_weights))
+            if w_sum <= 0:
+                w_sum = float(len(hk_weights))
+                hk_weights = [1.0] * len(hk_weights)
+            hk_pred = sum(w * p for w, p in zip(hk_weights, hk_parts, strict=False)) / w_sum
+
+        return {"main": main_pred, "quantile": q_pred, "hk": hk_pred}
+
+    def _slot_group_mass(self, weights: np.ndarray, names: list[str]) -> dict[str, float]:
+        """Aggregate a slot-level NNLS weight vector to group masses (v3.1 §3.6).
+
+        This is the smooth, non-cornering holdout target ``pi_hold``.  It is
+        deliberately *not* a separate NNLS on 2-3 group means: with highly
+        correlated group-mean columns that solve collapses to a vertex
+        (observed ``pi_hold = 1.0/0.0/0.0`` on 5 of 13 TabArena datasets,
+        which zeroed miami's HK mass and cut wine/healthcare's quantile
+        mass).  The stable quantity is the *group mass of the slot-level
+        solution* — exactly what v2 §0 calls the signal.
+
+        Returns:
+        -------
+        dict
+            ``{'main': ..., 'quantile': ..., 'hk': ...}`` subset with values
+            summing to 1 (groups with zero mass are dropped).  Empty dict if
+            ``weights`` is empty or degenerate.
+        """
+        totals = {"main": 0.0, "quantile": 0.0, "hk": 0.0}
+        for nm, w in zip(names, weights, strict=False):
+            group = self._candidate_group(nm)
+            key = "hk" if group.startswith("hk") else group
+            if key not in totals:
+                key = "main"
+            totals[key] += float(w)
+        total = float(sum(totals.values()))
+        if not np.isfinite(total) or total <= 0:
+            return {}
+        return {k: v / total for k, v in totals.items() if v > 0}
+
+    def _group_prior_prediction(
+        self,
+        arr: np.ndarray,
+        names: list[str] | None = None,
+        pi: dict[str, float] | None = None,
+    ) -> np.ndarray:
+        """Combine candidate predictions with a group mixing vector (v2 §3.5).
+
+        Parameters
+        ----------
+        arr : np.ndarray, shape (n_candidates, ...)
+            Candidate predictions in **original** target scale (2-d, or 3-d
+            for multi-quantile output — the mixture is taken over axis 0).
+        names : list[str], optional
+            Candidate labels for the rows of ``arr``.  Must be supplied
+            whenever rows have been dropped (NaN filtering) — rebuilding
+            names from row positions would then mis-assign groups.
+        pi : dict[str, float], optional
+            Mixing ratios to use.  Defaults to ``self.group_prior_`` (pi_0).
+
+        Returns:
+        -------
+        np.ndarray
+            The group-mixture ensemble prediction (``arr.shape[1:]``).
+        """
+        if names is None or len(names) != arr.shape[0]:
+            names = [self._candidate_name(i) for i in range(arr.shape[0])]
+        gmeans = self._group_means(arr, names)
+
+        if pi is None:
+            pi = self.group_prior_
+        parts: list[np.ndarray] = []
+        weights: list[float] = []
+        for g in ("main", "quantile", "hk"):
+            pred_g = gmeans.get(g)
+            w_g = pi.get(g, 0.0)
+            if pred_g is not None and w_g > 0.0:
+                parts.append(pred_g)
+                weights.append(w_g)
+
+        if not parts:
+            # No group matched the prior — fall back to all-candidate mean.
+            return _safe_ensemble_mean(arr, axis=0)
+
+        total_w = float(sum(weights))
+        if total_w <= 0:
+            return _safe_ensemble_mean(arr, axis=0)
+        return sum(w * p for w, p in zip(weights, parts, strict=False)) / total_w
+
+    def _combine_predictions(self, arr: np.ndarray, names: list[str]) -> np.ndarray:
+        """Two-level holdout shrinkage (v3.1 §3.6)::
+
+            holdout_pred = (1 - rho) * mix(pi_hold) + rho * slot_nnls_pred
+            pred = (1 - lambda) * mix(pi_0) + lambda * holdout_pred
+
+        ``mix(pi_hold)`` carries the stable group-mass correction and
+        ``slot_nnls_pred`` only restores within-group reweighting (capped to
+        ``rho`` of the holdout budget, since the sparse slot support is the
+        noisy part — v2 §2.7).  Slot weights are looked up **by candidate
+        name**, so rows dropped on either the holdout or the test side
+        (NaN filtering / skipped HK estimators) cannot shift them.
+
+        Returns:
+        -------
+        np.ndarray
+            Combined prediction, shape ``arr.shape[1:]``.
+        """
+        mix0 = self._group_prior_prediction(arr, names)
+        lam = float(getattr(self, "shrink_lambda_", 0.0) or 0.0)
+        if lam <= 0.0:
+            return mix0
+
+        rho = float(self.slot_blend_rate)
+        pi_hold = getattr(self, "group_prior_holdout_", None)
+        w_map = getattr(self, "nnls_weight_map_", None)
+
+        parts: list[np.ndarray] = []
+        weights: list[float] = []
+        if pi_hold:
+            parts.append(self._group_prior_prediction(arr, names, pi=pi_hold))
+            weights.append(1.0 - rho)
+        if w_map:
+            w_aligned = np.array([w_map.get(nm, 0.0) for nm in names], dtype=np.float64)
+            w_sum = float(w_aligned.sum())
+            if w_sum > 0:
+                parts.append(np.tensordot(w_aligned / w_sum, arr, axes=(0, 0)))
+                weights.append(rho if pi_hold else 1.0)
+        if not parts:
+            return mix0
+
+        w_total = float(sum(weights))
+        holdout_pred = sum(w * p for w, p in zip(weights, parts, strict=False)) / w_total
+        return (1.0 - lam) * mix0 + lam * holdout_pred
+
+    def _compute_feature_stats(self, X: np.ndarray) -> None:
+        """Record feature-side summary statistics (v2 §4.5).
+
+        Target kurtosis alone can only route the HK branch — it has no
+        predictive power over the quantile-group preference (v2 §2.8).  The
+        quantile group's payoff comes from the *feature* side (heavy tails /
+        outliers in the feature columns), so each task must at least log
+        ``n_num``, ``n_cat``, mean skewness of numeric columns, mean excess
+        kurtosis of numeric columns, and the outlier rate (share of |z| > 4
+        entries).  Stored on ``self`` for downstream analysis.
+        """
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim != 2 or X.size == 0:
+            self.n_num_ = 0
+            self.n_cat_ = 0
+            self.feat_skew_mean_ = float("nan")
+            self.feat_kurt_mean_ = float("nan")
+            self.feat_outlier_rate_ = float("nan")
+            return
+
+        n_cols = X.shape[1]
+        is_num = np.zeros(n_cols, dtype=bool)
+        n_unique = np.zeros(n_cols, dtype=np.int64)
+        for c in range(n_cols):
+            col = X[:, c]
+            col = col[np.isfinite(col)]
+            n_unique[c] = len(np.unique(col)) if col.size else 0
+            # A column is treated as numeric when it has more than 10 distinct
+            # finite values (mirrors `_fit_svd_cross`'s cat/num split).
+            is_num[c] = n_unique[c] > 10
+
+        self.n_num_ = int(is_num.sum())
+        self.n_cat_ = int(n_cols - is_num.sum())
+
+        skews: list[float] = []
+        kurts: list[float] = []
+        outlier_rates: list[float] = []
+        for c in np.where(is_num)[0]:
+            col = X[:, c]
+            col = col[np.isfinite(col)]
+            if col.size < 3 or col.std() < 1e-12:
+                continue
+            try:
+                skews.append(float(_scipy_skew(col, bias=False)))
+            except Exception:  # noqa: S110 — optional stat, skip on failure
+                pass
+            try:
+                kurts.append(float(_scipy_kurtosis(col, fisher=True, bias=False)))
+            except Exception:  # noqa: S110 — optional stat, skip on failure
+                pass
+            z = (col - col.mean()) / col.std()
+            outlier_rates.append(float(np.mean(np.abs(z) > 4.0)))
+
+        self.feat_skew_mean_ = float(np.mean(skews)) if skews else float("nan")
+        self.feat_kurt_mean_ = float(np.mean(kurts)) if kurts else float("nan")
+        self.feat_outlier_rate_ = float(np.mean(outlier_rates)) if outlier_rates else float("nan")
 
     # ==================================================================
     # SVD + cross feature fitting
@@ -686,8 +1094,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         n_train, n_orig = X_raw.shape
 
         is_cat = np.array(
-            [np.issubdtype(X_raw[:, c].dtype, np.integer) or len(np.unique(X_raw[:, c])) <= 10
-             for c in range(n_orig)],
+            [np.issubdtype(X_raw[:, c].dtype, np.integer) or len(np.unique(X_raw[:, c])) <= 10 for c in range(n_orig)],
             dtype=bool,
         )
         num_idx = np.where(~is_cat)[0]
@@ -713,8 +1120,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             )
             cross_scaler = StandardScaler()
             setattr(self, f"{attr_prefix}_cross_scaler_", cross_scaler)
-            setattr(self, f"{attr_prefix}_cross_pool_train_",
-                    cross_scaler.fit_transform(cross_mat).clip(-100, 100))
+            setattr(self, f"{attr_prefix}_cross_pool_train_", cross_scaler.fit_transform(cross_mat).clip(-100, 100))
         else:
             setattr(self, f"{attr_prefix}_cross_pool_", [])
             setattr(self, f"{attr_prefix}_cross_scaler_", None)
@@ -735,8 +1141,10 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         # ---- SVD pool ----
         if len(cat_idx) > 0 and len(num_idx) > 0:
             svd_pre = ColumnTransformer(
-                [("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_idx.tolist()),
-                 ("num", StandardScaler(), num_idx.tolist())],
+                [
+                    ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_idx.tolist()),
+                    ("num", StandardScaler(), num_idx.tolist()),
+                ],
                 remainder="drop",
             )
         elif len(cat_idx) > 0:
@@ -764,8 +1172,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         svd = TruncatedSVD(n_components=svd_pool_size, random_state=self.random_state)
         setattr(self, f"{attr_prefix}_svd_pre_", svd_pre)
         setattr(self, f"{attr_prefix}svd_", svd)
-        setattr(self, f"{attr_prefix}_X_train_svd_",
-                svd.fit_transform(X_pre).clip(-100, 100).astype(np.float32))
+        setattr(self, f"{attr_prefix}_X_train_svd_", svd.fit_transform(X_pre).clip(-100, 100).astype(np.float32))
 
         svd_selections = []
         for _ in range(16):
@@ -795,8 +1202,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 cross_feats = cross_pool_train[:, cross_sel].astype(np.float32)
             else:
                 all_cross_mat = np.stack(
-                    [raw_X[:, i].astype(float) * raw_X[:, j].astype(float)
-                     for i, j in cross_pool],
+                    [raw_X[:, i].astype(float) * raw_X[:, j].astype(float) for i, j in cross_pool],
                     axis=1,
                 )
                 all_cross_scaled = cross_scaler.transform(all_cross_mat).clip(-100, 100)
@@ -826,113 +1232,83 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         Xs: np.ndarray,
         ys: np.ndarray,
         output_type: str | list[str] = "mean",
-        alphas: Optional[List[float]] = None,
-        feat_indices: Optional[List[np.ndarray]] = None,
+        alphas: list[float] | None = None,
+        feat_indices: list[np.ndarray] | None = None,
+        budget: _FitBudget | None = None,
     ) -> np.ndarray | dict[str, np.ndarray]:
-        """Process model forward passes in batches, optionally across GPUs.
+        """Process model forward passes in batches to manage memory efficiently.
 
-        ``feat_indices`` holds one column subset per row of ``Xs``, expressed in
-        the column space of ``Xs`` itself (see ``_feat_sample``). A ``None``
-        entry means "keep every column" for that row.  When ``self.devices_``
-        contains more than one device, estimator rows are partitioned across
-        devices and evaluated concurrently, then concatenated in original order.
+        When ``budget`` is given and expires mid-loop, the remaining estimator
+        slots are returned as NaN rows (full planned shape, prefix completed).
+        The existing NaN-estimator filter drops those rows and records the drop
+        in ``nan_valid_mask_``, which predict time replays — so fit and predict
+        combine exactly the same pool. Truncation only happens after at least
+        one batch has completed across the whole fit, so a fitted model always
+        retains >= 1 candidate.
         """
         if feat_indices is not None:
-            Xs = np.stack(
-                [
-                    Xs[i] if feat_indices[i] is None else Xs[i][:, feat_indices[i]]
-                    for i in range(Xs.shape[0])
-                ],
-                axis=0,
-            )
+            Xs = np.stack([Xs[i][:, feat_indices[i]] for i in range(Xs.shape[0])], axis=0)
 
-        output_type = [output_type] if isinstance(output_type, str) else list(output_type)
-        devices = getattr(self, "devices_", [self.device_])
-
-        if len(devices) <= 1:
-            return self._forward_on_device(
-                self.model_, self.device_, Xs, ys, output_type, alphas
-            )
-
-        # Partition estimator rows contiguously across devices.  Contiguous
-        # chunks keep global row order stable when results are concatenated.
-        from concurrent.futures import ThreadPoolExecutor
-
-        chunks = np.array_split(np.arange(Xs.shape[0]), len(devices))
-
-        def run_on_device(device: torch.device, indices: np.ndarray):
-            return self._forward_on_device(
-                self._model_for_device(device),
-                device,
-                Xs[indices],
-                ys[indices],
-                output_type,
-                alphas,
-            )
-
-        with ThreadPoolExecutor(max_workers=len(devices)) as executor:
-            futures = [
-                executor.submit(run_on_device, device, indices)
-                if indices.size > 0 else None
-                for device, indices in zip(devices, chunks)
-            ]
-            results = [None if future is None else future.result() for future in futures]
-
-        if len(output_type) == 1:
-            key = output_type[0]
-            parts = [result for result in results if result is not None]
-            return np.concatenate(parts, axis=0)
-
-        merged = {key: [] for key in output_type}
-        for result in results:
-            if result is None:
-                continue
-            for key in output_type:
-                merged[key].append(result[key])
-        return {key: np.concatenate(merged[key], axis=0) for key in output_type}
-
-    def _forward_on_device(
-        self,
-        model,
-        device: torch.device,
-        Xs: np.ndarray,
-        ys: np.ndarray,
-        output_type: list[str],
-        alphas: Optional[List[float]],
-    ) -> np.ndarray | dict[str, np.ndarray]:
-        """Run ``predict_stats`` on one device and return CPU NumPy output."""
-        if device.type == "cuda":
-            torch.cuda.set_device(device)
-
+        n_total_est = int(Xs.shape[0])
         batch_size = self.batch_size_ or Xs.shape[0]
-        n_batches = int(np.ceil(Xs.shape[0] / batch_size))
-        Xs_split = np.array_split(Xs, n_batches)
-        ys_split = np.array_split(ys, n_batches)
-        inference_config = self._inference_config_for_device(device)
+        n_batches = np.ceil(Xs.shape[0] / batch_size)
+        Xs = np.array_split(Xs, n_batches)
+        ys = np.array_split(ys, n_batches)
 
+        output_type = [output_type] if isinstance(output_type, str) else output_type
         results = {key: [] for key in output_type}
-        for X_batch, y_batch in zip(Xs_split, ys_split):
-            if X_batch.shape[0] == 0:
-                continue
-            X_batch = torch.from_numpy(X_batch).float().to(device)
-            y_batch = torch.from_numpy(y_batch).float().to(device)
+        n_done = 0
+
+        for X_batch, y_batch in zip(Xs, ys, strict=False):
+            # Budget checkpoint: stop between estimator batches. The floor
+            # (``n_batches_done > 0``) guarantees at least one batch runs per
+            # fit and that the output shape is known before any NaN fill.
+            if budget is not None and budget.expired() and budget.n_batches_done > 0:
+                break
+            X_batch = torch.from_numpy(X_batch).float().to(self.device_)
+            y_batch = torch.from_numpy(y_batch).float().to(self.device_)
 
             with torch.no_grad():
-                out = model.predict_stats(
+                out = self.model_.predict_stats(
                     X_batch,
                     y_batch,
                     output_type=output_type,
                     alphas=alphas,
-                    inference_config=inference_config,
+                    inference_config=self.inference_config_,
                 )
                 if isinstance(out, dict):
                     for key in output_type:
                         results[key].append(out[key].float().cpu().numpy())
                 else:
                     results[output_type[0]].append(out.float().cpu().numpy())
+            n_done += int(X_batch.shape[0])
+            if budget is not None:
+                budget.n_batches_done += 1
+                for key in output_type:
+                    budget.out_shapes.setdefault(key, results[key][-1].shape[1:])
 
-        for key in results:
-            results[key] = np.concatenate(results[key], axis=0)
+        if budget is not None and n_done < n_total_est:
+            # Truncated: keep the completed prefix and NaN-fill the tail so the
+            # planned estimator count is preserved and the caller's existing
+            # NaN filter marks the unrun candidates invalid.
+            n_left = n_total_est - n_done
+            budget.n_truncated += n_left
+            for key in output_type:
+                if results[key]:
+                    base = np.concatenate(results[key], axis=0)
+                    fill = np.full((n_left,) + base.shape[1:], np.nan, dtype=base.dtype)
+                    results[key] = np.concatenate([base, fill], axis=0)
+                else:
+                    shape = budget.out_shapes.get(key)
+                    if shape is None:
+                        raise RuntimeError(
+                            f"cannot NaN-fill output {key!r} after the fit budget expired: "
+                            "no earlier batch recorded its shape"
+                        )
+                    results[key] = np.full((n_left,) + tuple(shape), np.nan, dtype=np.float32)
+        else:
+            for key in results:
+                results[key] = np.concatenate(results[key], axis=0)
 
         if len(output_type) == 1:
             return results[output_type[0]]
@@ -943,7 +1319,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         Xs: np.ndarray,
         kv_cache: TabLDMCache,
         output_type: str | list[str] = "mean",
-        alphas: Optional[List[float]] = None,
+        alphas: list[float] | None = None,
     ) -> np.ndarray | dict[str, np.ndarray]:
         """Process model forward passes using a pre-computed KV cache."""
         n_total = Xs.shape[0]
@@ -1000,12 +1376,11 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             random_state=self.random_state,
         )
         self.ensemble_generator_.fit(X, y_scaled)
-
-        # Share one UniqueFeatureFilter across every group so they agree on
-        # column identity and width. Without this each group (and each fold)
-        # refits its own filter and can drop a different set of constant
-        # columns, which shifts the column space feature sampling lives in.
-        shared_unique_filter = self.ensemble_generator_.unique_filter_
+        # Freeze the REAL row count: EnsembleGenerator truncates to the
+        # shuffle patterns it can produce, so this is
+        # min(n_estimators, n_features * n_norm_methods) with the default
+        # latin shuffler — not necessarily n_estimators.
+        self.n_main_actual_ = sum(len(v) for v in self.ensemble_generator_.ensemble_configs_.values())
 
         # SVD + crossing augmentation for odd estimators in main group
         self.svd_ = None
@@ -1014,6 +1389,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
         # Quantile-only EnsembleGenerator
         self.quantile_ensemble_generator_ = None
+        self.n_quantile_actual_ = 0
         if self.n_quantile_estimators > 0:
             self.quantile_ensemble_generator_ = EnsembleGenerator(
                 classification=False,
@@ -1023,83 +1399,36 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
             )
-            self.quantile_ensemble_generator_.fit(X, y_scaled, frozen_unique_filter=shared_unique_filter)
+            self.quantile_ensemble_generator_.fit(X, y_scaled)
+            self.n_quantile_actual_ = sum(len(v) for v in self.quantile_ensemble_generator_.ensemble_configs_.values())
 
-        # Quantile-SVD + cross EnsembleGenerator (group 3)
-        self.quantile_svd_ensemble_generator_ = None
-        self._q_svd_ = None
-        self._q__svd_pre_ = None
-        self._q__X_train_svd_ = np.empty((0,), dtype=np.float32)
-        self._q__svd_selections_ = [[] for _ in range(16)]
-        self._q__cross_pool_ = []
-        self._q__cross_scaler_ = None
-        self._q__cross_pool_train_ = np.empty((0,), dtype=np.float32)
-        self._q__cross_selections_ = [[] for _ in range(16)]
-        self._q__k_ = 0
-        if self.n_quantile_svd_estimators > 0:
-            self.quantile_svd_ensemble_generator_ = EnsembleGenerator(
-                classification=False,
-                n_estimators=self.n_quantile_svd_estimators,
-                norm_methods=["quantile"],
-                feat_shuffle_method=self.feat_shuffle_method,
-                outlier_threshold=self.outlier_threshold,
-                random_state=self.random_state,
-            )
-            self.quantile_svd_ensemble_generator_.fit(X, y_scaled, frozen_unique_filter=shared_unique_filter)
-            if self.n_quantile_svd_estimators == 32:
-                self._fit_svd_cross(
-                    self.quantile_svd_ensemble_generator_.X_, attr_prefix="_q_"
-                )
+        # Base-row name labels (main + quantile).  HK rows are appended at
+        # predict time with names built from the surviving estimators'
+        # kinds, so a skipped HK estimator cannot shift the asinh/yj split.
+        self.candidate_names_ = [self._candidate_name(i) for i in range(self.n_main_actual_ + self.n_quantile_actual_)]
 
-        # Independent SVD feature group (group 4): norms + SVD component
-        # concatenation via the EnsembleGenerator use_svd support.
-        self.svd_ens_generator_ = None
-        if self.n_svd_ens_estimators and self.n_svd_ens_estimators > 0:
-            self.svd_ens_generator_ = EnsembleGenerator(
-                classification=False,
-                n_estimators=self.n_svd_ens_estimators,
-                norm_methods=self.svd_ens_norm_methods,
-                feat_shuffle_method=self.feat_shuffle_method,
-                outlier_threshold=self.outlier_threshold,
-                random_state=self.random_state,
-                use_svd=True,
-                svd_n_components=self.svd_ens_n_components,
-            )
-            self.svd_ens_generator_.fit(X, y_scaled, frozen_unique_filter=shared_unique_filter)
-
-        print(
-            f"[TabLDM:enhance] Estimator groups: main={self.n_estimators}, "
-            f"quantile={self.n_quantile_estimators}, "
-            f"quantile_svd={self.n_quantile_svd_estimators}, "
-            f"svd_ens(group6)={self.n_svd_ens_estimators}, "
-            f"total={self.n_estimators + (self.n_quantile_estimators or 0) + (self.n_quantile_svd_estimators or 0) + (self.n_svd_ens_estimators or 0)}"
-        )
+        # print(
+            # f"[TabLDM:enhance] Estimator groups: main={self.n_main_actual_} "
+            # f"(requested {self.n_estimators}), "
+            # f"quantile={self.n_quantile_actual_} (requested {self.n_quantile_estimators}), "
+            # f"total={self.n_main_actual_ + self.n_quantile_actual_}"
+        # )
 
         # HK full-train generators
         self.hk_generators_ = []
         if self.hk_triggered_:
-            y_orig_full = self.y_scaler_.inverse_transform(
-                y_scaled.reshape(-1, 1)
-            ).flatten()
+            y_orig_full = self.y_scaler_.inverse_transform(y_scaled.reshape(-1, 1)).flatten()
             self.hk_generators_ = self._make_hk_generators(X, y_orig_full, seed_offset=0)
-            print(f"[TabLDM:hk] full-train HK generators fitted: {len(self.hk_generators_)}")
+            # print(f"[TabLDM:hk] full-train HK generators fitted: {len(self.hk_generators_)}")
 
     def _make_and_fit_generators(self, X_tr: np.ndarray, y_tr: np.ndarray):
         """Fit all generators on a (possibly reduced) training split.
 
-        Returns a dict with keys 'main_gen', 'val_svd' (may be None), 'q_gen'
-        (may be None), 'q_svd_gen' (may be None), 'q_svd_val_svd' (may be
-        None), 'svd_ens_gen' (may be None), and 'saved_svd' so that
-        _collect_val_predictions can use them.
+        The full-train ``unique_filter_``s are frozen into the split-local
+        generators so every generator output shares one feature axis (required
+        for ``feat_sample_indices_`` to address the same columns everywhere).
         """
-        # Reuse the full-train UniqueFeatureFilter so the fold-local generators
-        # emit the same width (and the same surviving columns) as the full-train
-        # ones. Otherwise a column that is constant only inside the fold gets
-        # dropped here and every downstream column index shifts.
-        frozen_unique_filter = getattr(
-            getattr(self, "ensemble_generator_", None), "unique_filter_", None
-        )
-
+        main_frozen_filter = getattr(self.ensemble_generator_, "unique_filter_", None)
         main_gen = EnsembleGenerator(
             classification=False,
             n_estimators=self.n_estimators,
@@ -1108,16 +1437,20 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             outlier_threshold=self.outlier_threshold,
             random_state=self.random_state,
         )
-        main_gen.fit(X_tr, y_tr, frozen_unique_filter=frozen_unique_filter)
+        main_gen.fit(X_tr, y_tr, frozen_unique_filter=main_frozen_filter)
 
-        # Save and wire SVD/cross state (main group prefix "" and
-        # quantile-SVD group prefix "_q_").
-        svd_attrs = ["svd_", "_svd_pre_", "_X_train_svd_", "_svd_selections_",
-                     "_cross_pool_", "_cross_scaler_", "_cross_pool_train_",
-                     "_cross_selections_", "_k_",
-                     "_q_svd_", "_q__svd_pre_", "_q__X_train_svd_", "_q__svd_selections_",
-                     "_q__cross_pool_", "_q__cross_scaler_", "_q__cross_pool_train_",
-                     "_q__cross_selections_", "_q__k_"]
+        # Save and wire SVD/cross state
+        svd_attrs = [
+            "svd_",
+            "_svd_pre_",
+            "_X_train_svd_",
+            "_svd_selections_",
+            "_cross_pool_",
+            "_cross_scaler_",
+            "_cross_pool_train_",
+            "_cross_selections_",
+            "_k_",
+        ]
         saved_svd = {a: getattr(self, a, None) for a in svd_attrs}
 
         val_svd = None
@@ -1129,6 +1462,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
         q_gen = None
         if self.n_quantile_estimators > 0:
+            q_frozen_filter = getattr(getattr(self, "quantile_ensemble_generator_", None), "unique_filter_", None)
             q_gen = EnsembleGenerator(
                 classification=False,
                 n_estimators=self.n_quantile_estimators,
@@ -1137,49 +1471,12 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 outlier_threshold=self.outlier_threshold,
                 random_state=self.random_state,
             )
-            q_gen.fit(X_tr, y_tr, frozen_unique_filter=frozen_unique_filter)
-
-        # Quantile-SVD group (group 3)
-        q_svd_gen = None
-        q_svd_val_svd = None
-        if self.n_quantile_svd_estimators > 0:
-            q_svd_gen = EnsembleGenerator(
-                classification=False,
-                n_estimators=self.n_quantile_svd_estimators,
-                norm_methods=["quantile"],
-                feat_shuffle_method=self.feat_shuffle_method,
-                outlier_threshold=self.outlier_threshold,
-                random_state=self.random_state,
-            )
-            q_svd_gen.fit(X_tr, y_tr, frozen_unique_filter=frozen_unique_filter)
-            if self.n_quantile_svd_estimators == 32:
-                self._fit_svd_cross(q_svd_gen.X_, attr_prefix="_q_")
-                q_svd_val_svd = getattr(self, "_q_svd_", None)
-            else:
-                self._q_svd_ = None
-
-        # Independent SVD feature group (group 4)
-        svd_ens_gen = None
-        if self.n_svd_ens_estimators and self.n_svd_ens_estimators > 0:
-            svd_ens_gen = EnsembleGenerator(
-                classification=False,
-                n_estimators=self.n_svd_ens_estimators,
-                norm_methods=self.svd_ens_norm_methods,
-                feat_shuffle_method=self.feat_shuffle_method,
-                outlier_threshold=self.outlier_threshold,
-                random_state=self.random_state,
-                use_svd=True,
-                svd_n_components=self.svd_ens_n_components,
-            )
-            svd_ens_gen.fit(X_tr, y_tr, frozen_unique_filter=frozen_unique_filter)
+            q_gen.fit(X_tr, y_tr, frozen_unique_filter=q_frozen_filter)
 
         return {
             "main_gen": main_gen,
             "val_svd": val_svd,
             "q_gen": q_gen,
-            "q_svd_gen": q_svd_gen,
-            "q_svd_val_svd": q_svd_val_svd,
-            "svd_ens_gen": svd_ens_gen,
             "saved_svd": saved_svd,
         }
 
@@ -1193,16 +1490,16 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         """Run all estimators on the validation set and return (E, n_val) predictions."""
         main_gen: EnsembleGenerator = val_gen_info["main_gen"]
         q_gen = val_gen_info["q_gen"]
-        q_svd_gen = val_gen_info.get("q_svd_gen")
         output_type = ["mean"]
 
         all_preds = []
+        fsi = getattr(self, "feat_sample_indices_", None)
+        # Fit-time collection honours the fit budget; predict-time collection
+        # (which never calls this) must keep running the full frozen pool.
+        budget = getattr(self, "_fit_budget_", None)
 
         # ---- main group ----
-        use_augment = (
-            val_gen_info["val_svd"] is not None
-            and self.n_estimators == 32
-        )
+        use_augment = val_gen_info["val_svd"] is not None and self.n_estimators == 32
         if use_augment:
             data = main_gen.transform(X_val, mode="both")
             X_raw_val = main_gen.unique_filter_.transform(X_val)
@@ -1229,9 +1526,9 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 per_est_preds = {}
 
                 if even_idxs:
-                    fi = self._feat_indices_for(even_global, Xs_both.shape[-1])
+                    fi = [fsi[g] for g in even_global] if fsi is not None else None
                     bout = self._batch_forward(
-                        Xs_both[even_idxs], ys[even_idxs], output_type=output_type, feat_indices=fi
+                        Xs_both[even_idxs], ys[even_idxs], output_type=output_type, feat_indices=fi, budget=budget
                     )
                     preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                     for i, li in enumerate(even_idxs):
@@ -1239,34 +1536,27 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
                 if odd_idxs:
                     Xs_odd_list = []
-                    for li, ol, g in zip(odd_idxs, odd_locals, odd_global):
-                        # Subsample base columns before the cross/SVD concat so
-                        # the augmented tail keeps its own layout.
-                        x_both_i = self._apply_feat_sample(Xs_both[li], g)
-                        x_tr = self._augment_estimator(
-                            x_both_i[:n_train_rows], X_raw_train, ol, is_train=True)
-                        x_te = self._augment_estimator(
-                            x_both_i[n_train_rows:], X_raw_val, ol, is_train=False)
+                    for li, ol in zip(odd_idxs, odd_locals, strict=False):
+                        x_both_i = Xs_both[li]
+                        x_tr = self._augment_estimator(x_both_i[:n_train_rows], X_raw_train, ol, is_train=True)
+                        x_te = self._augment_estimator(x_both_i[n_train_rows:], X_raw_val, ol, is_train=False)
                         Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
                     Xs_odd = np.stack(Xs_odd_list, axis=0)
-                    bout = self._batch_forward(
-                        Xs_odd, ys[odd_idxs], output_type=output_type
-                    )
+                    fi = [fsi[g] for g in odd_global] if fsi is not None else None
+                    bout = self._batch_forward(Xs_odd, ys[odd_idxs], output_type=output_type, feat_indices=fi, budget=budget)
                     preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                     for i, li in enumerate(odd_idxs):
                         per_est_preds[li] = preds_val[i]
 
-                stacked = np.stack(
-                    [per_est_preds[li] for li in range(n_est_this_method)], axis=0
-                )
+                stacked = np.stack([per_est_preds[li] for li in range(n_est_this_method)], axis=0)
                 all_preds.append(stacked)
         else:
             data = main_gen.transform(X_val, mode="both")
             _grp_offset = 0
             for norm_method, (Xs, ys) in data.items():
                 n_est = Xs.shape[0]
-                fi = self._feat_indices_for(range(_grp_offset, _grp_offset + n_est), Xs.shape[-1])
-                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
+                fi = [fsi[_grp_offset + i] for i in range(n_est)] if fsi is not None else None
+                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi, budget=budget)
                 preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                 all_preds.append(preds_val)
                 _grp_offset += n_est
@@ -1274,107 +1564,14 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         # ---- quantile group ----
         if q_gen is not None:
             q_data = q_gen.transform(X_val, mode="both")
-            _q_offset = self.n_estimators
+            _q_offset = getattr(self, "n_main_actual_", self.n_estimators)
             for norm_method, (Xs, ys) in q_data.items():
                 n_est = Xs.shape[0]
-                fi = self._feat_indices_for(range(_q_offset, _q_offset + n_est), Xs.shape[-1])
-                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
+                fi = [fsi[_q_offset + i] for i in range(n_est)] if fsi is not None else None
+                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi, budget=budget)
                 preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                 all_preds.append(preds_val)
                 _q_offset += n_est
-
-        # ---- quantile-SVD group (group 3) ----
-        if q_svd_gen is not None:
-            q_svd_use_augment = (
-                val_gen_info.get("q_svd_val_svd") is not None
-                and self.n_quantile_svd_estimators == 32
-            )
-            _qs_offset = self.n_estimators + (self.n_quantile_estimators or 0)
-            if q_svd_use_augment:
-                q_svd_data = q_svd_gen.transform(X_val, mode="both")
-                X_raw_val_q = q_svd_gen.unique_filter_.transform(X_val)
-                X_raw_train_q = q_svd_gen.X_
-
-                q_global_est_idx = 0
-                q_odd_local = 0
-                for norm_method, (Xs_both, ys) in q_svd_data.items():
-                    n_est_this_method = Xs_both.shape[0]
-                    n_train_rows = ys.shape[1]
-                    even_idxs, odd_idxs, odd_locals = [], [], []
-                    even_global, odd_global = [], []
-                    for local in range(n_est_this_method):
-                        if q_global_est_idx % 2 == 0:
-                            even_idxs.append(local)
-                            even_global.append(q_global_est_idx)
-                        else:
-                            odd_idxs.append(local)
-                            odd_locals.append(q_odd_local)
-                            odd_global.append(q_global_est_idx)
-                            q_odd_local += 1
-                        q_global_est_idx += 1
-
-                    per_est_preds = {}
-
-                    if even_idxs:
-                        fi = self._feat_indices_for([_qs_offset + g for g in even_global], Xs_both.shape[-1])
-                        bout = self._batch_forward(
-                            Xs_both[even_idxs], ys[even_idxs], output_type=output_type, feat_indices=fi
-                        )
-                        preds_val = bout if not isinstance(bout, dict) else bout["mean"]
-                        for i, li in enumerate(even_idxs):
-                            per_est_preds[li] = preds_val[i]
-
-                    if odd_idxs:
-                        Xs_odd_list = []
-                        for li, ol, g in zip(odd_idxs, odd_locals, odd_global):
-                            # Subsample base columns before the cross/SVD concat
-                            # so the augmented tail keeps its own layout.
-                            x_both_i = self._apply_feat_sample(Xs_both[li], _qs_offset + g)
-                            x_tr = self._augment_estimator(
-                                x_both_i[:n_train_rows], X_raw_train_q, ol, is_train=True,
-                                attr_prefix="_q_")
-                            x_te = self._augment_estimator(
-                                x_both_i[n_train_rows:], X_raw_val_q, ol, is_train=False,
-                                attr_prefix="_q_")
-                            Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
-                        Xs_odd = np.stack(Xs_odd_list, axis=0)
-                        bout = self._batch_forward(
-                            Xs_odd, ys[odd_idxs], output_type=output_type
-                        )
-                        preds_val = bout if not isinstance(bout, dict) else bout["mean"]
-                        for i, li in enumerate(odd_idxs):
-                            per_est_preds[li] = preds_val[i]
-
-                    stacked = np.stack(
-                        [per_est_preds[li] for li in range(n_est_this_method)], axis=0
-                    )
-                    all_preds.append(stacked)
-            else:
-                q_svd_data = q_svd_gen.transform(X_val, mode="both")
-                for norm_method, (Xs, ys) in q_svd_data.items():
-                    n_est = Xs.shape[0]
-                    fi = self._feat_indices_for(range(_qs_offset, _qs_offset + n_est), Xs.shape[-1])
-                    bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
-                    preds_val = bout if not isinstance(bout, dict) else bout["mean"]
-                    all_preds.append(preds_val)
-                    _qs_offset += n_est
-
-        # ---- independent SVD group (group 4) ----
-        svd_ens_gen = val_gen_info.get("svd_ens_gen")
-        if svd_ens_gen is not None:
-            svd_ens_data = svd_ens_gen.transform(X_val, mode="both")
-            _svd_ens_offset = (
-                self.n_estimators
-                + (self.n_quantile_estimators or 0)
-                + (self.n_quantile_svd_estimators or 0)
-            )
-            for norm_method, (Xs, ys) in svd_ens_data.items():
-                n_est = Xs.shape[0]
-                fi = self._feat_indices_for(range(_svd_ens_offset, _svd_ens_offset + n_est), Xs.shape[-1])
-                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
-                preds_val = bout if not isinstance(bout, dict) else bout["mean"]
-                all_preds.append(preds_val)
-                _svd_ens_offset += n_est
 
         # Restore SVD attributes on self to their pre-validation state
         for attr, val in val_gen_info["saved_svd"].items():
@@ -1385,58 +1582,44 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
         return np.concatenate(all_preds, axis=0)
 
-    def _candidate_name(self, idx: int, n_main: int) -> str:
-        """Human-readable candidate label for NNLS weight logging.
+    def _candidate_name(self, idx: int) -> str:
+        """Human-readable candidate label for logging and group parsing.
 
-        Matches the candidate ordering produced by ``_collect_val_predictions``
-        and ``predict``: main-group estimators occupy indices ``0..n_main-1``
-        (even global index = plain "default", odd = "svd+cross" augmented when
-        the main group augmentation is active), followed by the quantile group,
-        the quantile-SVD group, the independent SVD group, and finally the HK
-        group — mirroring the external MiTab regressor_attnres_ensemble.py
-        ordering.
+        Labels are derived from the **actual** generator row counts
+        (``n_main_actual_`` / ``n_quantile_actual_``), never from the
+        requested ``n_estimators`` / ``n_quantile_estimators``.
+        ``EnsembleGenerator`` truncates to the shuffle patterns it can
+        produce — with the default ``feat_shuffle_method='latin'`` that is
+        ``min(requested, n_features * n_norm_methods)`` rows for the main
+        group and ``min(requested, n_features)`` for the quantile group —
+        so the requested counts overstate the matrix.  Using them shifts
+        every index past the real main block: quantile rows get labelled
+        ``default[i]`` (the whole matrix collapses into one group and the
+        group prior silently degrades to a flat mean) and HK rows shift by
+        the shortfall (v2 §1.4).  ``fit()`` freezes the real counts from
+        the fitted generators before any name is built.
+
+        The ``svd+cross`` label is only used when the SVD+cross augmentation
+        is actually active (``use_augment``, i.e. ``n_estimators == 32``);
+        otherwise every main candidate is a plain feature candidate and is
+        labelled ``default[i]`` so the name matches the construction
+        (v2 §1.3 / §4.4).
         """
+        n_main = int(getattr(self, "n_main_actual_", self.n_estimators))
+        n_q = int(getattr(self, "n_quantile_actual_", self.n_quantile_estimators or 0))
         if idx < n_main:
-            return f"default[{idx}]" if idx % 2 == 0 else f"svd+cross[{idx}]"
-        n_q = self.n_quantile_estimators if getattr(self, "n_quantile_estimators", 0) > 0 else 0
+            use_augment = getattr(self, "svd_", None) is not None and self.n_estimators == 32
+            if use_augment and idx % 2 == 1:
+                return f"svd+cross[{idx}]"
+            return f"default[{idx}]"
         if idx < n_main + n_q:
             return f"quantile[{idx - n_main}]"
-        n_qs = self.n_quantile_svd_estimators if getattr(self, "n_quantile_svd_estimators", 0) > 0 else 0
-        if idx < n_main + n_q + n_qs:
-            return f"quantile_svd+cross[{idx - n_main - n_q}]"
-        n_svd_ens = self.n_svd_ens_estimators if getattr(self, "svd_ens_generator_", None) is not None else 0
-        if idx < n_main + n_q + n_qs + n_svd_ens:
-            return f"svd_ens(group6)[{idx - n_main - n_q - n_qs}]"
-        hk_idx = idx - n_main - n_q - n_qs - n_svd_ens
+        hk_idx = idx - n_main - n_q
         hk_infos = getattr(self, "hk_generators_", [])
         if hk_idx < len(hk_infos):
             h = hk_infos[hk_idx]
             return f"hk_{h['kind']}[{hk_idx}]"
         return f"hk[{hk_idx}]"
-
-    def _nnls_weight_labels(self, valid_mask: np.ndarray, n_weights: int) -> List[str]:
-        """Map NNLS weight positions back to original candidate names.
-
-        ``valid_mask`` is the boolean mask over original base-estimator indices
-        (True = kept after NaN filtering). The NNLS weight vector layout is
-        [kept base estimators in original order ..., HK rows ...], so weight
-        position ``i`` maps to original estimator ``np.where(valid_mask)[0][i]``
-        for base rows, and to HK rows thereafter. ``n_weights`` is the actual
-        length of the learned weight vector (base-kept + HK rows appended).
-        """
-        valid_orig = np.where(valid_mask)[0]
-        labels = [
-            self._candidate_name(int(g), self.n_estimators)
-            for g in valid_orig[:n_weights]
-        ]
-        hk_infos = getattr(self, "hk_generators_", [])
-        n_hk_rows = max(0, int(n_weights) - len(labels))
-        for j in range(n_hk_rows):
-            if j < len(hk_infos):
-                labels.append(f"hk_{hk_infos[j]['kind']}[{j}]")
-            else:
-                labels.append(f"hk[{j}]")
-        return labels
 
     def _build_kv_cache(self) -> None:
         """Pre-compute KV caches for training data across all ensemble batches."""
@@ -1451,7 +1634,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 ys_split = np.array_split(ys, n_batches)
 
                 caches = []
-                for X_batch, y_batch in zip(Xs_split, ys_split):
+                for X_batch, y_batch in zip(Xs_split, ys_split, strict=False):
                     X_batch = torch.from_numpy(X_batch).float().to(self.device_)
                     y_batch = torch.from_numpy(y_batch).float().to(self.device_)
                     with torch.no_grad():
@@ -1473,93 +1656,85 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
         # Build KV cache for quantile group
         self.quantile_kv_cache_ = None
-        q_gen = getattr(self, "quantile_ensemble_generator_", None)
-        if q_gen is not None:
-            self.quantile_kv_cache_ = _cache_generator(q_gen)
-
-        # Build KV cache for quantile-SVD group (group 3)
-        self.quantile_svd_kv_cache_ = None
-        qs_gen = getattr(self, "quantile_svd_ensemble_generator_", None)
-        if qs_gen is not None:
-            self.quantile_svd_kv_cache_ = _cache_generator(qs_gen)
-
-        # Build KV cache for independent SVD group (group 4)
-        self.svd_ens_kv_cache_ = None
-        svd_ens_gen = getattr(self, "svd_ens_generator_", None)
-        if svd_ens_gen is not None:
-            self.svd_ens_kv_cache_ = _cache_generator(svd_ens_gen)
+        if self.quantile_ensemble_generator_ is not None:
+            self.quantile_kv_cache_ = _cache_generator(self.quantile_ensemble_generator_)
 
     # ==================================================================
     # Feature sampling
     # ==================================================================
 
-    def _feat_sample(self, est_idx: int, n_cols: int) -> Optional[np.ndarray]:
-        """Column subset for one estimator, in the column space it actually sees.
-
-        ``n_cols`` must be the width of the matrix produced by
-        ``EnsembleGenerator.transform()`` for this estimator -- i.e. *after*
-        ``UniqueFeatureFilter`` (and after the SVD append for the group-4
-        generator), but *before* any ``_augment_estimator`` cross/SVD concat.
-
-        Sampling in that space keeps every index in bounds. Sampling against the
-        raw ``X.shape[1]`` does not: the unique filter drops constant columns,
-        so indices drawn from the raw width can exceed the filtered width and
-        raise ``IndexError``.
-
-        Deterministic in ``(est_idx, n_cols)``, so a fold-local generator and
-        the full-train generator hand the same estimator the same columns.
-        """
-        if self.max_num_features is None or n_cols <= self.max_num_features:
-            return None
-        seed_base = self.random_state if self.random_state is not None else 0
-        return np.sort(
-            np.random.default_rng(seed_base + est_idx).choice(
-                n_cols, size=self.max_num_features, replace=False
-            )
-        )
-
-    def _feat_indices_for(self, est_ids, n_cols: int) -> Optional[List[np.ndarray]]:
-        """Build a ``feat_indices`` list for ``_batch_forward``.
-
-        Returns ``None`` when sampling is inactive so callers can forward it
-        unchanged. Every entry has the same length, so the stacked batch keeps a
-        uniform width.
-        """
-        if self.max_num_features is None or n_cols <= self.max_num_features:
-            return None
-        return [self._feat_sample(g, n_cols) for g in est_ids]
-
     def _apply_feat_sample(self, X: np.ndarray, est_idx: int) -> np.ndarray:
-        """Subsample base feature columns for ``est_idx`` before augmentation.
+        """Return X with selected columns if feature sampling is active for est_idx.
 
-        Must run on the generator output *before* ``_augment_estimator`` appends
-        cross/SVD columns, so the sampled columns stay aligned with the base
-        layout the cross/SVD pool was fitted on and the augmented tail keeps its
-        own layout.
+        ``feat_sample_indices_`` addresses generator-output columns (post
+        UniqueFeatureFilter), so ``X`` must be a generator-transformed matrix.
         """
-        idx = self._feat_sample(est_idx, X.shape[-1])
-        return X if idx is None else X[..., idx]
+        if self.feat_sample_indices_ is None or est_idx >= len(self.feat_sample_indices_):
+            return X
+        return X[:, self.feat_sample_indices_[est_idx]]
 
     # ==================================================================
     # fit()
     # ==================================================================
 
-    def fit(self, X: np.ndarray, y: np.ndarray, kv_cache: bool | str = False) -> "TabLDMRegressor":
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        kv_cache: bool | str = False,
+        *,
+        time_limit: float | None = None,
+    ) -> TabLDMRegressor:
         """Fit the regressor to training data.
 
         When ``enhance_candidates=True``, fits multiple candidate generators
         and optionally learns NNLS ensemble weights via validation/OOF.
         When ``enhance_candidates=False``, runs the plain single-group
         inference path.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training features.
+        y : array-like of shape (n_samples,)
+            Training targets.
+        kv_cache : bool or str, default=False
+            Non-enhanced path only; see the class docstring.
+        time_limit : float or None, default=None
+            Wall-clock budget for this ``fit`` call, in seconds. Three
+            contracts hold:
+
+            1. ``time_limit=None`` (the default) leaves behavior bit-identical
+               to fitting without the argument: same candidate pool, same
+               shrinkage weights, same predictions.
+            2. Overshoot is bounded. The budget is checked *between* estimator
+               batches, so a fit may exceed ``time_limit`` by at most one batch
+               forward (at most ``batch_size_`` candidates).
+            3. The pool is only ever truncated from the tail of the canonical
+               candidate order — never by skipping candidates in the middle.
+               Candidates that were not run are marked invalid and dropped from
+               fusion; the fitted mask (``nan_valid_mask_``) is replayed at
+               predict time, so the pool fit froze is exactly the pool predict
+               combines.
+
+            ``time_limit<=0`` is normalized to the floor path rather than an
+            error: at least one estimator batch always runs, so the returned
+            model is always able to ``predict``.
         """
         if y is None:
             raise ValueError("This regressor requires y to be passed, but the target y is None.")
+
+        # Wall-clock budget covering the whole fit (from here, so it lines up
+        # with the caller's window).  The shrinkage holdout gets a small
+        # reserve so the candidate loop cannot starve it.
+        self._fit_budget_ = _FitBudget(time_limit, reserve=_reserve(time_limit) if time_limit else 0.0)
 
         X, y = validate_data(self, X, y, dtype=None, skip_check_array=True)
         y = np.asarray(y, dtype=np.float32)
 
         if y.ndim == 2 and y.shape[1] == 1:
             from sklearn.exceptions import DataConversionWarning
+
             warnings.warn(
                 "A column-vector y was passed when a 1d array was expected. Please change "
                 "the shape of y to (n_samples, ), for example using ravel().",
@@ -1591,8 +1766,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         if self.enhance_candidates:
             if self.kv_cache:
                 raise ValueError(
-                    "kv_cache is not supported together with enhance_candidates=True. "
-                    "Disable one of them."
+                    "kv_cache is not supported together with enhance_candidates=True. Disable one of them."
                 )
 
             # Kurtosis check (uses original-scale y before StandardScaler)
@@ -1600,245 +1774,182 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             self.hk_kurtosis_ = float("nan")
             self.hk_triggered_, self.hk_kurtosis_ = self._check_high_kurtosis(y)
 
-            # Feature sampling is decided per estimator from the width its
-            # generator emits (see ``_feat_sample``), so there is nothing to
-            # precompute here against the raw X width -- that width is the
-            # pre-UniqueFeatureFilter one and indexes out of bounds.
-
-            if self.foundation_rate < 0.0 or self.foundation_rate > 1.0:
-                raise ValueError(
-                    f"foundation_rate must be in [0, 1], got {self.foundation_rate}"
+            if self.k_fold:
+                warnings.warn(
+                    "k_fold is deprecated and completely disabled in TabLDMRegressor "
+                    "(v2 no-K-Fold rules). The parameter is ignored; a single holdout "
+                    "is used at most for shrinkage. Pass k_fold=False to silence this "
+                    "warning.",
+                    DeprecationWarning,
+                    stacklevel=2,
                 )
-
-            print(f"[TabLDM:enhance] use_cross_feature={self.use_cross_feature}")
+            if abs(self.foundation_rate - 0.25) > 1e-12:
+                warnings.warn(
+                    "foundation_rate is deprecated in favor of shrink_lambda "
+                    "(v2 §3.6). The foundation is now the group-prior prediction, "
+                    "not the all-candidate equal-weight mean. "
+                    f"Got foundation_rate={self.foundation_rate}; this value is ignored.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            if self.shrink_lambda is not None and not (0.0 <= self.shrink_lambda <= 1.0):
+                raise ValueError(f"shrink_lambda must be in [0, 1] or None (auto), got {self.shrink_lambda}")
+            if self.shrink_kappa <= 0:
+                raise ValueError(f"shrink_kappa must be positive, got {self.shrink_kappa}")
+            if not (0.0 <= self.slot_blend_rate <= 1.0):
+                raise ValueError(f"slot_blend_rate must be in [0, 1], got {self.slot_blend_rate}")
+            if not self.validation and self.shrink_lambda:
+                # print(
+                    # f"[TabLDM:enhance] validation=False: holdout is skipped and "
+                    # f"shrink_lambda={self.shrink_lambda} is ignored; pure group prior will be used."
+                # )
+                pass
+            # print(f"[TabLDM:enhance] use_cross_feature={self.use_cross_feature}")
+            # print(
+                # f"[TabLDM:enhance] v3.1 group-prior rules active: "
+                # f"shrink_lambda={'auto' if self.shrink_lambda is None else self.shrink_lambda}, "
+                # f"shrink_kappa={self.shrink_kappa}, slot_blend_rate={self.slot_blend_rate}, "
+                # f"hk_kind_ratio={self.hk_kind_ratio}"
+            # )
 
             # Fit generators
             self._fit_full_generators(X, y_scaled)
 
-            # Report feature sampling against the width the main generator
-            # actually emits (post-unique-filter), which is the space
-            # ``_feat_sample`` draws indices from.
-            n_emitted = self.ensemble_generator_.n_features_in_
+            # Feature sampling: build per-estimator column indices for ALL
+            # estimator groups ([main | quantile | hk]) after the generators are
+            # fitted, using the generator's actual n_features_in_ (post
+            # UniqueFeatureFilter). Sampling against the raw X width would
+            # produce out-of-bounds / misaligned column indices whenever
+            # UniqueFeatureFilter drops constant columns (mirrors classifier).
             _n_hk_est = self.high_kurtosis_n_estimators if self.hk_triggered_ else 0
-            n_total_estimators = (
-                self.n_estimators
-                + (self.n_quantile_estimators or 0)
-                + (self.n_quantile_svd_estimators or 0)
-                + (self.n_svd_ens_estimators or 0)
-                + _n_hk_est
-            )
-            if self.max_num_features is not None and n_emitted > self.max_num_features:
-                print(
-                    f"[TabLDM:enhance] feature sampling triggered: "
-                    f"n_features={n_emitted} -> max_num_features={self.max_num_features}, "
-                    f"n_estimators={n_total_estimators}"
-                )
+            n_total_estimators = self.n_main_actual_ + self.n_quantile_actual_ + _n_hk_est
+            n_features = self.ensemble_generator_.n_features_in_
+            self.feat_sample_indices_ = None
+            if self.max_num_features is not None and n_features > self.max_num_features:
+                seed_base = self.random_state if self.random_state is not None else 0
+                self.feat_sample_indices_ = [
+                    np.sort(
+                        np.random.default_rng(seed_base + est_idx).choice(
+                            n_features, size=self.max_num_features, replace=False
+                        )
+                    )
+                    for est_idx in range(n_total_estimators)
+                ]
+                # print(
+                    # f"[TabLDM:enhance] feature sampling triggered: "
+                    # f"n_features={n_features} -> max_num_features={self.max_num_features}, "
+                    # f"n_estimators={n_total_estimators}"
+                # )
             else:
-                print(
-                    f"[TabLDM:enhance] feature sampling off: n_features={n_emitted}, "
-                    f"max_num_features={self.max_num_features}"
-                )
+                # print(
+                    # f"[TabLDM:enhance] feature sampling off: n_features={n_features}, "
+                    # f"max_num_features={self.max_num_features}"
+                # )
+                pass
+            # Feature-side statistics for routing analysis (§4.5)
+            self._compute_feature_stats(X)
 
-            # Validation + NNLS routing
+            # ---- v3 group-prior routing (§3.3-3.4, recalibrated) ----
             n_full = X.shape[0]
-            n_val = math.ceil(0.2 * n_full)
-            route = self._route_validation(self.validation, self.k_fold, n_full, n_val)
-            print(
-                f"[TabLDM:enhance] routing: k_fold={self.k_fold}, n_train={n_full}, "
-                f"n_val={n_val}, path={route}"
+            n_features_eff = X.shape[1]
+            heavy_tail = bool(self.hk_triggered_)
+            feat_sampled = self.feat_sample_indices_ is not None
+            n_main_actual = self.n_main_actual_
+            n_q_actual = self.n_quantile_actual_
+
+            if self.group_prior is not None:
+                prior = {str(k): float(v) for k, v in self.group_prior.items()}
+            else:
+                prior = self._route_group_prior(
+                    n_full,
+                    n_features_eff,
+                    heavy_tail,
+                    feat_sampled,
+                )
+            prior_sum = float(sum(prior.values()))
+            if prior_sum <= 0:
+                raise ValueError(f"group_prior values must sum to a positive value, got {prior}")
+            pi_0 = {k: v / prior_sum for k, v in prior.items()}
+            self.group_prior_initial_ = dict(pi_0)
+            self.group_prior_holdout_ = None
+            self.group_prior_ = dict(pi_0)  # pi_0: the mix(pi_0) term of _combine_predictions
+            self.shrink_lambda_ = 0.0
+
+            rule_tag = (
+                "explicit"
+                if self.group_prior is not None
+                else (
+                    "R1 high_dim"
+                    if feat_sampled or n_features_eff > 100
+                    else "R2 heavy_tail"
+                    if heavy_tail
+                    else "R3 low_dim"
+                    if n_features_eff <= 5
+                    else "R4 large_n"
+                    if n_full >= 10000
+                    else "R5 default"
+                )
             )
+            if heavy_tail and self.group_prior is not None:
+                rule_tag = "explicit (heavy_tail)"
+            elif heavy_tail and not rule_tag.startswith("R2"):
+                rule_tag = "R2 heavy_tail + " + rule_tag
+            # print(
+                # f"[TabLDM:enhance] routing: n_train={n_full}, n_features={n_features_eff}, "
+                # f"n_main={n_main_actual}, n_q={n_q_actual}, heavy_tail={heavy_tail}, "
+                # f"feat_sampled={feat_sampled}, rule={rule_tag}"
+            # )
+            # print(
+                # f"[TabLDM:enhance] group prior pi_0: main={pi_0.get('main', 0.0):.4f}, "
+                # f"quantile={pi_0.get('quantile', 0.0):.4f}, "
+                # f"hk={pi_0.get('hk', 0.0):.4f}"
+            # )
+            # print(
+                # f"[TabLDM:enhance] feature-side stats: n_num={self.n_num_}, n_cat={self.n_cat_}, "
+                # f"feat_skew_mean={self.feat_skew_mean_:.4f}, "
+                # f"feat_kurt_mean={self.feat_kurt_mean_:.4f}, "
+                # f"feat_outlier_rate={self.feat_outlier_rate_:.4f}"
+            # )
 
-            if route == "kfold":
-                n_splits = self.n_splits
-                y_orig = self.y_scaler_.inverse_transform(
-                    y_scaled.reshape(-1, 1)
-                ).flatten()
-                kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
-                print(f"[TabLDM:enhance] k_fold enabled: n_splits={n_splits}, n_train={n_full}")
+            # ---- single-holdout group-level shrinkage (§3.6, v3) ----
+            # K-Fold is completely disabled.  The holdout learns a
+            # *group-level* weight vector (2-3 unknowns) used purely as a
+            # shrinkage term towards pi_0 — never as a candidate selector
+            # (v2 §3.1 / §2.7).  Slot-level NNLS is still computed, but
+            # only for the diagnostic log lines below.
+            self.nnls_weights_ = None
+            self.nnls_weight_map_ = None
+            self.nan_valid_mask_ = None
+            self.nan_valid_idx_ = None
+            n_val = math.ceil(0.2 * n_full)
+            route = self._route_validation(self.validation, self.k_fold, n_full)
+            # print(
+                # f"[TabLDM:enhance] shrinkage path: k_fold=disabled, n_train={n_full}, "
+                # f"n_val={n_val}, path={route}, shrink_lambda="
+                # f"{'auto' if self.shrink_lambda is None else self.shrink_lambda}, "
+                # f"shrink_kappa={self.shrink_kappa}"
+            # )
 
-                oof_preds_scaled = None
-                hk_oof_rows = []
-                coverage = np.zeros(n_full, dtype=np.int64)
-                for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(X)):
-                    X_tr, X_val = X[tr_idx], X[val_idx]
-                    y_tr_scaled = y_scaled[tr_idx]
-                    y_tr_orig_fold = self.y_scaler_.inverse_transform(
-                        y_tr_scaled.reshape(-1, 1)
-                    ).flatten()
-                    print(
-                        f"[TabLDM:enhance] fold {fold_idx + 1}/{n_splits}: "
-                        f"n_fold_train={X_tr.shape[0]}, n_fold_val={X_val.shape[0]}"
-                    )
-                    fold_gen = self._make_and_fit_generators(X_tr, y_tr_scaled)
-                    fold_preds_scaled = self._collect_val_predictions(
-                        X_tr, y_tr_scaled, X_val, fold_gen
-                    )
-                    if oof_preds_scaled is None:
-                        n_est_total = fold_preds_scaled.shape[0]
-                        oof_preds_scaled = np.full(
-                            (n_est_total, n_full), np.nan, dtype=np.float64
-                        )
-                    oof_preds_scaled[:, val_idx] = fold_preds_scaled
-                    coverage[val_idx] += 1
-
-                    # HK fold predictions
-                    if self.hk_triggered_:
-                        fold_hk_infos = self._make_hk_generators(
-                            X_tr, y_tr_orig_fold, seed_offset=fold_idx * 100
-                        )
-                        fold_hk_preds = self._collect_hk_val_predictions_orig(X_val, fold_hk_infos)
-                        hk_oof_rows.append((val_idx, fold_hk_preds))
-
-                if not np.all(coverage == 1):
-                    n_missing = int((coverage == 0).sum())
-                    n_dup = int((coverage > 1).sum())
-                    raise RuntimeError(
-                        f"[TabLDM:enhance] OOF coverage error: {n_missing} samples never predicted, "
-                        f"{n_dup} samples predicted more than once"
-                    )
-                print(
-                    f"[TabLDM:enhance] OOF prediction matrix shape={oof_preds_scaled.shape}; "
-                    f"coverage OK (each of {n_full} train samples predicted exactly once)."
-                )
-
-                # Detect and skip NaN estimators
-                nan_per_est = np.isnan(oof_preds_scaled).any(axis=1)
-                n_nan_est = int(nan_per_est.sum())
-                if n_nan_est > 0:
-                    valid_mask = ~nan_per_est
-                    nan_indices = np.where(nan_per_est)[0].tolist()
-                    oof_preds_scaled = oof_preds_scaled[valid_mask]
-                    print(
-                        f"[TabLDM:enhance] WARNING: {n_nan_est}/{len(nan_per_est)} estimators "
-                        f"produced NaN and were SKIPPED: indices={nan_indices}"
-                    )
-                else:
-                    valid_mask = np.ones(oof_preds_scaled.shape[0], dtype=bool)
-                self.nan_valid_mask_ = valid_mask
-
-                oof_preds_orig = self.y_scaler_.inverse_transform(
-                    oof_preds_scaled.reshape(-1, 1)
-                ).reshape(oof_preds_scaled.shape)
-                if not np.isfinite(oof_preds_orig).all():
-                    n_bad = int((~np.isfinite(oof_preds_orig)).sum())
-                    oof_preds_orig = np.nan_to_num(
-                        oof_preds_orig, nan=0.0, posinf=0.0, neginf=0.0
-                    )
-                    print(
-                        f"[TabLDM:enhance] WARNING: OOF inverse transform produced {n_bad} "
-                        f"NaN/Inf values, replaced with 0.0"
-                    )
-
-                n_base_valid = oof_preds_orig.shape[0]
-
-                # Assemble HK OOF matrix
-                if self.hk_triggered_ and hk_oof_rows:
-                    n_hk_valid = 0
-                    for _, fp in hk_oof_rows:
-                        if fp.shape[0] > 0:
-                            n_hk_valid = fp.shape[0]
-                            break
-                    if n_hk_valid > 0:
-                        hk_oof_matrix = np.full((n_hk_valid, n_full), np.nan, dtype=np.float64)
-                        for val_idx_f, fp in hk_oof_rows:
-                            if fp.shape[0] == n_hk_valid:
-                                hk_oof_matrix[:, val_idx_f] = fp
-                        if not np.isnan(hk_oof_matrix).any():
-                            oof_preds_orig = np.concatenate(
-                                [oof_preds_orig, hk_oof_matrix], axis=0
-                            )
-                            print(f"[TabLDM:hk] appended {n_hk_valid} HK OOF rows; total candidates={oof_preds_orig.shape[0]}")
-                        else:
-                            print("[TabLDM:hk] HK OOF matrix contains NaN (fold size mismatch?), skipping HK in NNLS")
-
-                # NNLS
-                raw_weights, _ = _scipy_nnls(oof_preds_orig.T, y_orig)
-                w_sum = raw_weights.sum()
-                n_nonzero = int((raw_weights > 0).sum())
-                if w_sum > 0:
-                    weights = raw_weights / w_sum
-                else:
-                    weights = np.ones(oof_preds_orig.shape[0]) / oof_preds_orig.shape[0]
-                    w_sum = 1.0
-
-                # Log group-level weight sums. Weight-vector positions map to
-                # original estimator indices through valid_mask (NaN-filtered
-                # base rows first, then HK rows) — following the external MiTab
-                # regressor_attnres_ensemble.py group layout.
-                n_main = self.n_estimators
-                n_q = self.n_quantile_estimators if (self.n_quantile_estimators or 0) > 0 else 0
-                n_qs = self.n_quantile_svd_estimators if (self.n_quantile_svd_estimators or 0) > 0 else 0
-                n_svd_ens = self.n_svd_ens_estimators if getattr(self, "svd_ens_generator_", None) is not None else 0
-                vm = valid_mask
-
-                # Weight position of a kept original index i is its rank among
-                # np.where(vm)[0] (NaN-filtered base rows keep original order).
-                wpos = np.where(vm)[0]
-                w_base = weights[:len(wpos)]
-
-                def _group_sum(start, end):
-                    """Sum weights for original-index range [start, end) after filtering."""
-                    sel = (wpos >= start) & (wpos < end)
-                    return float(w_base[sel].sum()) if sel.any() else 0.0
-
-                w_default = _group_sum(0, n_main // 2) if n_main >= 2 else _group_sum(0, n_main)
-                w_svd = _group_sum(n_main // 2, n_main) if n_main >= 2 else 0.0
-                w_q = _group_sum(n_main, n_main + n_q)
-                qs_start = n_main + n_q
-                qs_sel = (wpos >= qs_start) & (wpos < qs_start + n_qs)
-                qs_orig = wpos[qs_sel]
-                qs_w = w_base[qs_sel]
-                w_qs_even = float(qs_w[qs_orig % 2 == 0].sum()) if len(qs_orig) > 0 else 0.0
-                w_qs_odd = float(qs_w[qs_orig % 2 == 1].sum()) if len(qs_orig) > 1 else 0.0
-                w_svd_ens = _group_sum(n_main + n_q + n_qs, n_main + n_q + n_qs + n_svd_ens)
-                n_hk_nnls = oof_preds_orig.shape[0] - n_base_valid
-                w_hk = float(weights[n_base_valid:].sum()) if n_hk_nnls > 0 else 0.0
-                print(
-                    f"[TabLDM:enhance] NNLS (OOF): n_nonzero={n_nonzero}/{len(weights)}, "
-                    f"weights.sum()={w_sum:.4f}, "
-                    f"w_default={w_default:.4f}, w_svd/cross={w_svd:.4f}, "
-                    f"w_quantile={w_q:.4f}, "
-                    f"w_quantile_svd_even(plain)={w_qs_even:.4f}, "
-                    f"w_quantile_svd_odd(svd+cross)={w_qs_odd:.4f}, "
-                    f"w_svd_ens(group6)={w_svd_ens:.4f}, w_hk={w_hk:.4f}"
-                )
-                weight_labels = self._nnls_weight_labels(vm, len(weights))
-                nonzero_str = ", ".join(
-                    f"{weight_labels[i]:s}={weights[i]:.4f}"
-                    for i in range(len(weights)) if weights[i] > 0
-                )
-                print(f"[TabLDM:enhance] NNLS (OOF) nonzero weights: {nonzero_str}")
-
-                # OOF ensemble quality
-                oof_ensemble = weights @ oof_preds_orig
-                rmse = float(np.sqrt(np.mean((oof_ensemble - y_orig) ** 2)))
-                ss_res = float(np.sum((y_orig - oof_ensemble) ** 2))
-                ss_tot = float(np.sum((y_orig - y_orig.mean()) ** 2))
-                r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-                print(f"[TabLDM:enhance] OOF ensemble: RMSE={rmse:.6f}, R2={r2:.6f}")
-
-                self.nnls_weights_ = weights
-
-            if route == "single_validation":
+            # If the fit budget is already spent, skip the holdout entirely and
+            # fall through to the pure-group-prior path rather than burning time
+            # on forwards we would only truncate.
+            _budget = getattr(self, "_fit_budget_", None)
+            if route != "single_validation" or (_budget is not None and _budget.expired()):
+                # print("[TabLDM:enhance] no holdout: using pure group prior pi_0")
+                pass
+            else:
                 X_tr, X_val, y_tr_scaled, y_val_scaled = train_test_split(
-                    X, y_scaled,
+                    X,
+                    y_scaled,
                     test_size=0.2,
                     shuffle=True,
                     random_state=self.random_state,
                 )
-                y_val_orig = self.y_scaler_.inverse_transform(
-                    y_val_scaled.reshape(-1, 1)
-                ).flatten()
-                y_tr_orig_sv = self.y_scaler_.inverse_transform(
-                    y_tr_scaled.reshape(-1, 1)
-                ).flatten()
-                print(
-                    f"[TabLDM:enhance] validation split: n_train={X_tr.shape[0]}, n_val={X_val.shape[0]}"
-                )
+                y_val_orig = self.y_scaler_.inverse_transform(y_val_scaled.reshape(-1, 1)).flatten()
+                y_tr_orig_sv = self.y_scaler_.inverse_transform(y_tr_scaled.reshape(-1, 1)).flatten()
+                # print(f"[TabLDM:enhance] validation split: n_train={X_tr.shape[0]}, n_val={X_val.shape[0]}")
                 val_gen = self._make_and_fit_generators(X_tr, y_tr_scaled)
-                val_preds_scaled = self._collect_val_predictions(
-                    X_tr, y_tr_scaled, X_val, val_gen
-                )
+                val_preds_scaled = self._collect_val_predictions(X_tr, y_tr_scaled, X_val, val_gen)
                 # Detect and skip NaN estimators
                 nan_per_est = np.isnan(val_preds_scaled).any(axis=1)
                 n_nan_est = int(nan_per_est.sum())
@@ -1853,33 +1964,45 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 else:
                     valid_mask = np.ones(val_preds_scaled.shape[0], dtype=bool)
                 self.nan_valid_mask_ = valid_mask
+                if _budget is not None and _budget.n_truncated > 0:
+                    print(
+                        f"[TabLDM:time_limit] early-stop: {int(valid_mask.sum())}/{valid_mask.shape[0]} "
+                        f"candidates ran within the budget; the rest are excluded from fusion "
+                        f"(elapsed={_budget.elapsed:.1f}s)."
+                    )
+                # Map from the filtered (valid-only) weight index back to the
+                # global candidate index so names/log sums stay aligned (§4.2).
+                valid_idx = np.where(valid_mask)[0]
+                self.nan_valid_idx_ = valid_idx
 
-                val_preds_orig = self.y_scaler_.inverse_transform(
-                    val_preds_scaled.reshape(-1, 1)
-                ).reshape(val_preds_scaled.shape)
+                val_preds_orig = self.y_scaler_.inverse_transform(val_preds_scaled.reshape(-1, 1)).reshape(
+                    val_preds_scaled.shape
+                )
                 if not np.isfinite(val_preds_orig).all():
                     n_bad = int((~np.isfinite(val_preds_orig)).sum())
-                    val_preds_orig = np.nan_to_num(
-                        val_preds_orig, nan=0.0, posinf=0.0, neginf=0.0
-                    )
+                    val_preds_orig = np.nan_to_num(val_preds_orig, nan=0.0, posinf=0.0, neginf=0.0)
                     print(
                         f"[TabLDM:enhance] WARNING: val inverse transform produced {n_bad} "
                         f"NaN/Inf values, replaced with 0.0"
                     )
 
-                n_base_valid = val_preds_orig.shape[0]
-
-                # HK single-validation predictions
+                # HK single-validation predictions (kinds travel with rows)
+                sv_hk_kinds: list[str] = []
                 if self.hk_triggered_:
                     sv_hk_infos = self._make_hk_generators(X_tr, y_tr_orig_sv, seed_offset=0)
-                    sv_hk_preds = self._collect_hk_val_predictions_orig(X_val, sv_hk_infos)
+                    sv_hk_preds, sv_hk_kinds = self._collect_hk_val_predictions_orig(X_val, sv_hk_infos)
                     if sv_hk_preds.shape[0] > 0:
                         val_preds_orig = np.concatenate([val_preds_orig, sv_hk_preds], axis=0)
-                        print(f"[TabLDM:hk] appended {sv_hk_preds.shape[0]} HK val rows; total={val_preds_orig.shape[0]}")
+                        # print(
+                            # f"[TabLDM:hk] appended {sv_hk_preds.shape[0]} HK val rows; total={val_preds_orig.shape[0]}"
+                        # )
 
-                print(f"[TabLDM:enhance] val_predictions shape={val_preds_orig.shape}")
+                # print(f"[TabLDM:enhance] val_predictions shape={val_preds_orig.shape}")
 
-                # NNLS
+                names_w = [self._candidate_name(int(gi)) for gi in valid_idx]
+                names_w += [f"hk_{kind}[{i}]" for i, kind in enumerate(sv_hk_kinds)]
+
+                # ---- slot-level NNLS: diagnostics only (§2.7: support is noise) ----
                 raw_weights, _ = _scipy_nnls(val_preds_orig.T, y_val_orig)
                 w_sum = raw_weights.sum()
                 n_nonzero = int((raw_weights > 0).sum())
@@ -1889,54 +2012,69 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     weights = np.ones(val_preds_orig.shape[0]) / val_preds_orig.shape[0]
                     w_sum = 1.0
 
-                n_main = self.n_estimators
-                n_q = self.n_quantile_estimators if (self.n_quantile_estimators or 0) > 0 else 0
-                n_qs = self.n_quantile_svd_estimators if (self.n_quantile_svd_estimators or 0) > 0 else 0
-                n_svd_ens = self.n_svd_ens_estimators if getattr(self, "svd_ens_generator_", None) is not None else 0
-                vm = valid_mask
+                # Log group-level weight sums aggregated by candidate-name
+                # prefix (§1.7 / §4.1: the old integer-slice `_group_sum` mixed
+                # up relative and absolute indices and made w_default ==
+                # w_svd/cross always).  HK rows appended above sit after the
+                # base candidates and are named via their recorded kinds.
 
-                # Weight position of a kept original index i is its rank among
-                # np.where(vm)[0] (NaN-filtered base rows keep original order).
-                wpos = np.where(vm)[0]
-                w_base = weights[:len(wpos)]
+                def _sum_prefixes(*prefixes: str) -> float:
+                    total = 0.0
+                    for nm, w in zip(names_w, weights, strict=False):
+                        if any(nm.startswith(p) for p in prefixes):
+                            total += float(w)
+                    return total
 
-                def _group_sum(start, end):
-                    """Sum weights for original-index range [start, end) after filtering."""
-                    sel = (wpos >= start) & (wpos < end)
-                    return float(w_base[sel].sum()) if sel.any() else 0.0
-
-                w_default = _group_sum(0, n_main // 2) if n_main >= 2 else _group_sum(0, n_main)
-                w_svd = _group_sum(n_main // 2, n_main) if n_main >= 2 else 0.0
-                w_q = _group_sum(n_main, n_main + n_q)
-                qs_start = n_main + n_q
-                qs_sel = (wpos >= qs_start) & (wpos < qs_start + n_qs)
-                qs_orig = wpos[qs_sel]
-                qs_w = w_base[qs_sel]
-                w_qs_even = float(qs_w[qs_orig % 2 == 0].sum()) if len(qs_orig) > 0 else 0.0
-                w_qs_odd = float(qs_w[qs_orig % 2 == 1].sum()) if len(qs_orig) > 1 else 0.0
-                w_svd_ens = _group_sum(n_main + n_q + n_qs, n_main + n_q + n_qs + n_svd_ens)
-                n_hk_sv = val_preds_orig.shape[0] - n_base_valid
-                w_hk = float(weights[n_base_valid:].sum()) if n_hk_sv > 0 else 0.0
-                print(
-                    f"[TabLDM:enhance] NNLS: n_nonzero={n_nonzero}/{len(weights)}, "
-                    f"weights.sum()={w_sum:.4f}, "
-                    f"w_default={w_default:.4f}, w_svd/cross={w_svd:.4f}, "
-                    f"w_quantile={w_q:.4f}, "
-                    f"w_quantile_svd_even(plain)={w_qs_even:.4f}, "
-                    f"w_quantile_svd_odd(svd+cross)={w_qs_odd:.4f}, "
-                    f"w_svd_ens(group6)={w_svd_ens:.4f}, w_hk={w_hk:.4f}"
-                )
-                weight_labels = self._nnls_weight_labels(vm, len(weights))
-                nonzero_str = ", ".join(
-                    f"{weight_labels[i]:s}={weights[i]:.4f}"
-                    for i in range(len(weights)) if weights[i] > 0
-                )
+                w_default = _sum_prefixes("default")
+                w_svd = _sum_prefixes("svd+cross")
+                w_q = _sum_prefixes("quantile")
+                w_hk = _sum_prefixes("hk")
+                # print(
+                    # f"[TabLDM:enhance] NNLS (diagnostic): n_nonzero={n_nonzero}/{len(weights)}, "
+                    # f"weights.sum()={w_sum:.4f}, "
+                    # f"w_main={w_default + w_svd:.4f} "
+                    # f"(w_default={w_default:.4f}, w_svd/cross={w_svd:.4f}), "
+                    # f"w_quantile={w_q:.4f}, w_hk={w_hk:.4f}"
+                # )
+                # §4.2: index the *global* candidate name, not the filtered
+                # weight position (wrong the moment NaN filtering drops one).
+                nonzero_str = ", ".join(f"{nm}={w:.4f}" for nm, w in zip(names_w, weights, strict=False) if w > 0)
                 print(f"[TabLDM:enhance] NNLS nonzero weights: {nonzero_str}")
                 self.nnls_weights_ = weights
+                self.nnls_weight_map_ = {nm: float(w) for nm, w in zip(names_w, weights, strict=False) if w > 0}
+
+                # ---- holdout shrinkage targets (v3.1 §3.6) ----
+                # pi_hold = the *group masses* of the slot-level NNLS (smooth,
+                # never cornering).  The slot weights themselves only feed the
+                # rho-blend in _combine_predictions (within-group reweighting).
+                pi_hold = self._slot_group_mass(weights, names_w)
+                if not pi_hold:
+                    pi_hold = dict(pi_0)
+                n_val_rows = int(y_val_orig.shape[0])
+                lam = (
+                    float(self.shrink_lambda)
+                    if self.shrink_lambda is not None
+                    else n_val_rows / (n_val_rows + self.shrink_kappa)
+                )
+                lam = min(max(lam, 0.0), 1.0)
+                self.group_prior_holdout_ = dict(pi_hold)
+                self.shrink_lambda_ = lam
+                rho = float(self.slot_blend_rate)
+                # print(
+                    # f"[TabLDM:enhance] holdout shrinkage: lambda={lam:.4f} "
+                    # f"(n_val={n_val_rows}, kappa={self.shrink_kappa}), rho={rho:.4f}, "
+                    # f"blend={1.0 - lam:.4f}*mix(pi_0) + {lam * (1.0 - rho):.4f}*mix(pi_hold) "
+                    # f"+ {lam * rho:.4f}*slot_nnls, "
+                    # f"pi_0=({pi_0.get('main', 0.0):.4f}, {pi_0.get('quantile', 0.0):.4f}, "
+                    # f"{pi_0.get('hk', 0.0):.4f}), "
+                    # f"pi_hold=({pi_hold.get('main', 0.0):.4f}, {pi_hold.get('quantile', 0.0):.4f}, "
+                    # f"{pi_hold.get('hk', 0.0):.4f})"
+                # )
 
         else:
             # ---- Non-enhanced path ----
             self.hk_triggered_ = False
+            self.feat_sample_indices_ = None
             self.ensemble_generator_ = EnsembleGenerator(
                 classification=False,
                 n_estimators=self.n_estimators,
@@ -1965,13 +2103,14 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
     # ==================================================================
 
     def predict(
-        self, X: np.ndarray, output_type: str | list[str] = "mean", alphas: Optional[List[float]] = None
+        self, X: np.ndarray, output_type: str | list[str] = "mean", alphas: list[float] | None = None
     ) -> np.ndarray | dict[str, np.ndarray]:
         """Predict target values for test samples.
 
-        When ``enhance_candidates=True`` (and ``fit()`` was called with that flag),
-        applies the full multi-group ensemble pipeline with NNLS weighting.
-        Otherwise, runs the plain single-group predict path.
+        When ``enhance_candidates=True`` (and ``fit()`` was called with that
+        flag), applies the two-level holdout shrinkage of
+        ``_combine_predictions`` (group prior + holdout group masses + slot
+        NNLS).  Otherwise, runs the plain single-group predict path.
         """
         check_is_fitted(self)
         if isinstance(X, np.ndarray) and len(X.shape) == 1:
@@ -1993,13 +2132,15 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         if self.n_jobs is not None:
             assert self.n_jobs != 0
             import multiprocessing as mp
+
             old_n_threads = torch.get_num_threads()
             n_logical_cores = mp.cpu_count()
             if self.n_jobs > 0:
                 if self.n_jobs > n_logical_cores:
                     warnings.warn(
                         f"TabLDM got n_jobs={self.n_jobs} but there are only {n_logical_cores} logical cores available."
-                        f" Only {n_logical_cores} threads will be used."
+                        f" Only {n_logical_cores} threads will be used.",
+                        stacklevel=2,
                     )
                 n_threads = max(n_logical_cores, self.n_jobs)
             else:
@@ -2018,7 +2159,9 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 results = {key: [] for key in output_type}
                 for norm_method, (Xs_test,) in test_data.items():
                     kv_cache = self.model_kv_cache_[norm_method]
-                    batch_out = self._batch_forward_with_cache(Xs_test, kv_cache, output_type=output_type, alphas=alphas)
+                    batch_out = self._batch_forward_with_cache(
+                        Xs_test, kv_cache, output_type=output_type, alphas=alphas
+                    )
                     if isinstance(batch_out, dict):
                         for key in output_type:
                             results[key].append(batch_out[key])
@@ -2045,7 +2188,9 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     final_results[key] = np.mean(arr, axis=0)
                 else:
                     n_quantiles = arr.shape[2]
-                    arr = self.y_scaler_.inverse_transform(arr.reshape(-1, 1)).reshape(n_estimators, n_samples, n_quantiles)
+                    arr = self.y_scaler_.inverse_transform(arr.reshape(-1, 1)).reshape(
+                        n_estimators, n_samples, n_quantiles
+                    )
                     final_results[key] = np.mean(arr, axis=0)
 
             if self.n_jobs is not None:
@@ -2057,12 +2202,10 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         # ---- Enhanced path ----
         output_type = ["mean"]  # enhanced path only supports mean
         results = {key: [] for key in output_type}
+        fsi = getattr(self, "feat_sample_indices_", None)
 
         # Main group
-        use_augment = (
-            getattr(self, "svd_", None) is not None
-            and self.n_estimators == 32
-        )
+        use_augment = getattr(self, "svd_", None) is not None and self.n_estimators == 32
         if use_augment:
             data = self.ensemble_generator_.transform(X, mode="both")
             X_raw_test = self.ensemble_generator_.unique_filter_.transform(X)
@@ -2090,7 +2233,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 per_est_preds = {}
 
                 if even_idxs:
-                    fi = self._feat_indices_for(even_global, Xs_both.shape[-1])
+                    fi = [fsi[g] for g in even_global] if fsi is not None else None
                     bout = self._batch_forward(
                         Xs_both[even_idxs], ys[even_idxs], output_type=output_type, feat_indices=fi
                     )
@@ -2100,19 +2243,14 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
                 if odd_idxs:
                     Xs_odd_list = []
-                    for li, ol, g in zip(odd_idxs, odd_locals, odd_global):
-                        # Subsample base columns before the cross/SVD concat so
-                        # the augmented tail keeps its own layout.
-                        x_both_i = self._apply_feat_sample(Xs_both[li], g)
-                        x_tr = self._augment_estimator(
-                            x_both_i[:n_train_rows], X_raw_train, ol, is_train=True)
-                        x_te = self._augment_estimator(
-                            x_both_i[n_train_rows:], X_raw_test, ol, is_train=False)
+                    for li, ol in zip(odd_idxs, odd_locals, strict=False):
+                        x_both_i = Xs_both[li]
+                        x_tr = self._augment_estimator(x_both_i[:n_train_rows], X_raw_train, ol, is_train=True)
+                        x_te = self._augment_estimator(x_both_i[n_train_rows:], X_raw_test, ol, is_train=False)
                         Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
                     Xs_odd = np.stack(Xs_odd_list, axis=0)
-                    bout = self._batch_forward(
-                        Xs_odd, ys[odd_idxs], output_type=output_type
-                    )
+                    fi = [fsi[g] for g in odd_global] if fsi is not None else None
+                    bout = self._batch_forward(Xs_odd, ys[odd_idxs], output_type=output_type, feat_indices=fi)
                     preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                     for i, li in enumerate(odd_idxs):
                         per_est_preds[li] = preds_val[i]
@@ -2128,7 +2266,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             _grp_offset = 0
             for norm_method, (Xs, ys) in data.items():
                 n_est = Xs.shape[0]
-                fi = self._feat_indices_for(range(_grp_offset, _grp_offset + n_est), Xs.shape[-1])
+                fi = [fsi[_grp_offset + i] for i in range(n_est)] if fsi is not None else None
                 bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
                 if isinstance(bout, dict):
                     for key in output_type:
@@ -2141,10 +2279,10 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         q_gen = getattr(self, "quantile_ensemble_generator_", None)
         if q_gen is not None:
             q_data = q_gen.transform(X, mode="both")
-            _q_offset = self.n_estimators
+            _q_offset = getattr(self, "n_main_actual_", self.n_estimators)
             for norm_method, (Xs, ys) in q_data.items():
                 n_est = Xs.shape[0]
-                fi = self._feat_indices_for(range(_q_offset, _q_offset + n_est), Xs.shape[-1])
+                fi = [fsi[_q_offset + i] for i in range(n_est)] if fsi is not None else None
                 bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
                 if isinstance(bout, dict):
                     for key in output_type:
@@ -2153,145 +2291,51 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     results[output_type[0]].append(bout)
                 _q_offset += n_est
 
-        # Quantile-SVD group (group 3): even = plain quantile views,
-        # odd = SVD+cross augmented when the group count is 32.
-        qs_gen = getattr(self, "quantile_svd_ensemble_generator_", None)
-        if qs_gen is not None:
-            qs_use_augment = (
-                getattr(self, "_q_svd_", None) is not None
-                and self.n_quantile_svd_estimators == 32
-            )
-            _qs_offset = self.n_estimators + (self.n_quantile_estimators or 0)
-            if qs_use_augment:
-                qs_data = qs_gen.transform(X, mode="both")
-                X_raw_test_qs = qs_gen.unique_filter_.transform(X)
-                X_raw_train_qs = qs_gen.X_
-
-                q_global_est_idx = 0
-                q_odd_local = 0
-                for norm_method, (Xs_both, ys) in qs_data.items():
-                    n_est_this_method = Xs_both.shape[0]
-                    n_train_rows = ys.shape[1]
-
-                    even_idxs, odd_idxs, odd_locals = [], [], []
-                    even_global, odd_global = [], []
-                    for local in range(n_est_this_method):
-                        if q_global_est_idx % 2 == 0:
-                            even_idxs.append(local)
-                            even_global.append(q_global_est_idx)
-                        else:
-                            odd_idxs.append(local)
-                            odd_locals.append(q_odd_local)
-                            odd_global.append(q_global_est_idx)
-                            q_odd_local += 1
-                        q_global_est_idx += 1
-
-                    per_est_preds = {}
-
-                    if even_idxs:
-                        fi = self._feat_indices_for([_qs_offset + g for g in even_global], Xs_both.shape[-1])
-                        bout = self._batch_forward(
-                            Xs_both[even_idxs], ys[even_idxs], output_type=output_type,
-                            alphas=alphas, feat_indices=fi
-                        )
-                        preds_te = bout if not isinstance(bout, dict) else bout["mean"]
-                        for i, li in enumerate(even_idxs):
-                            per_est_preds[li] = preds_te[i]
-
-                    if odd_idxs:
-                        Xs_odd_list = []
-                        for li, ol, g in zip(odd_idxs, odd_locals, odd_global):
-                            # Subsample base columns before the cross/SVD concat
-                            # so the augmented tail keeps its own layout.
-                            x_both_i = self._apply_feat_sample(Xs_both[li], _qs_offset + g)
-                            x_tr = self._augment_estimator(
-                                x_both_i[:n_train_rows], X_raw_train_qs, ol, is_train=True,
-                                attr_prefix="_q_")
-                            x_te = self._augment_estimator(
-                                x_both_i[n_train_rows:], X_raw_test_qs, ol, is_train=False,
-                                attr_prefix="_q_")
-                            Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
-                        Xs_odd = np.stack(Xs_odd_list, axis=0)
-                        bout = self._batch_forward(
-                            Xs_odd, ys[odd_idxs], output_type=output_type,
-                            alphas=alphas
-                        )
-                        preds_te = bout if not isinstance(bout, dict) else bout["mean"]
-                        for i, li in enumerate(odd_idxs):
-                            per_est_preds[li] = preds_te[i]
-
-                    for key in output_type:
-                        stacked = np.stack(
-                            [per_est_preds[li] for li in range(n_est_this_method)], axis=0
-                        )
-                        results[key].append(stacked)
-            else:
-                qs_data = qs_gen.transform(X, mode="both")
-                for norm_method, (Xs, ys) in qs_data.items():
-                    n_est = Xs.shape[0]
-                    fi = self._feat_indices_for(range(_qs_offset, _qs_offset + n_est), Xs.shape[-1])
-                    bout = self._batch_forward(Xs, ys, output_type=output_type, alphas=alphas, feat_indices=fi)
-                    if isinstance(bout, dict):
-                        for key in output_type:
-                            results[key].append(bout[key])
-                    else:
-                        results[output_type[0]].append(bout)
-                    _qs_offset += n_est
-
-        # Independent SVD group (group 4)
-        svd_ens_gen = getattr(self, "svd_ens_generator_", None)
-        if svd_ens_gen is not None:
-            svd_ens_data = svd_ens_gen.transform(X, mode="both")
-            _svd_ens_offset = (
-                self.n_estimators
-                + (self.n_quantile_estimators or 0)
-                + (self.n_quantile_svd_estimators or 0)
-            )
-            for norm_method, (Xs, ys) in svd_ens_data.items():
-                n_est = Xs.shape[0]
-                fi = self._feat_indices_for(range(_svd_ens_offset, _svd_ens_offset + n_est), Xs.shape[-1])
-                bout = self._batch_forward(Xs, ys, output_type=output_type, alphas=alphas, feat_indices=fi)
-                if isinstance(bout, dict):
-                    for key in output_type:
-                        results[key].append(bout[key])
-                else:
-                    results[output_type[0]].append(bout)
-                _svd_ens_offset += n_est
-
-        # Collect HK test predictions in original scale
+        # Collect HK test predictions in original scale (kinds travel with rows)
         hk_preds_orig = None
+        hk_names: list[str] = []
         hk_infos_full = getattr(self, "hk_generators_", [])
         if self.hk_triggered_ and hk_infos_full:
-            _hk_p = self._collect_hk_test_predictions_orig(X, hk_infos_full)
+            _hk_p, _hk_kinds = self._collect_hk_test_predictions_orig(X, hk_infos_full)
             if _hk_p.ndim == 2 and _hk_p.shape[0] > 0:
                 hk_preds_orig = _hk_p
+                hk_names = [f"hk_{kind}[{i}]" for i, kind in enumerate(_hk_kinds)]
 
-        # Combine predictions
-        use_nnls = (
-            getattr(self, "nnls_weights_", None) is not None
-            and self.validation
-        )
+        # ---- v3.1 combine: two-level holdout shrinkage (§3.5-3.6) ----
+        #   holdout_pred = (1 - rho) * mix(pi_hold) + rho * slot_nnls
+        #   pred = (1 - lambda) * mix(pi_0) + lambda * holdout_pred
         nan_valid_mask = getattr(self, "nan_valid_mask_", None)
+        if getattr(self, "group_prior_", None) is None:
+            # fit() did not run the enhancement path (or was unpickled from an
+            # older version) — fall back to a sane prior on the groups that
+            # actually exist so predictions stay well-defined.
+            self.group_prior_ = {"main": 0.60, "quantile": 0.30, "hk": 0.20}
+
         final_results = {}
         for key in output_type:
             arr = np.concatenate(results[key], axis=0)
-            if nan_valid_mask is not None and len(nan_valid_mask) == arr.shape[0]:
-                arr = arr[nan_valid_mask]
-            n_estimators = arr.shape[0]
+            n_base = arr.shape[0]
             n_samples = arr.shape[1]
 
-            if self.verbose:
-                main_n = self.n_estimators
-                q_n = self.n_quantile_estimators if getattr(self, "quantile_ensemble_generator_", None) is not None else 0
-                qs_n = self.n_quantile_svd_estimators if getattr(self, "quantile_svd_ensemble_generator_", None) is not None else 0
-                svd_ens_n = self.n_svd_ens_estimators if getattr(self, "svd_ens_generator_", None) is not None else 0
-                print(
-                    f"[TabLDM:enhance] Predictions merged: main={main_n}, quantile={q_n}, "
-                    f"quantile_svd={qs_n}, svd_ens(group6)={svd_ens_n}, "
-                    f"total={n_estimators}, shape={arr.shape}"
-                )
+            base_names = list(getattr(self, "candidate_names_", []) or [])
+            if len(base_names) != n_base:
+                base_names = [self._candidate_name(i) for i in range(n_base)]
+            if nan_valid_mask is not None and len(nan_valid_mask) == n_base:
+                sel = np.asarray(nan_valid_mask, dtype=bool)
+                row_names = [base_names[i] for i in np.where(sel)[0]]
+                arr = arr[sel]
+            else:
+                row_names = base_names
+            n_estimators = arr.shape[0]
 
-            fr = self.foundation_rate
+            if self.verbose:
+                main_n = getattr(self, "n_main_actual_", self.n_estimators)
+                q_n = getattr(self, "n_quantile_actual_", 0)
+                # print(
+                    # f"[TabLDM:enhance] Predictions merged: main={main_n}, quantile={q_n}, "
+                    # f"total={n_estimators}, shape={arr.shape}"
+                # )
+
             if arr.ndim == 2:
                 arr = self.y_scaler_.inverse_transform(arr.reshape(-1, 1)).reshape(n_estimators, n_samples)
                 if not np.isfinite(arr).all():
@@ -2300,31 +2344,17 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 # Append HK predictions (already in original scale)
                 if hk_preds_orig is not None and key == "mean":
                     arr = np.concatenate([arr, hk_preds_orig.astype(np.float64)], axis=0)
-                    n_estimators = arr.shape[0]
+                    row_names = row_names + hk_names
 
-                if use_nnls:
-                    w = self.nnls_weights_
-                    if len(w) != n_estimators:
-                        w = np.ones(n_estimators) / n_estimators
-                    nnls_pred = w @ arr
-                    foundation_pred = _safe_ensemble_mean(arr, axis=0)
-                    final_results[key] = (1.0 - fr) * nnls_pred + fr * foundation_pred
-                else:
-                    final_results[key] = _safe_ensemble_mean(arr, axis=0)
+                final_results[key] = self._combine_predictions(arr, row_names)
             else:
                 n_quantiles = arr.shape[2]
                 arr = self.y_scaler_.inverse_transform(arr.reshape(-1, 1)).reshape(n_estimators, n_samples, n_quantiles)
                 if not np.isfinite(arr).all():
                     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-                if use_nnls:
-                    w = self.nnls_weights_
-                    if len(w) != n_estimators:
-                        w = np.ones(n_estimators) / n_estimators
-                    nnls_pred = np.einsum("e,enq->nq", w, arr)
-                    foundation_pred = np.mean(arr, axis=0)
-                    final_results[key] = (1.0 - fr) * nnls_pred + fr * foundation_pred
-                else:
-                    final_results[key] = np.mean(arr, axis=0)
+                # Multi-quantile output: the mixture is taken over the
+                # candidate axis, so the same combine math applies.
+                final_results[key] = self._combine_predictions(arr, row_names)
 
         if self.n_jobs is not None:
             torch.set_num_threads(old_n_threads)
@@ -2363,8 +2393,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             parent_config = {
                 key: value
                 for key, value in config.items()
-                if key not in ("global_dilation", "global_max_span")
-                and not key.startswith("icl_moe_")
+                if key not in ("global_dilation", "global_max_span") and not key.startswith("icl_moe_")
             }
             for legacy_name, native_name in {
                 "icl_moe_num_experts": "moe_num_experts",
@@ -2415,16 +2444,11 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             try:
                 missing, unexpected = self.model_.load_state_dict(model_state_dict, strict=False)
             except RuntimeError as exc:
-                raise RuntimeError(
-                    "Failed to load saved MoE model weights; file may be incompatible."
-                ) from exc
-            bad_missing, bad_unexpected = _moe_load_mismatch(
-                set(self.model_.state_dict().keys()), missing, unexpected
-            )
+                raise RuntimeError("Failed to load saved MoE model weights; file may be incompatible.") from exc
+            bad_missing, bad_unexpected = _moe_load_mismatch(set(self.model_.state_dict().keys()), missing, unexpected)
             if bad_missing or bad_unexpected:
                 raise RuntimeError(
-                    "Failed to load saved MoE model weights; "
-                    f"missing={bad_missing}, unexpected={bad_unexpected}"
+                    f"Failed to load saved MoE model weights; missing={bad_missing}, unexpected={bad_unexpected}"
                 )
             self.model_.eval()
         else:

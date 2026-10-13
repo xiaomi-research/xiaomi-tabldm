@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 import copy
+import time
 import pickle
 import warnings
 from pathlib import Path
@@ -51,6 +52,56 @@ def _check_version_compatibility(metadata: dict) -> None:
             )
 
 
+def _reserve(time_limit: float) -> float:
+    """Seconds held back from the candidate budget for NNLS + calibration."""
+    return max(5.0, 0.02 * float(time_limit))
+
+
+class _FitBudget:
+    """Wall-clock budget for one fit, checked between estimator batches.
+
+    ``time_limit=None`` means unlimited: ``expired()`` is then always False and
+    every checkpoint short-circuits, so the fit behaves exactly as it would
+    without a budget. The limit is checked *between* estimator batches, so a
+    fit may overshoot by at most one batch forward (``batch_size_`` candidates).
+
+    ``n_batches_done`` counts completed batches across the whole fit. It drives
+    the "always finish at least one batch" floor: truncation only ever happens
+    after a batch has completed, so a fitted model always has >= 1 candidate
+    and ``out_shapes`` is known before the first NaN fill.
+    """
+
+    def __init__(self, time_limit: float | None, *, reserve: float = 0.0):
+        self.time_limit = None if time_limit is None else max(float(time_limit), 0.0)
+        self._start = time.monotonic()
+        self._deadline = (
+            None if self.time_limit is None else self._start + self.time_limit - reserve
+        )
+        self.n_batches_done = 0
+        #: Per-output trailing shape recorded at the first completed batch, so
+        #: a later call can NaN-fill without re-running the model. Keyed by the
+        #: output name (the classifier uses a single key).
+        self.out_shapes: dict[str, tuple[int, ...]] = {}
+        self.n_truncated = 0
+
+    @property
+    def unlimited(self) -> bool:
+        return self._deadline is None
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self._start
+
+    @property
+    def remaining(self) -> float | None:
+        if self._deadline is None:
+            return None
+        return self._deadline - time.monotonic()
+
+    def expired(self) -> bool:
+        return self._deadline is not None and time.monotonic() >= self._deadline
+
+
 class TabLDMBaseEstimator(BaseEstimator):
     """Base class for TabLDM scikit-learn estimators.
 
@@ -75,103 +126,14 @@ class TabLDMBaseEstimator(BaseEstimator):
         tags.non_deterministic = True
         return tags
 
-    def _normalize_devices(self, device) -> list:
-        """Normalize the user-facing ``device`` parameter into a device list.
-
-        Supported values are a single device (``"cpu"``, ``"cuda"``,
-        ``"cuda:0"``), a comma-separated string (``"cuda:0,cuda:1"``), or an
-        iterable of devices.  The first entry is treated as the primary device
-        and is exposed as ``self.device_`` for backwards compatibility.
-        """
-        if device is None:
-            items = ["cuda" if torch.cuda.is_available() else "cpu"]
-        elif isinstance(device, (list, tuple)):
-            items = list(device)
-        elif isinstance(device, str):
-            stripped = device.strip()
-            if "," in stripped:
-                items = [item.strip() for item in stripped.split(",") if item.strip()]
-            else:
-                items = [stripped]
-        elif isinstance(device, torch.device):
-            items = [device]
-        else:
-            raise TypeError(
-                f"device must be None, str, torch.device, or an iterable of devices; got {type(device).__name__}"
-            )
-
-        if not items:
-            items = ["cpu"]
-
-        devices = []
-        seen = set()
-        for item in items:
-            # Accept bare numeric device IDs as a convenience; e.g. "0,1,2,3"
-            # means cuda:0,cuda:1,cuda:2,cuda:3.
-            if isinstance(item, str) and item.strip().isdigit():
-                item = f"cuda:{item.strip()}"
-            dev = item if isinstance(item, torch.device) else torch.device(item)
-            if dev.type == "cuda" and not torch.cuda.is_available():
-                raise ValueError("CUDA device requested but torch.cuda.is_available() is False")
-            if dev.type == "cuda" and dev.index is not None and dev.index >= torch.cuda.device_count():
-                raise ValueError(
-                    f"CUDA device {dev} requested but only {torch.cuda.device_count()} device(s) are visible"
-                )
-            key = (dev.type, dev.index)
-            if key not in seen:
-                seen.add(key)
-                devices.append(dev)
-        return devices
-
     def _resolve_device(self) -> None:
-        """Resolve the target device(s) from the init parameter.
-
-        ``self.device_`` remains the primary device for backwards
-        compatibility; ``self.devices_`` contains every device to use.
-        """
-        devices = self._normalize_devices(self.device)
-        previous_devices = getattr(self, "devices_", None)
-        self.devices_ = devices
-        self.device_ = devices[0]
-        if previous_devices != devices:
-            self._model_replicas_ = {}
-            self._inference_config_replicas_ = {}
-
-    def _model_for_device(self, device: torch.device):
-        """Return the model instance to run on ``device``.
-
-        The primary device uses ``self.model_`` directly.  Additional CUDA
-        devices get a lazily-created deep-copy replica on their own device.
-        """
-        devices = getattr(self, "devices_", [self.device_])
-        if len(devices) <= 1 or device == self.device_:
-            return self.model_
-
-        if not hasattr(self, "_model_replicas_"):
-            self._model_replicas_ = {}
-        replica = self._model_replicas_.get(device)
-        if replica is None:
-            replica = copy.deepcopy(self.model_)
-            replica.to(device)
-            replica.eval()
-            self._model_replicas_[device] = replica
-        return replica
-
-    def _inference_config_for_device(self, device: torch.device):
-        """Return an inference config whose manager devices point to ``device``."""
-        devices = getattr(self, "devices_", [self.device_])
-        if len(devices) <= 1 or device == self.device_:
-            return self.inference_config_
-
-        if not hasattr(self, "_inference_config_replicas_"):
-            self._inference_config_replicas_ = {}
-        config = self._inference_config_replicas_.get(device)
-        if config is None:
-            config = copy.deepcopy(self.inference_config_)
-            for attr in ("COL_CONFIG", "ROW_CONFIG", "ICL_CONFIG"):
-                getattr(config, attr).update({"device": device})
-            self._inference_config_replicas_[device] = config
-        return config
+        """Resolve the target device from the init parameter."""
+        if self.device is None:
+            self.device_ = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif isinstance(self.device, str):
+            self.device_ = torch.device(self.device)
+        else:
+            self.device_ = self.device
 
     def _resolve_amp_fa3(self) -> tuple:
         """Resolve the ``"auto"`` option for ``use_amp`` and ``use_fa3``.
@@ -358,6 +320,8 @@ class TabLDMBaseEstimator(BaseEstimator):
           references. Rebuilt from init parameters.
         - ``model_path_`` — Absolute filesystem path to the checkpoint; almost
           certainly invalid on another machine.
+        - ``_fit_budget_`` — Fit-time wall-clock scratch; meaningless after fit
+          returns and must not leak into a loaded model's predict path.
 
         **Optionally included (controlled by ``save()`` flags):**
 
@@ -385,11 +349,11 @@ class TabLDMBaseEstimator(BaseEstimator):
 
         # Always exclude device-specific and reconstructable attributes
         state.pop("device_", None)
-        state.pop("devices_", None)
         state.pop("inference_config_", None)
         state.pop("model_path_", None)
-        state.pop("_model_replicas_", None)
-        state.pop("_inference_config_replicas_", None)
+        # Fit-time scratch: the wall-clock budget is meaningless after fit
+        # returns (and must never leak into a loaded model's predict path).
+        state.pop("_fit_budget_", None)
 
         # Handle model weights
         if save_model_weights and hasattr(self, "model_"):
@@ -451,8 +415,6 @@ class TabLDMBaseEstimator(BaseEstimator):
             return
 
         # Resolve device
-        self._model_replicas_ = {}
-        self._inference_config_replicas_ = {}
         self._resolve_device()
 
         # Reload or reconstruct model
@@ -570,8 +532,6 @@ class TabLDMBaseEstimator(BaseEstimator):
 
         if device is not None:
             obj.device = device
-            obj._model_replicas_ = {}
-            obj._inference_config_replicas_ = {}
             obj._resolve_device()
             obj.model_.to(obj.device_)
             obj._build_inference_config()
