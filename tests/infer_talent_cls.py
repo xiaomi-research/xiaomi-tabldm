@@ -417,7 +417,11 @@ def main():
     ap.add_argument("--n-estimators", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--seed-num", type=int, default=5, help="#trials (referenced original evaluation uses 5)")
-    ap.add_argument("--device", default="auto")
+    ap.add_argument(
+        "--device",
+        default="auto",
+        help="inference device: auto, cpu, cuda, cuda:0, or comma-separated GPU ids (0,1,2,3) / cuda:0,cuda:1 for multi-GPU",
+    )
     ap.add_argument(
         "--cat_random", "--cat_randomEncode", dest="cat_random_encode",
         action="store_true",
