@@ -28,7 +28,7 @@
 - **[28 Sept 2026] 🚀 Updated Xiaomi-TabLDM weights.** 
   Updated the Xiaomi-TabLDM weights for regression ([reg_default.ckpt](https://huggingface.co/occams/Xiaomi-TabLDM/blob/main/checkpoints/reg_default.ckpt)).
 - **[5 Sept 2026] 🚀 Xiaomi-TabLDM officially released.**
-  The Xiaomi-TabLDM technical report is released on [arxiv](https://arxiv.org/abs/2609.03880). The Xiaomi-TabLDM weights ([`reg_default.ckpt` and `clf_default.ckpt`](https://huggingface.co/occams/Xiaomi-TabLDM/tree/main/checkpoints)) and inference code are released with this repository. Usage is subject to [Apache License 2.0](https://github.com/xiaomi-research/xiaomi-tabldm/blob/main/LICENSE).
+  The Xiaomi-TabLDM technical report is released on [arxiv](https://arxiv.org/abs/2609.03880). The Xiaomi-TabLDM weights ([`reg_default.ckpt` and `clf_default.ckpt`](https://huggingface.co/occams/Xiaomi-TabLDM/tree/main/checkpoints)) and inference code are released with this repository. The project is open-sourced under the [Apache License 2.0](https://github.com/xiaomi-research/xiaomi-tabldm/blob/main/LICENSE).
 
 
 ---
