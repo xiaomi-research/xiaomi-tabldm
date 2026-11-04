@@ -59,7 +59,7 @@ from sklearn.model_selection import KFold, train_test_split
 from sklearn.preprocessing import OneHotEncoder, PowerTransformer, StandardScaler
 from sklearn.utils.validation import check_is_fitted
 
-from .base import TabLDMBaseEstimator, _FitBudget, _reserve
+from .base import TabLDMBaseEstimator
 from .preprocessing import EnsembleGenerator, TransformToNumerical
 from .sklearn_utils import _moe_load_mismatch, _num_samples, validate_data
 
@@ -601,22 +601,12 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         """Run each HK estimator on val set, return (n_hk_valid, n_val) in ORIGINAL scale."""
         output_type = ["mean"]
         all_preds = []
-        # Fit-only helper: HK is optional enrichment, so once the fit budget is
-        # spent stop here rather than forward rows we would have to drop.
-        # Skipping keeps the surviving HK kinds aligned with their rows.
-        budget = getattr(self, "_fit_budget_", None)
         for hk in hk_infos:
             gen = hk["gen"]
-            if budget is not None and budget.expired() and budget.n_batches_done > 0:
-                print(
-                    f"[TabLDM:time_limit] HK val collection stopped early "
-                    f"({len(all_preds)}/{len(hk_infos)} done, elapsed={budget.elapsed:.1f}s)."
-                )
-                break
             try:
                 data = gen.transform(X_val, mode="both")
                 for Xs, ys in data.values():
-                    bout = self._batch_forward(Xs, ys, output_type=output_type, budget=budget)
+                    bout = self._batch_forward(Xs, ys, output_type=output_type)
                     p = bout if not isinstance(bout, dict) else bout["mean"]
                     p_orig = self._hk_inverse(p[0], hk)
                     if not np.all(np.isfinite(p_orig)):
@@ -838,7 +828,6 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         output_type: str | list[str] = "mean",
         alphas: Optional[List[float]] = None,
         feat_indices: Optional[List[np.ndarray]] = None,
-        budget: Optional[_FitBudget] = None,
     ) -> np.ndarray | dict[str, np.ndarray]:
         """Process model forward passes in batches, optionally across GPUs.
 
@@ -847,15 +836,6 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         entry means "keep every column" for that row.  When ``self.devices_``
         contains more than one device, estimator rows are partitioned across
         devices and evaluated concurrently, then concatenated in original order.
-
-        When ``budget`` is given and expires, the remaining estimator slots are
-        NaN-filled (see ``_forward_on_device``). With more than one device each
-        shard runs against its own private copy of the remaining time, so the
-        truncation is applied independently per device; that keeps the work
-        bounded without sharing mutable counters across threads, but it means
-        a multi-device truncated pool is not necessarily a contiguous prefix of
-        the canonical candidate order. The caller's NaN filter still drops the
-        unrun rows consistently at fit and predict time.
         """
         if feat_indices is not None:
             Xs = np.stack(
@@ -871,7 +851,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
         if len(devices) <= 1:
             return self._forward_on_device(
-                self.model_, self.device_, Xs, ys, output_type, alphas, budget
+                self.model_, self.device_, Xs, ys, output_type, alphas
             )
 
         # Partition estimator rows contiguously across devices.  Contiguous
@@ -880,17 +860,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
 
         chunks = np.array_split(np.arange(Xs.shape[0]), len(devices))
 
-        # Each shard gets its own budget object carrying the remaining time, so
-        # the per-batch counters are never shared between threads. This is the
-        # multi-device safe mode: truncation is independent per shard.
-        shard_budgets: dict[int, _FitBudget] = {}
-
-        def run_on_device(device: torch.device, indices: np.ndarray, slot: int):
-            device_budget = None
-            if budget is not None and not budget.unlimited:
-                remaining = budget.remaining
-                device_budget = _FitBudget(max(remaining if remaining is not None else 0.0, 0.0))
-                shard_budgets[slot] = device_budget
+        def run_on_device(device: torch.device, indices: np.ndarray):
             return self._forward_on_device(
                 self._model_for_device(device),
                 device,
@@ -898,28 +868,15 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 ys[indices],
                 output_type,
                 alphas,
-                device_budget,
             )
 
         with ThreadPoolExecutor(max_workers=len(devices)) as executor:
             futures = [
-                executor.submit(run_on_device, device, indices, slot)
+                executor.submit(run_on_device, device, indices)
                 if indices.size > 0 else None
-                for slot, (device, indices) in enumerate(zip(devices, chunks))
+                for device, indices in zip(devices, chunks)
             ]
             results = [None if future is None else future.result() for future in futures]
-
-        # Roll the per-shard counts back into the parent budget so downstream
-        # logging sees the same accounting as the single-device path.
-        if budget is not None and shard_budgets:
-            budget.n_batches_done += sum(b.n_batches_done for b in shard_budgets.values())
-            budget.n_truncated += sum(b.n_truncated for b in shard_budgets.values())
-            if sum(b.n_truncated for b in shard_budgets.values()) > 0:
-                print(
-                    "[TabLDM:time_limit] multi-device fit: each device shard was "
-                    "truncated independently against the remaining budget; the "
-                    "surviving pool may be non-contiguous."
-                )
 
         if len(output_type) == 1:
             key = output_type[0]
@@ -942,22 +899,11 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         ys: np.ndarray,
         output_type: list[str],
         alphas: Optional[List[float]],
-        budget: Optional[_FitBudget] = None,
     ) -> np.ndarray | dict[str, np.ndarray]:
-        """Run ``predict_stats`` on one device and return CPU NumPy output.
-
-        When ``budget`` is given and expires mid-loop, the remaining estimator
-        slots are returned as NaN rows (full planned shape, prefix completed).
-        The existing NaN-estimator filter drops those rows and records the drop
-        in ``nan_valid_mask_``, which predict time replays — so fit and predict
-        combine exactly the same pool. Truncation only happens after at least
-        one batch has completed across the whole fit, so a fitted model always
-        retains >= 1 candidate.
-        """
-        if device.type == "cuda" and device.index is not None:
+        """Run ``predict_stats`` on one device and return CPU NumPy output."""
+        if device.type == "cuda":
             torch.cuda.set_device(device)
 
-        n_total_est = int(Xs.shape[0])
         batch_size = self.batch_size_ or Xs.shape[0]
         n_batches = int(np.ceil(Xs.shape[0] / batch_size))
         Xs_split = np.array_split(Xs, n_batches)
@@ -965,15 +911,9 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         inference_config = self._inference_config_for_device(device)
 
         results = {key: [] for key in output_type}
-        n_done = 0
         for X_batch, y_batch in zip(Xs_split, ys_split):
             if X_batch.shape[0] == 0:
                 continue
-            # Budget checkpoint: stop between estimator batches. The floor
-            # (``n_batches_done > 0``) guarantees at least one batch runs per
-            # fit and that the output shape is known before any NaN fill.
-            if budget is not None and budget.expired() and budget.n_batches_done > 0:
-                break
             X_batch = torch.from_numpy(X_batch).float().to(device)
             y_batch = torch.from_numpy(y_batch).float().to(device)
 
@@ -990,37 +930,9 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                         results[key].append(out[key].float().cpu().numpy())
                 else:
                     results[output_type[0]].append(out.float().cpu().numpy())
-            n_done += int(X_batch.shape[0])
-            if budget is not None:
-                budget.n_batches_done += 1
-                for key in output_type:
-                    if results[key]:
-                        budget.out_shapes.setdefault(key, results[key][-1].shape[1:])
 
-        if budget is not None and n_done < n_total_est:
-            # Truncated: keep the completed prefix and NaN-fill the tail so the
-            # planned estimator count is preserved and the caller's existing
-            # NaN filter marks the unrun candidates invalid.
-            n_left = n_total_est - n_done
-            budget.n_truncated += n_left
-            for key in output_type:
-                if results[key]:
-                    base = np.concatenate(results[key], axis=0)
-                    fill = np.full((n_left,) + base.shape[1:], np.nan, dtype=base.dtype)
-                    results[key] = np.concatenate([base, fill], axis=0)
-                else:
-                    shape = budget.out_shapes.get(key)
-                    if shape is None:
-                        raise RuntimeError(
-                            f"cannot NaN-fill output {key!r} after the fit budget expired: "
-                            "no earlier batch recorded its shape"
-                        )
-                    results[key] = np.full(
-                        (n_left,) + tuple(shape), np.nan, dtype=np.float32
-                    )
-        else:
-            for key in results:
-                results[key] = np.concatenate(results[key], axis=0)
+        for key in results:
+            results[key] = np.concatenate(results[key], axis=0)
 
         if len(output_type) == 1:
             return results[output_type[0]]
@@ -1283,9 +1195,6 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         q_gen = val_gen_info["q_gen"]
         q_svd_gen = val_gen_info.get("q_svd_gen")
         output_type = ["mean"]
-        # Fit-time collection honours the fit budget. This helper is only ever
-        # called from fit(); the predict path builds its own forwards.
-        budget = getattr(self, "_fit_budget_", None)
 
         all_preds = []
 
@@ -1322,8 +1231,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 if even_idxs:
                     fi = self._feat_indices_for(even_global, Xs_both.shape[-1])
                     bout = self._batch_forward(
-                        Xs_both[even_idxs], ys[even_idxs], output_type=output_type,
-                        feat_indices=fi, budget=budget,
+                        Xs_both[even_idxs], ys[even_idxs], output_type=output_type, feat_indices=fi
                     )
                     preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                     for i, li in enumerate(even_idxs):
@@ -1342,7 +1250,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                         Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
                     Xs_odd = np.stack(Xs_odd_list, axis=0)
                     bout = self._batch_forward(
-                        Xs_odd, ys[odd_idxs], output_type=output_type, budget=budget
+                        Xs_odd, ys[odd_idxs], output_type=output_type
                     )
                     preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                     for i, li in enumerate(odd_idxs):
@@ -1358,7 +1266,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             for norm_method, (Xs, ys) in data.items():
                 n_est = Xs.shape[0]
                 fi = self._feat_indices_for(range(_grp_offset, _grp_offset + n_est), Xs.shape[-1])
-                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi, budget=budget)
+                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
                 preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                 all_preds.append(preds_val)
                 _grp_offset += n_est
@@ -1370,7 +1278,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             for norm_method, (Xs, ys) in q_data.items():
                 n_est = Xs.shape[0]
                 fi = self._feat_indices_for(range(_q_offset, _q_offset + n_est), Xs.shape[-1])
-                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi, budget=budget)
+                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
                 preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                 all_preds.append(preds_val)
                 _q_offset += n_est
@@ -1410,8 +1318,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                     if even_idxs:
                         fi = self._feat_indices_for([_qs_offset + g for g in even_global], Xs_both.shape[-1])
                         bout = self._batch_forward(
-                            Xs_both[even_idxs], ys[even_idxs], output_type=output_type,
-                            feat_indices=fi, budget=budget,
+                            Xs_both[even_idxs], ys[even_idxs], output_type=output_type, feat_indices=fi
                         )
                         preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                         for i, li in enumerate(even_idxs):
@@ -1432,7 +1339,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                             Xs_odd_list.append(np.concatenate([x_tr, x_te], axis=0))
                         Xs_odd = np.stack(Xs_odd_list, axis=0)
                         bout = self._batch_forward(
-                            Xs_odd, ys[odd_idxs], output_type=output_type, budget=budget
+                            Xs_odd, ys[odd_idxs], output_type=output_type
                         )
                         preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                         for i, li in enumerate(odd_idxs):
@@ -1447,7 +1354,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 for norm_method, (Xs, ys) in q_svd_data.items():
                     n_est = Xs.shape[0]
                     fi = self._feat_indices_for(range(_qs_offset, _qs_offset + n_est), Xs.shape[-1])
-                    bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi, budget=budget)
+                    bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
                     preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                     all_preds.append(preds_val)
                     _qs_offset += n_est
@@ -1464,7 +1371,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
             for norm_method, (Xs, ys) in svd_ens_data.items():
                 n_est = Xs.shape[0]
                 fi = self._feat_indices_for(range(_svd_ens_offset, _svd_ens_offset + n_est), Xs.shape[-1])
-                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi, budget=budget)
+                bout = self._batch_forward(Xs, ys, output_type=output_type, feat_indices=fi)
                 preds_val = bout if not isinstance(bout, dict) else bout["mean"]
                 all_preds.append(preds_val)
                 _svd_ens_offset += n_est
@@ -1637,64 +1544,16 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
     # fit()
     # ==================================================================
 
-    def fit(
-        self,
-        X: np.ndarray,
-        y: np.ndarray,
-        kv_cache: bool | str = False,
-        *,
-        time_limit: float | None = None,
-    ) -> "TabLDMRegressor":
+    def fit(self, X: np.ndarray, y: np.ndarray, kv_cache: bool | str = False) -> "TabLDMRegressor":
         """Fit the regressor to training data.
 
         When ``enhance_candidates=True``, fits multiple candidate generators
         and optionally learns NNLS ensemble weights via validation/OOF.
         When ``enhance_candidates=False``, runs the plain single-group
         inference path.
-
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-            Training features.
-        y : array-like of shape (n_samples,)
-            Training targets.
-        kv_cache : bool or str, default=False
-            Non-enhanced path only; see the class docstring.
-        time_limit : float or None, default=None
-            Wall-clock budget for this ``fit`` call, in seconds. Three
-            contracts hold:
-
-            1. ``time_limit=None`` (the default) leaves behavior bit-identical
-               to fitting without the argument: same candidate pool, same
-               shrinkage weights, same predictions.
-            2. Overshoot is bounded. The budget is checked *between* estimator
-               batches, so a fit may exceed ``time_limit`` by at most one batch
-               forward (at most ``batch_size_`` candidates).
-            3. The pool is only ever truncated from the tail of the canonical
-               candidate order — never by skipping candidates in the middle.
-               Candidates that were not run are marked invalid and dropped from
-               fusion; the fitted mask (``nan_valid_mask_``) is replayed at
-               predict time, so the pool fit froze is exactly the pool predict
-               combines.
-
-            ``time_limit<=0`` is normalized to the floor path rather than an
-            error: at least one estimator batch always runs, so the returned
-            model is always able to ``predict``.
-
-            With more than one device the budget is applied per device shard
-            independently (each shard gets a private copy of the remaining
-            time), so the multi-device truncated pool is not guaranteed to be a
-            contiguous prefix. The fit/predict mask invariant still holds.
         """
         if y is None:
             raise ValueError("This regressor requires y to be passed, but the target y is None.")
-
-        # Wall-clock budget covering the whole fit (from here, so it lines up
-        # with the caller's window).  The shrinkage holdout gets a small
-        # reserve so the candidate loop cannot starve it.
-        self._fit_budget_ = _FitBudget(
-            time_limit, reserve=_reserve(time_limit) if time_limit else 0.0
-        )
 
         X, y = validate_data(self, X, y, dtype=None, skip_check_array=True)
         y = np.asarray(y, dtype=np.float32)
@@ -1788,17 +1647,6 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
                 f"[TabLDM:enhance] routing: k_fold={self.k_fold}, n_train={n_full}, "
                 f"n_val={n_val}, path={route}"
             )
-
-            # If the fit budget is already spent, skip the validation holdout /
-            # OOF entirely and fall through to the pure group-prior path rather
-            # than burning time on forwards we would only truncate.
-            _budget = getattr(self, "_fit_budget_", None)
-            if _budget is not None and _budget.expired():
-                print(
-                    f"[TabLDM:time_limit] fit budget spent after {_budget.elapsed:.1f}s "
-                    "-> skipping validation holdout, pure group prior"
-                )
-                route = "budget_exhausted"
 
             if route == "kfold":
                 n_splits = self.n_splits

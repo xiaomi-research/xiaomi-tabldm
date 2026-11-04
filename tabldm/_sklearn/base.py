@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import sys
 import copy
-import time
 import pickle
 import warnings
 from pathlib import Path
@@ -50,56 +49,6 @@ def _check_version_compatibility(metadata: dict) -> None:
                 UserWarning,
                 stacklevel=3,
             )
-
-
-def _reserve(time_limit: float) -> float:
-    """Seconds held back from the candidate budget for NNLS + calibration."""
-    return max(5.0, 0.02 * float(time_limit))
-
-
-class _FitBudget:
-    """Wall-clock budget for one fit, checked between estimator batches.
-
-    ``time_limit=None`` means unlimited: ``expired()`` is then always False and
-    every checkpoint short-circuits, so the fit behaves exactly as it would
-    without a budget. The limit is checked *between* estimator batches, so a
-    fit may overshoot by at most one batch forward (``batch_size_`` candidates).
-
-    ``n_batches_done`` counts completed batches across the whole fit. It drives
-    the "always finish at least one batch" floor: truncation only ever happens
-    after a batch has completed, so a fitted model always has >= 1 candidate
-    and ``out_shapes`` is known before the first NaN fill.
-    """
-
-    def __init__(self, time_limit: float | None, *, reserve: float = 0.0):
-        self.time_limit = None if time_limit is None else max(float(time_limit), 0.0)
-        self._start = time.monotonic()
-        self._deadline = (
-            None if self.time_limit is None else self._start + self.time_limit - reserve
-        )
-        self.n_batches_done = 0
-        #: Per-output trailing shape recorded at the first completed batch, so
-        #: a later call can NaN-fill without re-running the model. Keyed by the
-        #: output name (the classifier uses a single key).
-        self.out_shapes: dict[str, tuple[int, ...]] = {}
-        self.n_truncated = 0
-
-    @property
-    def unlimited(self) -> bool:
-        return self._deadline is None
-
-    @property
-    def elapsed(self) -> float:
-        return time.monotonic() - self._start
-
-    @property
-    def remaining(self) -> float | None:
-        if self._deadline is None:
-            return None
-        return self._deadline - time.monotonic()
-
-    def expired(self) -> bool:
-        return self._deadline is not None and time.monotonic() >= self._deadline
 
 
 class TabLDMBaseEstimator(BaseEstimator):
@@ -441,9 +390,6 @@ class TabLDMBaseEstimator(BaseEstimator):
         state.pop("model_path_", None)
         state.pop("_model_replicas_", None)
         state.pop("_inference_config_replicas_", None)
-        # Fit-time scratch: the wall-clock budget is meaningless after fit
-        # returns (and must never leak into a loaded model's predict path).
-        state.pop("_fit_budget_", None)
 
         # Handle model weights
         if save_model_weights and hasattr(self, "model_"):
