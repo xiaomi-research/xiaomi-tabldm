@@ -1162,7 +1162,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
         feature_shuffles: Optional[np.ndarray],
     ) -> np.ndarray:
         """Run the classifier forward pass on one device and return CPU logits/probs."""
-        if device.type == "cuda":
+        if device.type == "cuda" and device.index is not None:
             torch.cuda.set_device(device)
 
         batch_size = self.batch_size_ or Xs.shape[0]

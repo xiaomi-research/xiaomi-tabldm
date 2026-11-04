@@ -954,7 +954,7 @@ class TabLDMRegressor(RegressorMixin, TabLDMBaseEstimator):
         one batch has completed across the whole fit, so a fitted model always
         retains >= 1 candidate.
         """
-        if device.type == "cuda":
+        if device.type == "cuda" and device.index is not None:
             torch.cuda.set_device(device)
 
         n_total_est = int(Xs.shape[0])
