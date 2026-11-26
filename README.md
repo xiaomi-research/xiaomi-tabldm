@@ -336,7 +336,7 @@ tabldm/
 ```bibtex
 @misc{tabldmteam2026xiaomitabldmtabularfoundationmodel,
   title         = {Xiaomi-TabLDM: A Tabular Foundation Model Technical Report},
-  author        = {Penghui Wang and Wei Liu and Hong Wang and Chengyue Huang and Yuxi Sun and Zirui Wang and Hongming Huang and Quan Wang and Zhenwei Xin and Ping Hou and Jie Yu and Chunxiao Liu and Erli Meng and Bin Wang},
+  author        = {TabLDM Team and Penghui Wang and Wei Liu and Hong Wang and Chengyue Huang and Yuxi Sun and Zirui Wang and Hongming Huang and Quan Wang and Zhenwei Xin and Ping Hou and Jie Yu and Chunxiao Liu and Erli Meng and Bin Wang},
   year          = {2026},
   eprint        = {2609.03880},
   archivePrefix = {arXiv},
